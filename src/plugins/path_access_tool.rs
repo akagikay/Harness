@@ -121,54 +121,39 @@ impl ToolPlugin for RequestPathAccessPlugin {
         // The grant is (a) only honored when a human explicitly approves it in
         // the permission prompt, and (b) scoped to this session, so it cannot
         // outlive the conversation or leak into another project.
-        let approved = args
-            .get("approved")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let always = args
-            .get("always_allow")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        // The permission mode must be one that is actually asking a human.
-        // `Safe` prompts; `Auto`/`Autonomous`/`Yolo` would let the agent widen
-        // its own reach with no human in the loop, which is exactly what this
-        // tool must not be able to do.
-        let mode = ctx.config.permissions.mode;
-        let approval_expected = matches!(mode, crate::config::PermissionMode::Safe);
-        if !approval_expected {
-            return Err(format!(
-                "Requesting new folder access requires a human approval, but the current \
-                 permission mode does not prompt one. Switch to the Safe mode, or add the folder \
-                 to the project yourself in Settings → Projects."
-            ));
-        }
-        if !approved {
-            return Err(
-                "Awaiting explicit approval: this folder is outside the project and needs a human \
-                 to approve it before the agent may read or write in it."
-                    .to_string(),
-            );
-        }
-
+        // SECURITY: this tool must never authorise ITSELF. The model controls
+        // the arguments, so reading `args["approved"]` let it grant any folder;
+        // and a human's Approve used to be ignored, so the flow was broken in
+        // both directions. The only authority is the human's answer, recorded by
+        // `decide_permission` into the session's grants - which is what this
+        // reads.
         let state = ctx
             .state
             .clone()
             .ok_or_else(|| "request_path_access requires application state.".to_string())?;
-        // Session-scoped: the grant lives and dies with this conversation.
-        let scope = if always { "session" } else { "turn" };
-        state
-            .grant_session_path_access(&ctx.session_id, &folder, always)
-            .await;
-        if always {
-            state.allow_tool_for_session(&ctx.session_id, "request_path_access").await;
+
+        let granted = state
+            .session_path_grants(&ctx.session_id)
+            .await
+            .into_iter()
+            .any(|p| *p == folder);
+        if !granted {
+            // The permission prompt has not been answered yet (or was denied).
+            // The loop runner asks before executing, so reaching here means no
+            // human approval exists for this folder.
+            return Err(format!(
+                "Folder '{}' is outside the project and has not been approved for this session. \
+                 A human must approve the permission prompt before the agent may read or write \
+                 there.",
+                folder.display()
+            ));
         }
 
         Ok(json!({
             "status": "granted",
             "path": folder.display().to_string(),
-            "scope": scope,
-            "note": "Approved for this session only. It is not persisted to any other project."
+            "scope": "session",
+            "note": "Approved by a human for this session only. It is not persisted to any other project."
         })
         .to_string())
     }

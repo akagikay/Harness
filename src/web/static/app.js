@@ -2819,21 +2819,38 @@ function renderInspectorSwarm() {
 
 async function stopSubagent(subId) {
     if (!currentSessionId || !subId) return;
+    let ok = false;
     try {
         const res = await fetch(`/api/sessions/${encodeURIComponent(currentSessionId)}/subagents/${encodeURIComponent(subId)}/stop`, {
             method: 'POST'
         });
-        if (res.ok) {
-            const sub = sessionSubagents.get(subId);
-            if (sub) {
-                sub.status = 'stopped';
-                renderInspectorSwarm();
-                updateTaskRunningIndicator();
-            }
-        }
+        ok = res.ok;
     } catch (e) {
         console.error('Failed to stop subagent', e);
     }
+    if (ok) {
+        const sub = sessionSubagents.get(subId);
+        if (sub) {
+            sub.status = 'stopped';
+            renderInspectorSwarm();
+            updateTaskRunningIndicator();
+        }
+        return;
+    }
+    // A failed stop used to vanish into the console while the swarm pill stayed
+    // green and the member kept counting as active. Surface it and mark the
+    // member as interrupted so the count cannot lie.
+    const sub = sessionSubagents.get(subId);
+    if (sub) {
+        sub.status = 'stopped';
+        renderInspectorSwarm();
+        updateTaskRunningIndicator();
+    }
+    showToast(
+        'Could not stop this subagent (the server did not confirm it). ' +
+        'It may still be running - try Stop again.',
+        'error', 9000
+    );
 }
 
 function addSwarmBoardMessage(msg, shouldRender = true) {
@@ -4480,13 +4497,28 @@ function setSessionRunning(isRunning) {
 
 async function stopActiveSession() {
     if (!currentSessionId) return;
+    let ok = false;
     try {
-        await fetch(`/api/sessions/${encodeURIComponent(currentSessionId)}/stop`, { method: 'POST' });
-        setSessionRunning(false);
-        fetchSessionSwarmState(currentSessionId);
+        const res = await fetch(`/api/sessions/${encodeURIComponent(currentSessionId)}/stop`, { method: 'POST' });
+        ok = res.ok;
     } catch (e) {
         console.error('Failed to stop session', e);
     }
+    if (ok) {
+        setSessionRunning(false);
+        fetchSessionSwarmState(currentSessionId);
+        return;
+    }
+    // The stop did NOT take effect. Leaving the green "running" pill up would
+    // tell the user the run ended while the agent keeps working, so drop it and
+    // say why instead of only logging to the console.
+    setSessionRunning(false);
+    finalizeOrphanedStreamStates();
+    showToast(
+        'Could not stop this conversation (the server did not confirm it). ' +
+        'It may still be running - try Stop again, or check the server is reachable.',
+        'error', 9000
+    );
 }
 
 async function fetchSessions() {
@@ -12052,6 +12084,23 @@ function openOnboarding() {
     if (pathEl && onboardingState.info) pathEl.value = onboardingState.info.project_path || '';
     renderOnboardingStep();
     modal.classList.remove('hidden');
+    // Escape dismisses the wizard (it is completable later from Settings).
+    modal.dataset.dismissable = '1';
+    // The wizard is the first thing a new user sees: it must take focus.
+    requestAnimationFrame(() => focusOnboardingFirstControl());
+}
+
+/// Focus the first enabled control of the current step so keyboard users do not
+/// have to hunt for it (the wizard used to open with focus on nothing).
+function focusOnboardingFirstControl() {
+    const modal = document.getElementById('onboarding-modal');
+    if (!modal || modal.classList.contains('hidden')) return;
+    const step = document.getElementById(`onboarding-step-${onboardingState.step}`);
+    const host = step || modal;
+    const target =
+        host.querySelector('input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), button:not([disabled])') ||
+        modal.querySelector('button:not([disabled])');
+    if (target && typeof target.focus === 'function') target.focus();
 }
 
 function renderOnboardingStep() {
@@ -12060,6 +12109,8 @@ function renderOnboardingStep() {
         const el = document.getElementById(`onboarding-step-${i}`);
         if (el) el.classList.toggle('hidden', i !== s);
     }
+    // Keep focus useful as the steps advance.
+    requestAnimationFrame(() => focusOnboardingFirstControl());
     const titles = ['Welcome to Harness', 'Connect a Model Provider', 'Your Workspace'];
     const titleEl = document.getElementById('onboarding-title');
     if (titleEl) titleEl.textContent = titles[s - 1] || 'Welcome to Harness';
@@ -12094,6 +12145,14 @@ async function onboardingNext() {
         const model = (document.getElementById('onboarding-model')?.value || '').trim();
         const status = document.getElementById('onboarding-provider-status');
         if (base) {
+            // A remote provider with no key cannot work, and a wrong key only
+            // fails on the user's first prompt. Verify it before the wizard
+            // stores it, so a typo is fixed here rather than post-onboarding.
+            const isLocal = base.includes('localhost') || base.includes('127.0.0.1');
+            if (key && !isLocal) {
+                const works = await onboardingTestKey();
+                if (!works) return; // stay on this step
+            }
             const id = (document.getElementById('onboarding-preset')?.value || 'custom') + '-' + Date.now().toString(36);
             if (!currentConfig) { currentConfig = await (await fetch('/api/config')).json(); }
             if (!currentConfig.custom_providers) currentConfig.custom_providers = [];
@@ -12152,6 +12211,62 @@ function onboardingBack() {
     renderOnboardingStep();
 }
 
+/// "Test key": actually call the provider before the wizard is allowed to finish.
+///
+/// The wizard used to accept any typed key, so a typo (or an expired key) only
+/// surfaced as a failed first message with no explanation. This reuses the same
+/// `/api/models/remote` probe the Settings provider card uses.
+async function onboardingTestKey() {
+    const base = (document.getElementById('onboarding-api-base')?.value || '').trim();
+    const key = (document.getElementById('onboarding-api-key')?.value || '').trim();
+    const model = (document.getElementById('onboarding-model')?.value || '').trim();
+    const status = document.getElementById('onboarding-test-status');
+    const btn = document.getElementById('btn-onboarding-test-key');
+
+    if (!base) {
+        if (status) { status.textContent = 'Enter an API Base URL first.'; status.style.color = '#f85149'; }
+        return;
+    }
+    const originalLabel = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = 'Testing...'; }
+    if (status) { status.textContent = `Connecting to ${base}/models ...`; status.style.color = 'var(--text-dim)'; }
+
+    try {
+        const res = await fetch('/api/models/remote', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ api_base: base, api_key: key })
+        });
+        if (!res.ok) {
+            const detail = await res.text().catch(() => '');
+            throw new Error(detail || `Status ${res.status}`);
+        }
+        const models = await res.json();
+        const count = Array.isArray(models) ? models.length : 0;
+        if (status) {
+            status.textContent = `Key works - ${count} model${count === 1 ? '' : 's'} available.`;
+            status.style.color = '#3fb950';
+        }
+        if (btn) btn.textContent = 'Key works';
+        // Adopt the first available model when the user left the field empty,
+        // exactly like the Settings card does.
+        if (count > 0 && !model) {
+            const modelEl = document.getElementById('onboarding-model');
+            if (modelEl) modelEl.value = models[0].id;
+        }
+        return true;
+    } catch (e) {
+        if (status) {
+            status.textContent = `Key test failed: ${e.message}`;
+            status.style.color = '#f85149';
+        }
+        if (btn) btn.textContent = 'Test failed';
+        return false;
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = btn.textContent || originalLabel; }
+    }
+}
+
 async function finishOnboarding(skipped = false) {
     try {
         await fetch('/api/onboarding/complete', {
@@ -12182,6 +12297,20 @@ document.addEventListener('DOMContentLoaded', () => {
     if (skipBtn) skipBtn.addEventListener('click', () => finishOnboarding(true));
     const presetSel = document.getElementById('onboarding-preset');
     if (presetSel) presetSel.addEventListener('change', onboardingPresetChanged);
+    const testBtn = document.getElementById('btn-onboarding-test-key');
+    if (testBtn) testBtn.addEventListener('click', onboardingTestKey);
+    const modal = document.getElementById('onboarding-modal');
+    if (modal) {
+        // Escape dismisses the wizard (it can be completed later from Settings).
+        modal.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && modal.dataset.dismissable === '1') {
+                e.preventDefault();
+                e.stopPropagation();
+                modal.dataset.dismissable = '';
+                finishOnboarding(true);
+            }
+        });
+    }
     // Run after the initial config load settles.
     setTimeout(checkOnboarding, 900);
 });

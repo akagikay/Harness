@@ -297,8 +297,8 @@ mod harness_tests {
     }
 
     /// The tool must not claim containment in the persisted contract JSON either.
-    #[test]
-    fn executed_shell_runs_outside_the_sandbox_when_told_to() {
+    #[tokio::test]
+    async fn executed_shell_runs_outside_the_sandbox_when_told_to() {
         #[cfg(target_os = "windows")]
         let cmd = "cd C:\\; Get-Location | Select-Object -ExpandProperty Path";
         #[cfg(not(target_os = "windows"))]

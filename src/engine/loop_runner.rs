@@ -1239,11 +1239,23 @@ impl AgentLoopRunner {
                             );
                             let (perm_tx, perm_rx) = oneshot::channel();
                             // Record (tool, session) so a later "always allow"
-                            // decision can name the tool it applies to.
-                            st.register_permission_waiter_with_meta(
+                            // decision can name the tool it applies to. For
+                            // `request_path_access` also record the path: the
+                            // grant is made when a HUMAN answers, and the tool
+                            // itself must never trust its own arguments.
+                            let requested_path = if tool_name == "request_path_access" {
+                                parsed_args
+                                    .get("path")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                            } else {
+                                None
+                            };
+                            st.register_permission_waiter_with_meta_and_path(
                                 perm_id.clone(),
                                 self.session_id.clone(),
                                 tool_name.clone(),
+                                requested_path,
                                 perm_tx,
                             )
                             .await;

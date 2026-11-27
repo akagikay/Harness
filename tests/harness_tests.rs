@@ -6748,6 +6748,104 @@ async fn test_multi_folder_project_keeps_extra_folders_on_remote_runs() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+/// A permission prompt must survive a page reload.
+///
+/// `PermissionRequested` used to live only in the live broadcast, so reloading
+/// during an approval lost the card and the badge and left the agent blocked on
+/// a 120s timeout with nothing on screen. It now flows through
+/// `append_session_event`, is persisted with the session snapshot, and comes
+/// back out of `GET /api/sessions/:id/history` so `replayHistoryEvents` can
+/// render it again (with `data-pending` re-armed whenever no
+/// `PermissionDecided` follows it).
+#[tokio::test]
+async fn test_permission_prompt_survives_a_reload_via_session_history() {
+    use deepseek_harness_rs::engine::events::HarnessEvent;
+
+    let temp_dir = std::env::temp_dir().join(format!("harness-perm-reload-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let mut config = HarnessConfig::default();
+    config.sandbox_root = temp_dir.clone();
+    config.auth_token = String::new();
+    let state = AppState::with_db(
+        config,
+        deepseek_harness_rs::db::HarnessDb::open_in_memory().unwrap(),
+    );
+
+    let session_id = "ses-perm-reload".to_string();
+    state
+        .create_session_with_options(
+            session_id.clone(),
+            "pending approval".into(),
+            "project".into(),
+            None,
+            None,
+            None,
+            "running",
+        )
+        .await;
+
+    // The turn emits a request (the loop runner's shape), then is interrupted by
+    // a reload: only the paired `PermissionDecided` would resolve the card, so
+    // a request with no decision is precisely the "reload during an approval" case.
+    let perm_id = "perm_reload_1".to_string();
+    state
+        .append_session_event(
+            &session_id,
+            HarnessEvent::PermissionRequested {
+                perm_id: perm_id.clone(),
+                session_id: session_id.clone(),
+                tool: "bash".to_string(),
+                description: "Run `rm -rf build`".to_string(),
+                args: serde_json::json!({ "command": "rm -rf build" }),
+            },
+        )
+        .await;
+    // Mid-turn flush (the handler now does this the moment the prompt is raised).
+    state.persist_session_record(&session_id).await;
+
+    // Simulate the restart: empty the in-memory session, forcing the handler to
+    // rehydrate from the persisted snapshot (a browser reload also starts here).
+    state.sessions.write().await.remove(&session_id);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", addr);
+
+    let hist: Vec<Value> = client
+        .get(format!("{}/api/sessions/{}/history", base, session_id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let requested = hist
+        .iter()
+        .find(|e| e["type"] == "PermissionRequested")
+        .expect("the pending approval must come back out of history");
+    assert_eq!(requested["data"]["perm_id"], perm_id);
+    assert_eq!(requested["data"]["tool"], "bash");
+    // Everything the UI needs to re-render the card (including its buttons).
+    assert!(requested["data"]["description"].is_string());
+    assert!(requested["data"]["args"].is_object());
+    // And the replay must be able to tell it is still unanswered: no decision.
+    assert!(
+        !hist.iter().any(|e| e["type"] == "PermissionDecided"),
+        "with no decision the replayed card is still pending"
+    );
+
+    srv.abort();
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// A permission prompt must survive a page reload.
+///
+/// The agent is BLOCKED on this event, so losing it means a stalled run with
+/// nothing on screen. `spawn_session_turn` n
 #[tokio::test]
 async fn test_provider_detection_covers_top_level_config() {
     // BUG-C: onboarding reported "no provider" for a working NIM harness.

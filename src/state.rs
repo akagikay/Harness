@@ -448,7 +448,7 @@ pub struct AppState {
     pub pending_permissions: Arc<RwLock<HashMap<String, oneshot::Sender<bool>>>>,
     /// (tool, session) for each pending permission request, so an "always
     /// allow" decision can name the tool it applies to.
-    pub pending_permission_meta: Arc<RwLock<HashMap<String, (String, String)>>>,
+    pub pending_permission_meta: Arc<RwLock<HashMap<String, (String, String, Option<String>)>>>,
     /// Tools a user approved for the rest of a session ("always allow").
     pub session_tool_allowlist: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     /// Allowlist entries already announced to the user (one notice, not many).
@@ -1205,15 +1205,31 @@ if !saved_conf.onboarded {
     pub async fn resolve_session_roots(&self, session_id: &str) -> Vec<PathBuf> {
         let project_id = self.session_project_id(session_id).await;
         let conf = self.config.read().await;
-        if let Some(pid) = project_id {
+        let mut roots = if let Some(pid) = project_id {
             if let Some(proj) = conf.projects.iter().find(|p| p.id == pid) {
-                let roots = proj.all_paths();
-                if !roots.is_empty() {
-                    return roots;
+                let owned = proj.all_paths();
+                if !owned.is_empty() {
+                    owned
+                } else {
+                    vec![conf.sandbox_root.clone()]
                 }
+            } else {
+                vec![conf.sandbox_root.clone()]
+            }
+        } else {
+            vec![conf.sandbox_root.clone()]
+        };
+        // Fold in folders a HUMAN approved for this session through
+        // `request_path_access`. Without this the tool answers
+        // `{"status":"granted"}` and the very next `read_file` still fails with
+        // "absolute path outside project folders" - the grant is real state, so
+        // it has to reach the tools.
+        for granted in self.session_path_grants(session_id).await {
+            if !roots.iter().any(|r| r == &granted) {
+                roots.push(granted);
             }
         }
-        vec![conf.sandbox_root.clone()]
+        roots
     }
 
     pub async fn register_permission_waiter(&self, perm_id: String, tx: oneshot::Sender<bool>) {
@@ -1230,10 +1246,30 @@ if !saved_conf.onboarded {
         tool: String,
         tx: oneshot::Sender<bool>,
     ) {
+        self.register_permission_waiter_with_meta_and_path(
+            perm_id, session_id, tool, None, tx,
+        )
+        .await;
+    }
+
+    /// As [`Self::register_permission_waiter_with_meta`], plus the path a
+    /// `request_path_access` call is asking about.
+    ///
+    /// The path must be recorded with the request because the grant is made when
+    /// a HUMAN answers the prompt (`decide_permission`) - the tool itself never
+    /// trusts its own arguments, and cannot know the prompt id.
+    pub async fn register_permission_waiter_with_meta_and_path(
+        &self,
+        perm_id: String,
+        session_id: String,
+        tool: String,
+        path: Option<String>,
+        tx: oneshot::Sender<bool>,
+    ) {
         self.pending_permission_meta
             .write()
             .await
-            .insert(perm_id.clone(), (tool, session_id));
+            .insert(perm_id.clone(), (tool, session_id, path));
         self.register_permission_waiter(perm_id, tx).await;
     }
 
@@ -1267,14 +1303,20 @@ if !saved_conf.onboarded {
     /// the request is already registered, so the tool is captured alongside it.
     pub async fn permission_tool_for(&self, perm_id: &str) -> Option<String> {
         let lock = self.pending_permission_meta.read().await;
-        lock.get(perm_id).map(|(t, _)| t.clone())
+        lock.get(perm_id).map(|(t, _, _)| t.clone())
     }
 
     /// The session a pending permission request belongs to (see
     /// [`Self::permission_tool_for`]).
     pub async fn permission_session_for(&self, perm_id: &str) -> Option<String> {
         let lock = self.pending_permission_meta.read().await;
-        lock.get(perm_id).map(|(_, s)| s.clone())
+        lock.get(perm_id).map(|(_, s, _)| s.clone())
+    }
+
+    /// The path a pending `request_path_access` request is asking about.
+    pub async fn permission_path_for(&self, perm_id: &str) -> Option<String> {
+        let lock = self.pending_permission_meta.read().await;
+        lock.get(perm_id).and_then(|(_, _, p)| p.clone())
     }
 
     /// Remember that `tool` was approved for the rest of `session_id`.

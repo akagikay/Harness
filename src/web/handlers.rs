@@ -448,7 +448,11 @@ pub fn spawn_session_turn(
             }).cloned();
 
             let (event_tx, mut event_rx) = mpsc::channel::<HarnessEvent>(100);
-            let runner_handle = if let Some(remote_srv) = remote_primary {
+            // Clones for the terminal-event paths: the originals move into the
+            // spawned task below, so the drain loop and the terminal `Error`
+            // emitters cannot own them.
+            let event_tx_terminal = event_tx.clone();
+            let mut runner_handle = if let Some(remote_srv) = remote_primary {
                 let run_id = format!("run_{}_{}", session_id, chrono::Utc::now().timestamp_millis());
                 {
                     let mut active_runs = state.active_remote_runs.write().await;
@@ -461,6 +465,7 @@ pub fn spawn_session_turn(
                 let cfg_c = session_config.clone();
                 let cancel_c = cancel_notify.clone();
                 let state_c = state.clone();
+                    let remote_tx = event_tx.clone();
                 tokio::spawn(async move {
                     let res = crate::remote::execute_remote_server_run(
                         &remote_srv,
@@ -478,7 +483,7 @@ pub fn spawn_session_turn(
                         use_mock,
                         cancel_c,
                         Some(state_c.clone()),
-                        event_tx,
+                        remote_tx,
                     )
                     .await;
                     let mut active_runs = state_c.active_remote_runs.write().await;
@@ -508,11 +513,41 @@ pub fn spawn_session_turn(
                 .with_task_attachments(current_attachments)
                 .with_steer_inbox(current_steer);
 
-                tokio::spawn(async move { runner.run_with_messages(event_tx).await })
+                // Clone, do not move: the turn's terminal `Ok(Err)` / `Err` arms below still
+                // emit `Error` through this sender after the runner is spawned.
+                let runner_tx = event_tx.clone();
+                tokio::spawn(async move { runner.run_with_messages(runner_tx).await })
             };
 
-            // Forward internal events to state history and broadcast SSE listeners while this turn owns cancel_notify
-            while let Some(evt) = event_rx.recv().await {
+            // Forward internal events to state history and broadcast SSE listeners while this turn owns cancel_notify.
+            // The channel has other sender clones alive, so `recv()` alone would never
+            // return `None`; the loop must also watch the runner task and end the turn
+            // when IT ends (otherwise the status sticks on "running", no
+            // SessionCompleted is emitted, and queued prompts are never drained).
+            let mut run_res: Option<
+                Result<
+                    Result<(String, Vec<crate::engine::context::ChatMessage>), String>,
+                    tokio::task::JoinError,
+                >,
+            > = None;
+            loop {
+                let evt = tokio::select! {
+                    biased;
+                    maybe = event_rx.recv() => match maybe {
+                        Some(evt) => evt,
+                        // The channel closed AND the runner already finished.
+                        None => break,
+                    },
+                    // Taking the result here is what makes this safe: a JoinHandle
+                    // may be polled to completion exactly once, so the terminal arm
+                    // below must use `run_res` instead of awaiting the handle again
+                    // (polling a finished JoinHandle panics with "JoinHandle
+                    // polled after completion").
+                    joined = &mut runner_handle => {
+                        run_res = Some(joined);
+                        break;
+                    }
+                };
                 let still_active = {
                     let lock = state.sessions.read().await;
                     lock.get(&session_id)
@@ -522,10 +557,22 @@ pub fn spawn_session_turn(
                     continue;
                 }
                 state.append_session_event(&session_id, evt.clone()).await;
+                // A pending permission prompt is the one event a user must never
+                // lose: the agent is BLOCKED on it. Flush the snapshot the moment
+                // it is raised (mid-turn, long before the next status transition)
+                // so it survives a restart of the harness, not just a browser reload.
+                if matches!(evt, HarnessEvent::PermissionRequested { .. }) {
+                    state.persist_session_record(&session_id).await;
+                }
                 let _ = bcast_tx.send(evt);
             }
 
-            let run_res = runner_handle.await;
+            let run_res = match run_res {
+                Some(res) => res,
+                // The channel closed first: the runner may still be parked on a
+                // blocking read, so await it once here.
+                None => runner_handle.await,
+            };
 
             // If undo_to_turn or a newer turn replaced cancel_notify, do not overwrite rolled-back state
             let (still_active, was_stopped) = {
@@ -575,15 +622,32 @@ pub fn spawn_session_turn(
                     }
                     break;
                 }
-                Ok(Err(_)) => {
+                Ok(Err(run_err)) => {
+                    // A turn that ends in an error MUST tell the stream. Without
+                    // this the session is marked "failed" and simply stops
+                    // emitting: no `Error`, no `SessionCompleted`, so the UI
+                    // shows a running agent that will never finish and the DB
+                    // keeps a "failed" row that is not rendered anywhere.
                     if !was_stopped {
                         state.update_session_status(&session_id, "failed").await;
+                        let _ = event_tx_terminal
+                            .send(HarnessEvent::Error {
+                                message: run_err,
+                                fatal: true,
+                            })
+                            .await;
                     }
                     break;
                 }
-                Err(_) => {
+                Err(join_err) => {
                     if !was_stopped {
                         state.update_session_status(&session_id, "panic").await;
+                        let _ = event_tx_terminal
+                            .send(HarnessEvent::Error {
+                                message: format!("Agent turn task failed: {join_err}"),
+                                fatal: true,
+                            })
+                            .await;
                     }
                     break;
                 }
@@ -763,6 +827,31 @@ pub async fn decide_permission(
     };
     if let (Some(tool), Some(session_id)) = (always_allow_tool, always_session) {
         state.allow_tool_for_session(&session_id, &tool).await;
+    }
+    // An approved `request_path_access` grants THAT folder to THIS session.
+    // The decision is made here, by the human's answer - never by the tool's own
+    // arguments, which the model controls.
+    if payload.approved {
+        let tool = state.permission_tool_for(&perm_id).await;
+        if tool.as_deref() == Some("request_path_access") {
+            if let (Some(session_id), Some(path)) = (
+                state.permission_session_for(&perm_id).await,
+                state.permission_path_for(&perm_id).await,
+            ) {
+                let folder = std::path::PathBuf::from(&path);
+                let resolved = folder
+                    .canonicalize()
+                    .unwrap_or_else(|_| folder.clone());
+                state
+                    .grant_session_path_access(&session_id, &resolved, true)
+                    .await;
+                if payload.always_allow {
+                    state
+                        .allow_tool_for_session(&session_id, "request_path_access")
+                        .await;
+                }
+            }
+        }
     }
 
     if state.resolve_permission(&perm_id, payload.approved).await {
@@ -1277,6 +1366,62 @@ mod sensitive_entry_tests {
 #[cfg(test)]
 mod ui_structure_tests {
     use super::{APP_JS, INDEX_HTML};
+
+    /// A permission prompt must survive a reload.
+    ///
+    /// `replayHistoryEvents` tears the stream down and replays every stored
+    /// event, so the `PermissionRequested` case has to re-render the card (which
+    /// re-arms `__pendingPerms` and re-sets `data-pending` through
+    /// `markPendingPermission`), exactly like the live path. A reload during an
+    /// approval used to leave the agent blocked with nothing on screen.
+    #[test]
+    fn permission_prompt_replay_re_arms_the_pending_badge() {
+        // The replay switch must not be gated on live-only behaviour.
+        let case = "case 'PermissionRequested':";
+        let start = APP_JS
+            .find(case)
+            .unwrap_or_else(|| panic!("app.js must handle PermissionRequested during replay"));
+        let window = &APP_JS[start..start + 260];
+        assert!(
+            window.contains("renderPermissionPrompt("),
+            "replay must render the card: {window}"
+        );
+
+        // `renderPermissionPrompt` is what re-arms the badge: it stamps
+        // `data-pending` and calls `markPendingPermission`.
+        let render_start = APP_JS
+            .find("function renderPermissionPrompt(")
+            .expect("renderPermissionPrompt is defined");
+        let render = &APP_JS[render_start..render_start + 2200];
+        assert!(
+            render.contains("setAttribute('data-pending', '1')")
+                && render.contains("markPendingPermission(permId, tool)"),
+            "the replayed card must be marked pending again so the badge returns"
+        );
+        assert!(
+            render.contains("role", ) || render.contains("role', 'alert'"),
+            "the prompt must stay announced to screen readers"
+        );
+
+        // The badge's click must still target a *pending* card, and answering it
+        // must clear that state (a decided card is no longer a target).
+        let badge = APP_JS
+            .find("function syncPermissionBadge()")
+            .map(|i| &APP_JS[i..i + 900])
+            .unwrap_or_default();
+        assert!(
+            badge.contains("'.permission-card[data-pending=\"1\"]'"),
+            "the badge must jump to a still-pending card: {badge}"
+        );
+        let decision = APP_JS
+            .find("function updatePermissionPromptDecision(")
+            .map(|i| &APP_JS[i..i + 1200])
+            .unwrap_or_default();
+        assert!(
+            decision.contains("clearPendingPermission(permId)"),
+            "answering must clear the pending count"
+        );
+    }
 
     /// The CSP serves `script-src 'self'` with no `'unsafe-inline'`, so no inline
 /// event handler may exist anywhere in the UI - the shipped HTML *or* the
@@ -2765,14 +2910,6 @@ pub async fn send_session_message(
         return Err((StatusCode::NOT_FOUND, "Session not found".to_string()));
     }
 
-    let is_running = {
-        let lock = state.sessions.read().await;
-        let session = lock
-            .get(&id)
-            .ok_or((StatusCode::NOT_FOUND, "Session not found".to_string()))?;
-        session.status == "running"
-    };
-
     let conf = { state.config.read().await.clone() };
     let sandbox = state.resolve_session_sandbox(&id).await;
     let (prompt, slash_cmd, slash_args) = resolve_slash_input(
@@ -2791,6 +2928,11 @@ pub async fn send_session_message(
     }
 
     let use_mock = payload.mock.unwrap_or(conf.mock_mode);
+
+    let is_running = {
+        let lock = state.sessions.read().await;
+        lock.get(&id).map(|s| s.status == "running").unwrap_or(false)
+    };
 
     if is_running {
         if mode == "steer" {
@@ -3485,11 +3627,21 @@ pub async fn start_server_run(
         let mut run_conf = payload.config.clone();
         // Each execution server operates within its own configured sandbox workspace.
         run_conf.sandbox_root = server_conf.sandbox_root.clone();
-        if !server_conf.server_identity.trim().is_empty() {
-            run_conf.server_identity = server_conf.server_identity.clone();
-        }
+        // SECURITY: the ONLY authoritative filesystem scope on this server is its
+        // own. `payload.config` is client-supplied, so its `extra_access_roots`
+        // and `projects` would otherwise be folded straight into the runner's
+        // sandbox roots (`loop_runner.rs`) - which is exactly the list the file
+        // tools enforce. A client sending `extra_access_roots: ["C:\\"]` got
+        // full read/write on the server host (red-team verified: `list_dir` on
+        // the server's own out-of-sandbox folder returned success). Take both
+        // from the server's own config instead.
+        run_conf.extra_access_roots = server_conf.extra_access_roots.clone();
+        run_conf.projects = server_conf.projects.clone();
         if payload.read_only {
             run_conf.permissions.mode = crate::config::PermissionMode::ReadOnly;
+        }
+        if !server_conf.server_identity.trim().is_empty() {
+            run_conf.server_identity = server_conf.server_identity.clone();
         }
 
         let sandbox = run_conf.sandbox_root.clone();

@@ -393,3 +393,65 @@ Follow-up messages to running subagents are being truncated by the harness
 (`sessionID` arrives as `ses`), so running agents cannot be redirected. Protocol
 records this as a known limitation: do not start two source-editing agents in the
 same round, because they cannot be told to change scope.
+---
+
+## Round 6 applied (2026-11-28, by the orchestrator)
+
+### WRONG-1 FIXED - session ids are now reserved atomically
+`unique_session_id` takes the `sessions` WRITE lock for the whole
+check-and-reserve and inserts a placeholder; `create_session_with_options`
+overwrites that placeholder with the real session. Red team measured
+"40 concurrent creates -> 18 unique ids" before; the reservation makes a second
+creator unable to observe or claim the same id. `fork_session` already re-checks.
+Regression test queued: two tasks that both call `unique_session_id` without
+yielding must get distinct ids.
+
+### WRONG-2 FIXED - session path grants now reach the tools
+`resolve_session_roots` merges `session_path_grants(session)` into the roots, so
+an approved `request_path_access` actually widens the session's reach instead of
+returning `{"status":"granted"}` while the next `read_file` still failed.
+
+### WRONG-3 FIXED (CRITICAL) - a remote server no longer trusts the client's scope
+`start_server_run` now overrides `extra_access_roots`, `projects` AND the
+permission mode from the SERVER's own config, keeping only `task`,
+`prior_messages` and `attachments` from the payload. Red-team verified a client
+sending `extra_access_roots: ["<out-of-sandbox folder>"]` made the server's
+`list_dir` succeed on that folder even with `bash_policy: deny`; that path is
+gone.
+
+### WRONG-6 FIXED - request_path_access no longer trusts the model's own claim
+The tool reads only `session_path_grants`, which `decide_permission` fills from
+the path recorded with the permission request (new
+`register_permission_waiter_with_meta_and_path` + `permission_path_for`). Both
+directions of the old bug are closed: a fabricated `approved:true` in the args
+grants nothing, and a human's Approve DOES grant.
+
+### Also applied
+- **D6**: an empty incoming secret no longer wipes the stored one - a config
+  round-trip that does not echo the redacted placeholder used to delete the
+  provider API key and break every later turn.
+- **D5**: automation ids are unique on derivation (two names slugifying the same
+  used to share an id and the second save replaced the first).
+- **D4**: prompts over 100k characters are rejected with 413 instead of being
+  stored, sent, and failing with the provider's raw 400.
+- LRU eviction drops the per-session allowlist/grant/notice maps.
+---
+
+## Round 6/7 - CRITICAL PROCESS NOTES (read before doing anything)
+
+### 2026-11-28: lost-work incident and recovery (do not repeat)
+- I ran `git checkout -- src/web/handlers.rs` to undo a malformed debug edit. That reverted hours of work from TWO agents, because `handlers.rs` carried both their uncommitted edits and mine.
+- Recovery: the combined content survived as an **unreachable git blob** (`f8ff6d9de819d35d60ab38f51aab355c286a1531`, found via `git fsck --unreachable`) and was restored byte-for-byte from it.
+- Rule: **never `git checkout -- <file>` a shared working file.** Use `git stash`, or restore from a blob.
+
+### Lossless editing rules learned the hard way
+- PowerShell redirection (`> file`) writes **UTF-16LE**, which corrupts Rust/JS. Use `cmd /c "git cat-file -p <blob> > file"` to extract bytes losslessly.
+- PowerShell string `.Replace()` eats Rust delimiters: `>>` collapses and backticks vanish inside strings. Prefer the `edit` tool.
+- `git stash push -- <file>` takes a full-worktree snapshot each time: it is usable as a cheap backup before any risky edit.
+
+### Concurrency protocol (enforced)
+Exactly ONE agent edits source per round. Follow-up messages to a running subagent are truncated by the harness (`sessionID` arrives as `ses`), so a running agent CANNOT be told to change scope - never start a second editor.
+
+### The bug that cost the most time (fixed)
+`JoinHandle polled after completion`: the turn loop polled `&mut runner_handle` inside `select!` and then awaited the handle again in the terminal arm, panicking the tokio worker. The panic happened after `SessionCompleted` was emitted but before `update_session_status("completed")`, so **every session stuck on "running" forever**. Symptom: a session whose history ends in `SessionCompleted` while `/api/sessions` still reports `running`, and a stderr line `tokio-rt-worker ... JoinHandle polled after completion`.
+Fix: the `select!` arm takes the result into `run_res`, and the terminal arm uses that value instead of awaiting the handle again.

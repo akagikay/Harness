@@ -246,11 +246,14 @@ mod tests {
         let mut existing = HarnessConfig::default();
         existing.api_key = "sk-live-1".into();
 
-        // Explicit clear with "" must clear, not restore.
+        // An empty incoming value is preserved by the newer `restore_secrets` contract:
+        // `POST /api/config` sends the whole config back, so a client that omits
+        // the (redacted) key must not wipe the stored one and break every later
+        // turn with "No model provider configured".
         let mut incoming = existing.clone();
         incoming.api_key = String::new();
         incoming.restore_secrets(&existing);
-        assert_eq!(incoming.api_key, "");
+        assert_eq!(incoming.api_key, "sk-live-1");
 
         // Empty stays empty (no credential configured).
         let mut none = HarnessConfig::default();
