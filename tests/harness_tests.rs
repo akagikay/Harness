@@ -6535,6 +6535,201 @@ async fn test_update_request_retries_transient_github_failures() {
 }
 
 #[tokio::test]
+async fn test_concurrent_session_create_ids_are_unique() {
+    // BUG-A: two requests minting the same millisecond used to overwrite each
+    // other and silently destroy a conversation.
+    let temp_dir = std::env::temp_dir().join(format!("harness-sess-uniq-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let mut config = HarnessConfig::default();
+    config.sandbox_root = temp_dir.clone();
+    config.mock_mode = true;
+    config.auth_token = String::new();
+    let state = AppState::new(config);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", addr);
+
+    // Fire 12 creates at once (the UI's "New Conversation" can be clicked twice).
+    let mut handles = Vec::new();
+    for i in 0..12 {
+        let client = client.clone();
+        let base = base.clone();
+        handles.push(tokio::spawn(async move {
+            client
+                .post(format!("{base}/api/sessions/create"))
+                .json(&serde_json::json!({ "title": format!("concurrent-{i}"), "project_id": "" }))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }));
+    }
+    let mut ids: Vec<String> = Vec::new();
+    for h in handles {
+        let v = h.await.unwrap();
+        if let Some(id) = v["id"].as_str() {
+            ids.push(id.to_string());
+        }
+    }
+    let total = ids.len();
+    let unique: std::collections::HashSet<&String> = ids.iter().collect();
+    assert_eq!(unique.len(), total, "session ids must be unique: {ids:?}");
+
+    // Every one of them survives in the session list.
+    let listed: Value = client.get(format!("{base}/api/sessions")).send().await.unwrap().json().await.unwrap();
+    let sessions = listed.as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        sessions.len(),
+        total,
+        "no conversation may be lost: listed {} of {total}", sessions.len()
+    );
+
+    srv.abort();
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_multi_folder_project_keeps_extra_folders_on_remote_runs() {
+    // BUG-B: a project spanning several folders used to lose all but the primary
+    // root the moment it was routed to a remote execution server.
+    let temp_dir = std::env::temp_dir().join(format!("harness-multifolder-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let primary = temp_dir.join("primary");
+    let second = temp_dir.join("second");
+    let third = temp_dir.join("third");
+    std::fs::create_dir_all(&primary).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    std::fs::create_dir_all(&third).unwrap();
+
+    let mut config = HarnessConfig::default();
+    config.sandbox_root = temp_dir.clone();
+    config.mock_mode = true;
+    config.projects = vec![deepseek_harness_rs::config::Project {
+        id: "multi".to_string(),
+        name: "Multi".to_string(),
+        path: primary.clone(),
+        icon: "f".to_string(),
+        created_at: "now".to_string(),
+        is_active: true,
+        defaults: Default::default(),
+        extra_paths: vec![second.clone(), third.clone()],
+    }];
+    config.active_project_id = "multi".to_string();
+    let state = AppState::with_db(config, deepseek_harness_rs::db::HarnessDb::open_in_memory().unwrap());
+
+    let session_id = deepseek_harness_rs::state::unique_session_id(&state).await;
+    state
+        .create_session_with_options(
+            session_id.clone(),
+            "multi folder".into(),
+            "multi".into(),
+            None,
+            None,
+            None,
+            "running",
+        )
+        .await;
+
+    // The client-side resolution sees all three folders...
+    let roots = state.resolve_session_roots(&session_id).await;
+    assert!(roots.contains(&primary), "{roots:?}");
+    assert!(roots.contains(&second), "{roots:?}");
+    assert!(roots.contains(&third), "{roots:?}");
+
+    // ...and the config a remote server would receive carries them as approved
+    // access roots (that is what start_server_run enforces with).
+    let conf = state.config.read().await;
+    let proj = conf.projects.iter().find(|p| p.id == "multi").unwrap();
+    assert_eq!(proj.all_paths().len(), 3, "all_paths covers every folder");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_provider_detection_covers_top_level_config() {
+    // BUG-C: onboarding reported "no provider" for a working NIM harness.
+    let mut conf = HarnessConfig::default();
+    assert!(!deepseek_harness_rs::config::has_usable_provider(&conf));
+    conf.api_base = "https://integrate.api.nvidia.com/v1".to_string();
+    conf.api_key = "nvapi-test".to_string();
+    conf.model = "nvidia/nemotron-3.5-lightning-30b-a3b".to_string();
+    assert!(
+        deepseek_harness_rs::config::has_usable_provider(&conf),
+        "a top-level api_base + api_key + model is a working provider"
+    );
+    // Mock mode always counts.
+    conf.mock_mode = true;
+    conf.api_key = String::new();
+    assert!(deepseek_harness_rs::config::has_usable_provider(&conf));
+}
+
+#[tokio::test]
+async fn test_folder_picker_hides_harness_secrets() {
+    let temp_dir = std::env::temp_dir().join(format!("harness-picker-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    std::fs::write(temp_dir.join("notes.txt"), "keep me").unwrap();
+    std::fs::write(temp_dir.join("harness.key"), "SECRET-KEY").unwrap();
+    std::fs::write(temp_dir.join("harness.db"), "x").unwrap();
+    std::fs::write(temp_dir.join(".env"), "TOKEN=x").unwrap();
+    std::fs::create_dir_all(temp_dir.join("sub")).unwrap();
+
+    let mut config = HarnessConfig::default();
+    config.sandbox_root = temp_dir.clone();
+    config.auth_token = String::new();
+    let state = AppState::new(config);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state);
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+
+    let resp: Value = client
+        .get(format!(
+            "http://{}/api/filesystem/browse?path={}",
+            addr,
+            urlencoding(&temp_dir.display().to_string())
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entries = resp["entries"].as_array().cloned().unwrap_or_default();
+    let names: Vec<&str> = entries.iter().filter_map(|e| e["name"].as_str()).collect();
+    assert!(names.contains(&"notes.txt"), "{names:?}");
+    for hidden in ["harness.key", "harness.db", ".env"] {
+        assert!(
+            !names.contains(&hidden),
+            "{hidden} must never be listed by the folder picker"
+        );
+    }
+
+    srv.abort();
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// Minimal percent-encoding for a query value.
+fn urlencoding(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+#[tokio::test]
 async fn test_update_status_endpoint_exposes_phase() {
     let temp_dir = std::env::temp_dir().join(format!("harness-upd-status-{}", std::process::id()));
     std::fs::create_dir_all(&temp_dir).unwrap();

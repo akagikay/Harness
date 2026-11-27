@@ -409,6 +409,22 @@ pub fn spawn_session_turn(
                 config.with_model_override(eff_m, eff_p, eff_override)
             };
             session_config.sandbox_root = project_path;
+            // A project may span several folders. The in-process runner learns
+            // them through `resolve_session_roots`, but a *remote* execution
+            // server only receives this config - so hand it the extra folders as
+            // explicitly approved access roots or multi-folder projects would
+            // silently lose 2 of 3 folders the moment they route remotely.
+            if let Some(proj) = config.projects.iter().find(|p| p.id == project_id) {
+                for root in proj.all_paths() {
+                    if !session_config
+                        .extra_access_roots
+                        .iter()
+                        .any(|existing| existing == &root)
+                    {
+                        session_config.extra_access_roots.push(root);
+                    }
+                }
+            }
             session_config.knowledge_only = crate::config::is_knowledge_only_project(&project_id);
             if session_config.knowledge_only {
                 session_config.permissions.mode = crate::config::PermissionMode::ReadOnly;
@@ -607,7 +623,8 @@ pub async fn create_session(
         runner_task = "Analyze the attached file(s).".to_string();
     }
 
-    let session_id = format!("ses_{}", chrono::Utc::now().timestamp_millis());
+    // Unique per allocation: concurrent creators must not share a millisecond id.
+    let session_id = crate::state::unique_session_id(&state).await;
     let (bcast_tx, cancel_notify) = state
         .create_session_with_options(
             session_id.clone(),
@@ -1817,6 +1834,57 @@ pub async fn list_all_provider_models(
     }
 
     let mut groups = futures_util::future::join_all(futs).await;
+    // The single top-level provider counts too: a harness pointed at
+    // `https://host/v1` with an `api_key` + `model` (no saved custom provider)
+    // is a working setup, and the model picker must show it as one.
+    let top_base = conf.api_base.trim();
+    if !top_base.is_empty() && crate::config::has_usable_provider(&conf) {
+        let provider_id = if conf.provider.trim().is_empty() {
+            "default".to_string()
+        } else {
+            conf.provider.clone()
+        };
+        let mut models: Vec<RemoteModelItem> = Vec::new();
+        if !conf.model.trim().is_empty() {
+            let caps = resolve_model_capabilities(&conf.model, None);
+            models.push(RemoteModelItem {
+                id: conf.model.clone(),
+                owned_by: Some(provider_id.clone()),
+                provider_id: provider_id.clone(),
+                provider_name: if provider_id == "default" {
+                    "Default Provider".to_string()
+                } else {
+                    provider_id.clone()
+                },
+                reasoning: caps.reasoning,
+                modalities: caps.modalities,
+                max_context_tokens: caps.max_context_tokens,
+                experimental: is_google_search_model(&conf.model),
+            });
+        }
+        if models.is_empty() {
+            models = fetch_models_for_provider(
+                provider_id.clone(),
+                "Default Provider".to_string(),
+                top_base.to_string(),
+                conf.api_key.clone(),
+            )
+            .await
+            .unwrap_or_default();
+        }
+        groups.push(ProviderModelsGroup {
+            provider_id: provider_id.clone(),
+            provider_name: if provider_id == "default" {
+                "Default Provider".to_string()
+            } else {
+                provider_id.clone()
+            },
+            is_active: provider_id == conf.provider,
+            has_credentials: true,
+            error: None,
+            models,
+        });
+    }
     groups.push(ProviderModelsGroup {
         provider_id: "builtin".to_string(),
         provider_name: "Built-in Experimental".to_string(),
@@ -2777,7 +2845,8 @@ pub async fn create_idle_conversation(
     State(state): State<AppState>,
     Json(payload): Json<CreateIdleConversationRequest>,
 ) -> Json<SessionSummary> {
-    let session_id = format!("ses_{}", chrono::Utc::now().timestamp_millis());
+    // Unique per allocation: concurrent creators must not share a millisecond id.
+    let session_id = crate::state::unique_session_id(&state).await;
     let title = payload
         .title
         .map(|s| s.trim().to_string())
@@ -3462,6 +3531,19 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
     (drives, favorites)
 }
 
+/// Names the folder picker must never list.
+///
+/// The DB, its WAL/SHM siblings and the encryption key live next to the
+/// executable. Browsing that directory used to expose them - and `harness.key`
+/// is the credential that decrypts every stored API key.
+fn is_sensitive_picker_entry(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower == "harness.key" || lower == "harness.db" || lower == "harness.db-wal" || lower == "harness.db-shm" {
+        return true;
+    }
+    lower.ends_with(".key") || lower == ".env" || lower.starts_with(".env.")
+}
+
 pub async fn browse_filesystem(
     State(state): State<AppState>,
     Query(query): Query<BrowseQuery>,
@@ -3543,6 +3625,10 @@ pub async fn browse_filesystem(
         Ok(mut dir) => {
             while let Ok(Some(entry)) = dir.next_entry().await {
                 let name = entry.file_name().to_string_lossy().to_string();
+                // Never surface the harness's own secrets to the folder picker.
+                if is_sensitive_picker_entry(&name) {
+                    continue;
+                }
                 let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
                 let meta = entry.metadata().await.ok();
                 let size_bytes = if is_dir { None } else { meta.as_ref().map(|m| m.len()) };
@@ -3627,6 +3713,15 @@ pub async fn create_directory(
     }
 
     let target = parent.join(clean_name);
+
+    // Report a duplicate name the same way rename does: a folder that already
+    // exists is a conflict, not a silent success.
+    if target.exists() {
+        return Err(json_api_error(
+            StatusCode::CONFLICT,
+            format!("'{clean_name}' already exists."),
+        ));
+    }
 
     if let Err(e) = tokio::fs::create_dir_all(&target).await {
         return Err(json_api_error(
@@ -4725,13 +4820,10 @@ pub async fn stop_automation_handler(
 // First-run onboarding
 // ============================================================================
 
-/// `GET /api/onboarding` — what the first-run wizard should show.
+/// `GET /api/onboarding` - what the first-run wizard should show.
 pub async fn onboarding_state(State(state): State<AppState>) -> Json<serde_json::Value> {
     let conf = state.config.read().await;
-    let provider_configured = conf
-        .custom_providers
-        .iter()
-        .any(|p| !p.api_key.trim().is_empty() || p.api_base.contains("localhost"));
+    let provider_configured = crate::config::has_usable_provider(&conf);
     let project = conf
         .projects
         .iter()

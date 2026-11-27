@@ -826,6 +826,41 @@ pub fn default_update_repo() -> String {
     crate::updater::DEFAULT_REPO.to_string()
 }
 
+/// True when the harness can actually reach a model with the stored config.
+///
+/// The wizard (and the "No model provider configured" guard) must look at every
+/// way a provider can be configured - not only saved custom providers. A harness
+/// that was pointed at `https://integrate.api.nvidia.com/v1` with a top-level
+/// `api_key` + `model` works fine, but the old check reported "no provider".
+pub fn has_usable_provider(conf: &HarnessConfig) -> bool {
+    use crate::models::google_search_client::is_google_search_model;
+    if conf.mock_mode {
+        return true;
+    }
+    let base = conf.api_base.trim();
+    let local_base = base.contains("localhost") || base.contains("127.0.0.1");
+    // A saved custom provider with a key or a local endpoint.
+    let custom = conf
+        .custom_providers
+        .iter()
+        .any(|p| !p.api_key.trim().is_empty() || p.api_base.contains("localhost"));
+    if custom {
+        return true;
+    }
+    // The top-level (single) provider: either an explicit key, a local endpoint
+    // that needs no key, or a model that runs through a built-in integration.
+    if !conf.api_key.trim().is_empty() {
+        return true;
+    }
+    if local_base && !conf.model.trim().is_empty() {
+        return true;
+    }
+    if is_google_search_model(&conf.model) {
+        return true;
+    }
+    false
+}
+
 impl Default for HarnessConfig {
     fn default() -> Self {
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));

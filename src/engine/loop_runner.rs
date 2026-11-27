@@ -908,6 +908,8 @@ impl AgentLoopRunner {
 
             let total_calls_in_turn = turn_result.tool_calls.len();
             let mut tc_idx = 0usize;
+            // Permission requests in this turn that were denied or timed out.
+            let mut turn_permission_denials = 0usize;
             while tc_idx < total_calls_in_turn {
                 let exec_registry = if let Some(ref st) = self.state {
                     st.get_registry_snapshot().await
@@ -1205,6 +1207,25 @@ impl AgentLoopRunner {
                     }
                     PermissionLevel::Ask => {
                         if let Some(ref st) = self.state {
+                            // A denied (or unanswered) permission must not let
+                            // the model burn 120s per attempt on the same tool
+                            // forever: cap denials per turn and fail fast.
+                            turn_permission_denials += 1;
+                            if turn_permission_denials > 3 {
+                                let msg = format!(
+                                    "Aborting turn: {turn_permission_denials} permission requests were \
+                                     denied or timed out. Approve the tool in the permission prompt, or \
+                                     switch the permission mode to Autonomous."
+                                );
+                                let _ = event_tx
+                                    .send(HarnessEvent::Warning { message: msg.clone() })
+                                    .await;
+                                context.messages.push(ChatMessage::tool(
+                                    tool_call.id.clone(),
+                                    format!("Error: {msg}"),
+                                ));
+                                return Err(msg);
+                            }
                             let perm_seq = PERM_SEQ.fetch_add(1, Ordering::Relaxed);
                             let perm_id = format!(
                                 "perm_{}_{}_{}_{}",

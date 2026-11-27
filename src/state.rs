@@ -37,6 +37,33 @@ pub struct QueuedPrompt {
     pub created_at: String,
 }
 
+/// Allocate a conversation id that cannot collide with one already in use.
+///
+/// `ses_{unix_ms}` is not unique: two browser tabs (or a double-clicked
+/// "New Conversation") can mint the same millisecond, and the second writer
+/// silently overwrote the first conversation. Retry with a suffix instead.
+pub async fn unique_session_id(state: &AppState) -> String {
+    let base = format!("ses_{}", chrono::Utc::now().timestamp_millis());
+    let mut candidate = base.clone();
+    let mut attempt = 0;
+    loop {
+        let recently_deleted = {
+            let deleted = state.recently_deleted_sessions.lock().await;
+            should_skip_resurrect(&deleted, &candidate)
+        };
+        let taken = state.sessions.read().await.contains_key(&candidate) || recently_deleted;
+        if !taken {
+            return candidate;
+        }
+        attempt += 1;
+        if attempt > 64 {
+            // Paranoia fallback: a monotonic counter can always make progress.
+            return format!("{base}-{attempt}");
+        }
+        candidate = format!("{base}-{attempt}");
+    }
+}
+
 pub fn is_known_builtin_slash_command(cmd: &str) -> bool {
     matches!(
         cmd.trim().trim_start_matches('/').to_ascii_lowercase().as_str(),
