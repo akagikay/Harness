@@ -405,6 +405,11 @@ pub struct AppState {
     pub sessions: Arc<RwLock<HashMap<String, SessionState>>>,
     pub swarm_boards: Arc<RwLock<HashMap<String, SwarmBoard>>>,
     pub pending_permissions: Arc<RwLock<HashMap<String, oneshot::Sender<bool>>>>,
+    /// (tool, session) for each pending permission request, so an "always
+    /// allow" decision can name the tool it applies to.
+    pub pending_permission_meta: Arc<RwLock<HashMap<String, (String, String)>>>,
+    /// Tools a user approved for the rest of a session ("always allow").
+    pub session_tool_allowlist: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     pub remote_perm_routes: Arc<RwLock<HashMap<String, String>>>,
     pub server_runs: Arc<RwLock<HashMap<String, ServerRunHandle>>>,
     pub active_remote_runs: Arc<RwLock<HashMap<String, (crate::config::ServerNodeConfig, String)>>>,
@@ -427,6 +432,8 @@ impl AppState {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             swarm_boards: Arc::new(RwLock::new(HashMap::new())),
             pending_permissions: Arc::new(RwLock::new(HashMap::new())),
+            pending_permission_meta: Arc::new(RwLock::new(HashMap::new())),
+            session_tool_allowlist: Arc::new(RwLock::new(HashMap::new())),
             remote_perm_routes: Arc::new(RwLock::new(HashMap::new())),
             server_runs: Arc::new(RwLock::new(HashMap::new())),
             active_remote_runs: Arc::new(RwLock::new(HashMap::new())),
@@ -588,6 +595,8 @@ if !saved_conf.onboarded {
             sessions: Arc::new(RwLock::new(sessions_map)),
             swarm_boards: Arc::new(RwLock::new(boards_map)),
             pending_permissions: Arc::new(RwLock::new(HashMap::new())),
+            pending_permission_meta: Arc::new(RwLock::new(HashMap::new())),
+            session_tool_allowlist: Arc::new(RwLock::new(HashMap::new())),
             remote_perm_routes: Arc::new(RwLock::new(HashMap::new())),
             server_runs: Arc::new(RwLock::new(HashMap::new())),
             active_remote_runs: Arc::new(RwLock::new(HashMap::new())),
@@ -1135,21 +1144,83 @@ if !saved_conf.onboarded {
         lock.insert(perm_id, tx);
     }
 
+    /// Register a permission request together with the (tool, session) it is
+    /// asking about, so a later "always allow" decision can name the tool.
+    pub async fn register_permission_waiter_with_meta(
+        &self,
+        perm_id: String,
+        session_id: String,
+        tool: String,
+        tx: oneshot::Sender<bool>,
+    ) {
+        self.pending_permission_meta
+            .write()
+            .await
+            .insert(perm_id.clone(), (tool, session_id));
+        self.register_permission_waiter(perm_id, tx).await;
+    }
+
     /// Drop a pending permission waiter without resolving it (e.g. on cancel or
     /// timeout) so stale entries cannot accumulate for the process lifetime.
     pub async fn cancel_permission_waiter(&self, perm_id: &str) {
         let mut lock = self.pending_permissions.write().await;
         lock.remove(perm_id);
+        drop(lock);
+        self.pending_permission_meta.write().await.remove(perm_id);
     }
 
     pub async fn resolve_permission(&self, perm_id: &str, approved: bool) -> bool {
-        let mut lock = self.pending_permissions.write().await;
-        if let Some(tx) = lock.remove(perm_id) {
-            let _ = tx.send(approved);
-            true
-        } else {
-            false
+        let sender = {
+            let mut lock = self.pending_permissions.write().await;
+            lock.remove(perm_id)
+        };
+        self.pending_permission_meta.write().await.remove(perm_id);
+        match sender {
+            Some(tx) => {
+                let _ = tx.send(approved);
+                true
+            }
+            None => false,
         }
+    }
+
+    /// The tool name a pending permission request belongs to, when still awake.
+    ///
+    /// Used by "Approve & always allow": the decision only names the tool once
+    /// the request is already registered, so the tool is captured alongside it.
+    pub async fn permission_tool_for(&self, perm_id: &str) -> Option<String> {
+        let lock = self.pending_permission_meta.read().await;
+        lock.get(perm_id).map(|(t, _)| t.clone())
+    }
+
+    /// The session a pending permission request belongs to (see
+    /// [`Self::permission_tool_for`]).
+    pub async fn permission_session_for(&self, perm_id: &str) -> Option<String> {
+        let lock = self.pending_permission_meta.read().await;
+        lock.get(perm_id).map(|(_, s)| s.clone())
+    }
+
+    /// Remember that `tool` was approved for the rest of `session_id`.
+    pub async fn allow_tool_for_session(&self, session_id: &str, tool: &str) {
+        self.session_tool_allowlist
+            .write()
+            .await
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(tool.to_string());
+    }
+
+    /// True when this tool was already approved for this session.
+    pub async fn is_tool_allowed_for_session(&self, session_id: &str, tool: &str) -> bool {
+        let lock = self.session_tool_allowlist.read().await;
+        lock.get(session_id)
+            .map(|tools| tools.contains(tool))
+            .unwrap_or(false)
+    }
+
+    /// Forget every "always allow" decision for a session (e.g. on delete).
+    pub async fn clear_tool_allowlist(&self, session_id: &str) {
+        self.session_tool_allowlist.write().await.remove(session_id);
     }
 
     /// Replace a session's `cancel_notify` with a fresh `Notify` when resuming an idle/stopped session.
@@ -1758,6 +1829,8 @@ if !saved_conf.onboarded {
             let mut boards = self.swarm_boards.write().await;
             boards.remove(session_id);
         }
+        // A deleted session must not carry its "always allow" trust forward.
+        self.clear_tool_allowlist(session_id).await;
         // Record the deletion so ensure_session_loaded cannot resurrect this id from a DB read
         // that raced with the delete.
         {

@@ -31,9 +31,9 @@
             </div>
 
             <div class="sidebar-actions">
-                <button class="btn-new-chat" id="btn-new-chat">
+                <button class="btn-new-chat" id="btn-new-chat" title="New project chat (with file & shell tools) — Ctrl+N">
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                    <span>New Conversation</span>
+                    <span>New Project Chat</span>
                     <span class="kbd-hint">⌃N</span>
                 </button>
             </div>
@@ -136,6 +136,8 @@
                 </div>
 
                 <div class="top-nav-right">
+                    <!-- Pending approval: the agent is paused until answered -->
+                    <button type="button" class="permission-badge hidden" id="permission-badge" title="The agent is paused waiting for your approval"></button>
                     <!-- Active Task / Swarm Pill -->
                     <div class="task-running-indicator hidden" id="task-running-strip" title="Active session and swarm agents">
                         <span class="pulse-amber-dot"></span>
@@ -1440,10 +1442,11 @@
                             </div>
                             <button type="button" class="btn-card-action primary" id="btn-new-automation" style="margin-top:10px;">+ New Automation</button>
                         </div>
-                    </section>
 
-                    <!-- AUTO SKILL ROUTING -->
-                    <section class="settings-subsection" id="settings-skill-router">
+                        <!-- AUTO SKILL ROUTING (lives inside the Skills page so it
+                             hides with every other tab - switchSettingsTab only
+                             toggles #settings-page-* elements) -->
+                        <div class="settings-subsection" id="settings-skill-router">
                         <h5>Automatic Skill Routing</h5>
                         <p class="settings-hint">
                             Let Harness pick a matching skill on its own from how you phrase a task.
@@ -1470,6 +1473,7 @@
                                 <input type="number" id="cfg-skill-router-max" class="form-input" min="0" max="4" step="1" value="2">
                                 <span class="form-hint">0 disables routing. Use 1 to keep it single-intent.</span>
                             </div>
+                        </div>
                         </div>
                     </section>
                 </div>

@@ -6730,6 +6730,61 @@ fn urlencoding(s: &str) -> String {
 }
 
 #[tokio::test]
+async fn test_permission_always_allow_is_honored_and_cleared() {
+    use deepseek_harness_rs::state::AppState;
+    let mut config = HarnessConfig::default();
+    config.mock_mode = true;
+    let state = AppState::new(config);
+
+    // No allowlist entry yet: the tool must still prompt.
+    assert!(!state.is_tool_allowed_for_session("ses-x", "bash").await);
+
+    // Register a pending request the way the loop runner does, remember the tool.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let perm_id = "perm_test_1".to_string();
+    state
+        .register_permission_waiter_with_meta(
+            perm_id.clone(),
+            "ses-x".to_string(),
+            "bash".to_string(),
+            tx,
+        )
+        .await;
+
+    // The meta lookup is what makes "always allow" possible.
+    assert_eq!(
+        state.permission_tool_for(&perm_id).await.as_deref(),
+        Some("bash")
+    );
+    assert_eq!(
+        state.permission_session_for(&perm_id).await.as_deref(),
+        Some("ses-x")
+    );
+
+    // "Approve & always allow" -> the decision is recorded for the session.
+    state.allow_tool_for_session("ses-x", "bash").await;
+    assert!(
+        state.is_tool_allowed_for_session("ses-x", "bash").await,
+        "an approved tool must not be re-prompted in the same session"
+    );
+    // ...but only that session/tool.
+    assert!(!state.is_tool_allowed_for_session("ses-y", "bash").await);
+    assert!(!state.is_tool_allowed_for_session("ses-x", "read_file").await);
+
+    // Resolving still reaches the waiter.
+    assert!(state.resolve_permission(&perm_id, true).await);
+    assert!(rx.await.unwrap(), "the approval must reach the loop");
+    assert!(
+        state.permission_tool_for(&perm_id).await.is_none(),
+        "a resolved request leaves no pending metadata"
+    );
+
+    // Deleting a session drops its trust.
+    state.clear_tool_allowlist("ses-x").await;
+    assert!(!state.is_tool_allowed_for_session("ses-x", "bash").await);
+}
+
+#[tokio::test]
 async fn test_update_status_endpoint_exposes_phase() {
     let temp_dir = std::env::temp_dir().join(format!("harness-upd-status-{}", std::process::id()));
     std::fs::create_dir_all(&temp_dir).unwrap();
@@ -6775,4 +6830,111 @@ async fn test_update_status_endpoint_exposes_phase() {
 
     srv.abort();
     let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// Regression: approved permission requests must NOT count toward the per-turn
+// denial-abort cap. Before the fix, `turn_permission_denials` was incremented
+// on EVERY `Ask` request (approved or denied), so a legitimate turn that needed
+// more than three approvals was aborted mid-flight with a misleading
+// "denied or timed out" message even though the user approved every request.
+// ============================================================================
+struct ApproveCountingBashModel {
+    bash_calls_before_done: usize,
+    step: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelAdapter for ApproveCountingBashModel {
+    async fn stream_completion(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &Value,
+        _event_tx: &mpsc::Sender<HarnessEvent>,
+    ) -> Result<ModelTurnResult, String> {
+        let idx = self.step.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if idx == 0 {
+            // One turn that issues SEVERAL parallel Ask-gated bash calls, so the
+            // whole batch flows through the per-turn denial counter.
+            let calls: Vec<ToolCall> = (0..self.bash_calls_before_done)
+                .map(|i| make_tool_call(&format!("bash_call_{i}"), "bash", r#"{"command":"echo hi"}"#))
+                .collect();
+            Ok(ModelTurnResult {
+                content: None,
+                reasoning_content: None,
+                tool_calls: calls,
+                finish_reason: Some("tool_calls".into()),
+                estimated_tokens: 20,
+                ..Default::default()
+            })
+        } else {
+            Ok(ModelTurnResult {
+                content: Some("ALL_APPROVED_DONE".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                estimated_tokens: 10,
+                ..Default::default()
+            })
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_many_approved_permissions_do_not_abort_the_turn() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "harness_perm_test_{}",
+        std::process::id()
+    ));
+    let _ = tokio::fs::create_dir_all(&temp_dir).await;
+
+    // Safe mode with bash forced to Ask: every bash call needs approval.
+    let mut cfg = HarnessConfig::default();
+    cfg.sandbox_root = temp_dir.clone();
+    cfg.permissions.mode = deepseek_harness_rs::config::PermissionMode::Safe;
+    cfg.permissions.bash_policy = PermissionLevel::Ask;
+    cfg.permissions
+        .rules
+        .insert("bash".to_string(), PermissionLevel::Ask);
+    cfg.max_iterations = 0;
+
+    let registry = PluginRegistry::new(&cfg);
+    let model = Arc::new(ApproveCountingBashModel {
+        bash_calls_before_done: 6,
+        step: std::sync::atomic::AtomicUsize::new(0),
+    });
+
+    let state = AppState::new(cfg.clone());
+
+    // Auto-approve every permission request the runner emits (6 of them, which
+    // is more than the abort cap of 3 the buggy counter hit on approvals).
+    let approver_state = state.clone();
+    let (tx, mut rx) = mpsc::channel::<HarnessEvent>(256);
+    let approver = tokio::spawn(async move {
+        let mut approved = 0usize;
+        while let Some(evt) = rx.recv().await {
+            if let HarnessEvent::PermissionRequested { perm_id, .. } = evt {
+                approver_state.resolve_permission(&perm_id, true).await;
+                approved += 1;
+            }
+        }
+        approved
+    });
+
+    let runner = AgentLoopRunner::new(
+        "perm_approve_test".into(),
+        "Run six approved bash commands".into(),
+        cfg,
+        registry,
+        model,
+        Some(state),
+    );
+    let result = runner.run(tx).await;
+
+    let approved = approver.await.expect("approver task panicked");
+    assert_eq!(approved, 6, "all six bash calls should have been approved");
+    let answer = result.expect("turn must NOT abort when every permission is approved");
+    assert_eq!(answer, "ALL_APPROVED_DONE");
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }

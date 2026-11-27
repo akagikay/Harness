@@ -1202,7 +1202,9 @@ document.addEventListener('DOMContentLoaded', () => {
     setDisplayVerbosity(activeDisplayVerbosity, false);
 
     btnSubmit.addEventListener('click', handlePromptSubmit);
-    btnNewChat.addEventListener('click', () => startNewConversation(true));
+    // The sidebar CTA and Ctrl+N must do the same thing: a PROJECT chat (with file
+    // & shell tools). The sidebar label advertises ^N, so they cannot differ.
+    btnNewChat.addEventListener('click', () => startNewConversation(false));
 
     // Steer / Queue Segmented Control (Settings Modal)
     if (settingsSendMode) {
@@ -4939,7 +4941,18 @@ async function submitPromptText(rawTask, clearInput = false) {
                 })
             });
 
-            if (!res.ok) throw new Error('Failed to create session');
+            // Name the fix, not just the failure: the most common cause of this is an
+            // unconfigured provider, and the user needs to know where to go.
+            let detail = '';
+            try { detail = (await res.text()) || ''; } catch (_) {}
+            let hint = 'Check Settings → AI Providers for a valid API key and model.';
+            const low = detail.toLowerCase();
+            if (low.includes('provider') || low.includes('api key') || low.includes('no model')) {
+                hint = 'No API key or model configured. Settings → AI Providers → add a provider, then try again.';
+            } else if (low.includes('project')) {
+                hint = 'The selected project is missing or unusable. Pick another project in the sidebar.';
+            }
+            throw new Error(`Could not start a session (HTTP ${res.status}). ${hint}`);
             const { session_id } = await res.json();
             currentSessionId = session_id;
             updateBreadcrumbSessionUI(taskDisplayTitle);
@@ -7199,45 +7212,100 @@ function renderPermissionPrompt(permId, tool, description, args) {
     const card = document.createElement('div');
     card.id = `perm-${permId}`;
     card.className = 'permission-card';
+    // The agent is BLOCKED until a human answers this. It must be impossible to
+    // miss: announced to screen readers, and scrolled into view even when the
+    // reader has auto-scroll turned off to read earlier output.
+    card.setAttribute('role', 'alert');
+    card.setAttribute('aria-live', 'assertive');
     card.innerHTML = `
         <div class="permission-card-head">
             <span class="perm-shield-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>
-            <span>Security Permission Required (${escapeHtml(tool || 'tool')})</span>
+            <span>Waiting for your approval — the agent is paused (${escapeHtml(tool || 'tool')})</span>
         </div>
         <div class="permission-card-desc">${escapeHtml(description)}</div>
         <div class="permission-card-actions">
             <button class="perm-btn deny" onclick="decidePermission('${permId}', false)">Deny</button>
             <button class="perm-btn approve" onclick="decidePermission('${permId}', true)">Approve</button>
+            <button class="perm-btn always" onclick="decidePermission('${permId}', true, true)">Approve & always allow</button>
         </div>
     `;
     streamContainer.appendChild(card);
+    // Force it on screen regardless of the reader's scroll position.
+    try {
+        card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    } catch (_) {
+        card.scrollIntoView();
+    }
+    markPendingPermission(permId, tool);
     return card;
 }
 
-window.decidePermission = async function(permId, approved) {
+/// Track how many approvals are outstanding, and reflect them in the document
+/// title / top bar so a stalled run is never mistaken for a working one.
+const __pendingPerms = new Set();
+function markPendingPermission(permId, tool) {
+    __pendingPerms.add(permId);
+    syncPermissionBadge();
+}
+function clearPendingPermission(permId) {
+    __pendingPerms.delete(permId);
+    syncPermissionBadge();
+}
+function syncPermissionBadge() {
+    const n = __pendingPerms.size;
+    document.body.classList.toggle('has-pending-permission', n > 0);
+    const badge = document.getElementById('permission-badge');
+    if (badge) {
+        badge.textContent = n > 0 ? `${n} awaiting approval` : '';
+        badge.classList.toggle('hidden', n === 0);
+        badge.onclick = () => {
+            const first = document.querySelector('.permission-card[role="alert"]');
+            if (first) {
+                first.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                const approve = first.querySelector('.perm-btn.approve');
+                if (approve) approve.focus();
+            }
+        };
+    }
+}
+function pendingPermissionCount() {
+    return __pendingPerms.size;
+}
+
+window.decidePermission = async function(permId, approved, alwaysAllow = false) {
     try {
         const res = await fetch(`/api/permissions/${permId}/decision`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ approved })
+            body: JSON.stringify({ approved, always_allow: !!alwaysAllow })
         });
-        if (res.ok) updatePermissionPromptDecision(permId, approved);
+        if (res.ok) {
+            updatePermissionPromptDecision(permId, approved, alwaysAllow);
+            clearPendingPermission(permId);
+        } else {
+            showToast('Could not record that decision (HTTP ' + res.status + ').', 'error', 7000);
+        }
     } catch (e) {
-        showToast('Permission decision error: ' + e, 'error');
+        showToast('Permission decision error: ' + e.message, 'error', 7000);
     }
 };
 
-function updatePermissionPromptDecision(permId, approved) {
+function updatePermissionPromptDecision(permId, approved, alwaysAllow = false) {
+    clearPendingPermission(permId);
     const card = document.getElementById(`perm-${permId}`);
     if (card) {
         const actions = card.querySelector('.permission-card-actions');
         if (actions) {
+            const label = approved
+                ? (alwaysAllow ? 'Approved — always allowed' : 'Approved')
+                : 'Denied';
             actions.innerHTML = `
                 <span style="font-size: 0.8rem; font-weight: 600; color: ${approved ? 'var(--accent-green)' : 'var(--accent-red)'};">
-                    ${approved ? '✓ Approved' : '✕ Denied'}
+                    ${approved ? '✓' : '✕'} ${label}
                 </span>
             `;
         }
+        card.setAttribute('aria-live', 'off');
     }
 }
 

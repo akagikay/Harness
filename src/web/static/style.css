@@ -5775,6 +5775,42 @@ input[type="number"].form-input::-webkit-inner-spin-button {
     color: #fca5a5;
 }
 
+/* A permission prompt is outstanding: never let the agent look busy when it is
+   actually blocked on a human. */
+.permission-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(245, 158, 11, 0.55);
+    background: rgba(245, 158, 11, 0.16);
+    color: #fde68a;
+    font-size: 0.71rem;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    animation: perm-badge-pulse 1.6s ease-in-out infinite;
+}
+.permission-badge.hidden {
+    display: none;
+}
+.permission-badge::before {
+    content: "";
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #fbbf24;
+}
+@keyframes perm-badge-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.45); }
+    50% { box-shadow: 0 0 0 4px rgba(245, 158, 11, 0); }
+}
+body.has-pending-permission .permission-card {
+    border-color: rgba(245, 158, 11, 0.55);
+    box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.28), 0 10px 30px rgba(0, 0, 0, 0.4);
+}
+
 /* Automatic-update settings strip */
 .settings-version-strip {
     display: flex;

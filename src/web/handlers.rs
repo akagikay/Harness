@@ -721,6 +721,9 @@ pub async fn stream_session_events(
 #[derive(Deserialize)]
 pub struct PermissionDecisionRequest {
     pub approved: bool,
+    /// "Approve and always allow": stop asking for this tool in this session.
+    #[serde(default)]
+    pub always_allow: bool,
 }
 
 pub async fn decide_permission(
@@ -728,8 +731,28 @@ pub async fn decide_permission(
     Path(perm_id): Path<String>,
     Json(payload): Json<PermissionDecisionRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // "Approve & always allow" records an in-memory allowlist entry for the
+    // session, so a chatty tool (bash) is not re-prompted on every call.
+    let always_allow_tool = if payload.approved && payload.always_allow {
+        state.permission_tool_for(&perm_id).await
+    } else {
+        None
+    };
+    let always_session = if always_allow_tool.is_some() {
+        state.permission_session_for(&perm_id).await
+    } else {
+        None
+    };
+    if let (Some(tool), Some(session_id)) = (always_allow_tool, always_session) {
+        state.allow_tool_for_session(&session_id, &tool).await;
+    }
+
     if state.resolve_permission(&perm_id, payload.approved).await {
-        return Ok(Json(serde_json::json!({ "status": "resolved", "approved": payload.approved })));
+        return Ok(Json(serde_json::json!({
+            "status": "resolved",
+            "approved": payload.approved,
+            "always_allowed": payload.approved && payload.always_allow
+        })));
     }
     let remote_server_id = {
         let mut routes = state.remote_perm_routes.write().await;

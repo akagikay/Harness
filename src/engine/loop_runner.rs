@@ -1206,7 +1206,22 @@ impl AgentLoopRunner {
                         continue;
                     }
                     PermissionLevel::Ask => {
-                        if let Some(ref st) = self.state {
+                        // Already approved for this session? Skip the prompt
+                        // entirely instead of re-asking for every call.
+                        let already_allowed = match self.state {
+                            Some(ref st) => st.is_tool_allowed_for_session(&self.session_id, tool_name).await,
+                            None => false,
+                        };
+                        if already_allowed {
+                            if let Some(ref st) = self.state {
+                                let _ = event_tx
+                                    .send(HarnessEvent::Warning {
+                                        message: format!("Tool '{tool_name}' approved for this session (always allow)."),
+                                    })
+                                    .await;
+                                let _ = st;
+                            }
+                        } else if let Some(ref st) = self.state {
                             // A denied (or unanswered) permission must not let
                             // the model burn 120s per attempt on the same tool
                             // forever: cap denials per turn and fail fast.
@@ -1232,7 +1247,15 @@ impl AgentLoopRunner {
                                 self.session_id, self.agent_id, total_tool_calls, perm_seq
                             );
                             let (perm_tx, perm_rx) = oneshot::channel();
-                            st.register_permission_waiter(perm_id.clone(), perm_tx).await;
+                            // Record (tool, session) so a later "always allow"
+                            // decision can name the tool it applies to.
+                            st.register_permission_waiter_with_meta(
+                                perm_id.clone(),
+                                self.session_id.clone(),
+                                tool_name.clone(),
+                                perm_tx,
+                            )
+                            .await;
 
                             let desc = self.tool_permission_description(tool_name, &parsed_args);
                             let _ = event_tx.send(HarnessEvent::PermissionRequested {
