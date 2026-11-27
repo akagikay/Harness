@@ -1901,6 +1901,90 @@
     <!-- Custom Non-Blocking Toast Notifications (replaces browser alert) -->
     <div id="toast-container" class="toast-container" aria-live="polite" aria-atomic="true"></div>
 
-    <script src="/static/app.js"></script>
+    <!-- FIRST-RUN ONBOARDING -->
+<div id="onboarding-modal" class="modal-backdrop hidden">
+    <div class="modal-card" style="max-width:620px;">
+        <div class="modal-header">
+            <div class="modal-title">
+                <span class="modal-icon" id="onboarding-step-icon">1</span>
+                <h3 id="onboarding-title">Welcome to Harness</h3>
+            </div>
+            <button class="close-btn" id="btn-onboarding-skip" title="Skip">Skip</button>
+        </div>
+        <div class="modal-body">
+            <!-- Step 1: welcome -->
+            <div id="onboarding-step-1">
+                <p style="margin:0 0 10px;line-height:1.6;">
+                    Harness is an agentic workspace: you describe a task, and an agent reads,
+                    writes, and runs tools inside a project folder.
+                </p>
+                <ul style="margin:0;padding-left:18px;line-height:1.9;font-size:0.86rem;">
+                    <li><strong>Projects</strong> are folders the agent may work in. A project can span several folders.</li>
+                    <li><strong>Conversations</strong> are knowledge-only chats with file and shell tools disabled.</li>
+                    <li><strong>Automations</strong> run the agent on a schedule.</li>
+                    <li><strong>Skills</strong> are reusable instructions the agent can follow or write for itself.</li>
+                </ul>
+            </div>
+
+            <!-- Step 2: provider -->
+            <div id="onboarding-step-2" class="hidden">
+                <p style="margin:0 0 12px;line-height:1.6;">
+                    Add a model provider to start chatting. Nothing is configured by default.
+                </p>
+                <div class="form-group">
+                    <label for="onboarding-preset">Preset</label>
+                    <select id="onboarding-preset" class="form-input">
+                        <option value="">Choose a provider...</option>
+                        <option value="openai">OpenAI-compatible</option>
+                        <option value="deepseek">DeepSeek</option>
+                        <option value="openrouter">OpenRouter</option>
+                        <option value="groq">Groq</option>
+                        <option value="nvidia">NVIDIA NIM</option>
+                        <option value="ollama">Local Ollama (no key needed)</option>
+                        <option value="vllm">Local vLLM / SGLang</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="onboarding-api-base">API Base URL</label>
+                    <input type="text" id="onboarding-api-base" class="form-input" placeholder="https://api.example.com/v1">
+                </div>
+                <div class="form-group">
+                    <label for="onboarding-api-key">API Key</label>
+                    <input type="password" id="onboarding-api-key" class="form-input" placeholder="sk-...">
+                    <span class="form-hint">Stored encrypted on disk. Leave blank for local providers.</span>
+                </div>
+                <div class="form-group">
+                    <label for="onboarding-model">Default Model</label>
+                    <input type="text" id="onboarding-model" class="form-input" placeholder="model-name">
+                </div>
+                <div id="onboarding-provider-status" style="font-size:0.8rem;"></div>
+            </div>
+
+            <!-- Step 3: project -->
+            <div id="onboarding-step-3" class="hidden">
+                <p style="margin:0 0 12px;line-height:1.6;">
+                    Your default project workspace:
+                </p>
+                <div class="form-group">
+                    <label for="onboarding-project-path">Project Folder</label>
+                    <input type="text" id="onboarding-project-path" class="form-input">
+                    <span class="form-hint">A <code>Project</code> folder was created next to the harness executable. You can change it.</span>
+                </div>
+                <div class="form-group">
+                    <label for="onboarding-extra-paths">Additional Folders <span style="color:var(--text-dim);font-weight:400;">(optional)</span></label>
+                    <textarea id="onboarding-extra-paths" class="form-input" rows="2" placeholder="One folder per line"></textarea>
+                </div>
+            </div>
+        </div>
+        <div class="modal-footer" style="display:flex;gap:8px;justify-content:space-between;align-items:center;">
+            <span id="onboarding-progress" style="font-size:0.76rem;color:var(--text-dim);">Step 1 of 3</span>
+            <div style="display:flex;gap:8px;">
+                <button type="button" class="btn-secondary" id="btn-onboarding-back">Back</button>
+                <button type="button" class="btn-primary" id="btn-onboarding-next">Continue</button>
+            </div>
+        </div>
+    </div>
+</div>
+<script src="/static/app.js"></script>
 </body>
 </html>

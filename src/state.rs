@@ -360,24 +360,21 @@ impl AppState {
                 // CLI/env operator fields (sandbox_root, model, api_key, api_base, provider) win over
                 // the persisted config when they were explicitly set at startup.
                 saved_conf.apply_operator_overrides(&config, &HarnessConfig::default());
-                // Migration: drop providers that cannot work (no key and not a local
-                // endpoint). Older builds shipped a hardcoded key that was removed, so
-                // installs could keep a keyless provider marked active and every
-                // request failed with an opaque upstream 401.
-                let before = saved_conf.custom_providers.len();
-                saved_conf.custom_providers.retain(|p| {
-                    let base = p.api_base.to_ascii_lowercase();
-                    let local = base.contains("localhost")
-                        || base.contains("127.0.0.1")
-                        || base.contains("[::1]");
-                    !p.api_key.trim().is_empty() || local
-                });
-                if saved_conf.custom_providers.len() != before {
-                    eprintln!(
-                        "[harness-db] removed {} provider(s) with no credentials",
-                        before - saved_conf.custom_providers.len()
-                    );
-                }
+                // One-time cleanup of shipped default providers. Earlier builds seeded
+// nvidia/deepseek/openrouter/groq/ollama/vllm; the harness now ships none, so
+// drop anything that still looks exactly like a preset (same id, base and
+// placeholder key). Gated on `onboarded` so a provider the user later adds is
+// never removed.
+if !saved_conf.onboarded {
+    let before = saved_conf.custom_providers.len();
+    saved_conf.custom_providers.retain(|p| !crate::config::is_shipped_default_provider(p));
+    if saved_conf.custom_providers.len() != before {
+        eprintln!(
+            "[harness-db] removed {} leftover default provider(s)",
+            before - saved_conf.custom_providers.len()
+        );
+    }
+}
                 // If the active provider no longer exists, clear the active selection so
                 // the UI shows "no provider configured" instead of a dead one.
                 if !saved_conf.provider.trim().is_empty()

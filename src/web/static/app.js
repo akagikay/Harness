@@ -3475,6 +3475,12 @@ function renderProjectsList() {
             }
         });
 
+        // Right-click a project for settings, new conversation, copy path, or delete.
+        folderRow.addEventListener('contextmenu', (ev) => {
+            ev.preventDefault();
+            openProjectContextMenu(ev, project);
+        });
+
         const btnSettings = folderRow.querySelector('.btn-proj-settings');
         if (btnSettings) {
             btnSettings.addEventListener('click', (e) => {
@@ -4090,6 +4096,9 @@ function renderBrowserEntries(data) {
         }
 
         browserEntriesList.appendChild(row);
+
+        // Right-click for a context menu (open, use, rename, delete, copy path).
+        row.addEventListener('contextmenu', (ev) => showBrowserContextMenu(ev, entry));
     });
 }
 
@@ -7188,60 +7197,10 @@ function mergeWithExperimentalModels(models) {
 }
 
 function getFallbackModelsList() {
-    return mergeWithExperimentalModels([
-        {
-            id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
-            owned_by: "nvidia",
-            reasoning: { support: "configurable", levels: ["low", "medium", "high"], default_level: "high", source: "inferred" }
-        },
-        {
-            id: "openai/gpt-oss-20b",
-            owned_by: "openai",
-            reasoning: { support: "configurable", levels: ["low", "medium", "high"], default_level: "medium", source: "inferred" }
-        },
-        {
-            id: "anthropic/claude-sonnet-4-5",
-            owned_by: "anthropic",
-            reasoning: { support: "configurable", levels: ["low", "medium", "high"], default_level: "medium", source: "inferred" }
-        },
-        {
-            id: "google/gemini-2.5-flash",
-            owned_by: "google",
-            reasoning: { support: "configurable", levels: ["none", "low", "medium", "high"], default_level: "medium", source: "inferred" }
-        },
-        {
-            id: "deepseek-ai/deepseek-r1",
-            owned_by: "deepseek-ai",
-            reasoning: { support: "fixed", levels: [], default_level: null, source: "inferred" }
-        },
-        {
-            id: "deepseek-ai/deepseek-v4.1-flash",
-            owned_by: "deepseek-ai",
-            reasoning: { support: "none", levels: [], default_level: null, source: "inferred" }
-        },
-        {
-            id: "mistralai/mistral-large-4-1t-a52b",
-            owned_by: "mistralai",
-            reasoning: { support: "none", levels: [], default_level: null, source: "inferred" }
-        },
-        {
-            id: "google/gemma-3-12b-it",
-            owned_by: "google",
-            reasoning: { support: "none", levels: [], default_level: null, source: "inferred" }
-        },
-        {
-            id: "minimaxai/minimax-m3.1-flash",
-            owned_by: "minimaxai",
-            reasoning: { support: "none", levels: [], default_level: null, source: "inferred" }
-        },
-        {
-            id: "stepfun-ai/step-5-preview",
-            owned_by: "stepfun-ai",
-            reasoning: { support: "none", levels: [], default_level: null, source: "inferred" }
-        }
-    ]);
+    // No providers are configured by default, so there is no fallback catalogue.
+    // The model picker is populated from real provider model lists only.
+    return [];
 }
-
 function getModelReasoningSpec(modelId) {
     const id = (modelId || '').trim();
     if (!id) return { support: 'none', levels: [], default_level: null, source: 'empty' };
@@ -7619,16 +7578,18 @@ function getAllModelsWithProviders() {
     if (allProviderModelGroups.length > 0) {
         return allProviderModelGroups;
     }
-    const activeProv = (currentConfig && currentConfig.custom_providers || []).find(
-        p => p.id === (currentConfig && currentConfig.provider) || p.api_base === (currentConfig && currentConfig.api_base)
-    );
-    const list = allRemoteModels.length > 0 ? allRemoteModels : getFallbackModelsList();
+    // No provider configured: return nothing rather than inventing a provider.
+    const providers = (currentConfig && currentConfig.custom_providers) || [];
+    const activeProv = providers.find(p => p.id === (currentConfig && currentConfig.provider));
+    if (!activeProv && allRemoteModels.length === 0) {
+        return [];
+    }
     return [{
-        provider_id: (activeProv && activeProv.id) || (currentConfig && currentConfig.provider) || 'default',
-        provider_name: (activeProv && activeProv.name) || 'Active Provider',
+        provider_id: (activeProv && activeProv.id) || (currentConfig && currentConfig.provider) || '',
+        provider_name: (activeProv && activeProv.name) || '',
         is_active: true,
-        has_credentials: true,
-        models: list
+        has_credentials: !!activeProv,
+        models: allRemoteModels
     }];
 }
 
@@ -8011,10 +7972,10 @@ async function fetchRemoteModels() {
             if (!res.ok) throw new Error(`Status ${res.status}`);
             const models = await res.json();
             groups = [{
-                provider_id: (currentConfig && currentConfig.provider) || 'default',
-                provider_name: 'Active Provider',
+                provider_id: (currentConfig && currentConfig.provider) || '',
+                provider_name: '',
                 is_active: true,
-                has_credentials: true,
+                has_credentials: !!(currentConfig && currentConfig.provider),
                 models
             }];
         }
@@ -11476,3 +11437,370 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 });
+// ==========================================================================
+// First-run onboarding
+// ==========================================================================
+let onboardingState = { step: 1, total: 3, info: null };
+
+const ONBOARDING_PRESETS = {
+    openai:     { base: 'https://api.openai.com/v1',        model: 'gpt-4o-mini',  keyLabel: 'sk-...' },
+    deepseek:   { base: 'https://api.deepseek.com/v1',      model: 'deepseek-chat', keyLabel: 'sk-...' },
+    openrouter: { base: 'https://openrouter.ai/api/v1',     model: 'openai/gpt-4o-mini', keyLabel: 'sk-or-...' },
+    groq:       { base: 'https://api.groq.com/openai/v1',   model: 'llama-3.3-70b-versatile', keyLabel: 'gsk_...' },
+    nvidia:     { base: 'https://integrate.api.nvidia.com/v1', model: 'nvidia/llama-3.1-nemotron-70b-instruct', keyLabel: 'nvapi-...' },
+    ollama:     { base: 'http://localhost:11434/v1',        model: 'llama3.3',     keyLabel: 'not required' },
+    vllm:       { base: 'http://localhost:8000/v1',         model: 'default',      keyLabel: 'not required' }
+};
+
+async function checkOnboarding() {
+    try {
+        const res = await fetch('/api/onboarding');
+        if (!res.ok) return;
+        const info = await res.json();
+        onboardingState.info = info;
+        if (!info.onboarded) {
+            openOnboarding();
+        }
+    } catch (_) { /* offline: skip */ }
+}
+
+function openOnboarding() {
+    const modal = document.getElementById('onboarding-modal');
+    if (!modal) return;
+    onboardingState.step = 1;
+    const pathEl = document.getElementById('onboarding-project-path');
+    if (pathEl && onboardingState.info) pathEl.value = onboardingState.info.project_path || '';
+    renderOnboardingStep();
+    modal.classList.remove('hidden');
+}
+
+function renderOnboardingStep() {
+    const s = onboardingState.step;
+    for (let i = 1; i <= onboardingState.total; i++) {
+        const el = document.getElementById(`onboarding-step-${i}`);
+        if (el) el.classList.toggle('hidden', i !== s);
+    }
+    const titles = ['Welcome to Harness', 'Connect a Model Provider', 'Your Workspace'];
+    const titleEl = document.getElementById('onboarding-title');
+    if (titleEl) titleEl.textContent = titles[s - 1] || 'Welcome to Harness';
+    const iconEl = document.getElementById('onboarding-step-icon');
+    if (iconEl) iconEl.textContent = String(s);
+    const progEl = document.getElementById('onboarding-progress');
+    if (progEl) progEl.textContent = `Step ${s} of ${onboardingState.total}`;
+    const backEl = document.getElementById('btn-onboarding-back');
+    if (backEl) backEl.disabled = s === 1;
+    const nextEl = document.getElementById('btn-onboarding-next');
+    if (nextEl) nextEl.textContent = s === onboardingState.total ? 'Finish' : 'Continue';
+}
+
+function onboardingPresetChanged() {
+    const sel = document.getElementById('onboarding-preset');
+    if (!sel) return;
+    const preset = ONBOARDING_PRESETS[sel.value];
+    if (!preset) return;
+    const baseEl = document.getElementById('onboarding-api-base');
+    const modelEl = document.getElementById('onboarding-model');
+    const keyEl = document.getElementById('onboarding-api-key');
+    if (baseEl) baseEl.value = preset.base;
+    if (modelEl && !modelEl.value) modelEl.value = preset.model;
+    if (keyEl) keyEl.placeholder = preset.keyLabel;
+}
+
+async function onboardingNext() {
+    if (onboardingState.step === 2) {
+        // Save the provider if one was entered.
+        const base = (document.getElementById('onboarding-api-base')?.value || '').trim();
+        const key = (document.getElementById('onboarding-api-key')?.value || '').trim();
+        const model = (document.getElementById('onboarding-model')?.value || '').trim();
+        const status = document.getElementById('onboarding-provider-status');
+        if (base) {
+            const id = (document.getElementById('onboarding-preset')?.value || 'custom') + '-' + Date.now().toString(36);
+            if (!currentConfig) { currentConfig = await (await fetch('/api/config')).json(); }
+            if (!currentConfig.custom_providers) currentConfig.custom_providers = [];
+            currentConfig.custom_providers.push({
+                id, name: (document.getElementById('onboarding-preset')?.value || 'Custom'),
+                api_base: base, api_key: key, default_model: model || 'default',
+                is_active: true, enabled: true
+            });
+            currentConfig.provider = id;
+            currentConfig.api_base = base;
+            currentConfig.api_key = key;
+            if (model) currentConfig.model = model;
+            try {
+                const res = await fetch('/api/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(currentConfig)
+                });
+                if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
+                currentConfig = await res.json();
+                if (status) { status.textContent = 'Provider saved.'; status.style.color = '#3fb950'; }
+            } catch (e) {
+                if (status) { status.textContent = 'Could not save provider: ' + e.message; status.style.color = '#f85149'; }
+                return; // stay on this step so the user can fix it
+            }
+        }
+    }
+
+    if (onboardingState.step === 3) {
+        // Persist the project path if it changed.
+        const pathEl = document.getElementById('onboarding-project-path');
+        const extraEl = document.getElementById('onboarding-extra-paths');
+        const newPath = (pathEl?.value || '').trim();
+        const extras = (extraEl?.value || '').split('\n').map(s => s.trim()).filter(Boolean);
+        if (currentConfig && currentConfig.projects && currentConfig.projects.length > 0) {
+            const active = currentConfig.projects.find(p => p.id === currentConfig.active_project_id) || currentConfig.projects[0];
+            if (active && (newPath || extras.length)) {
+                try {
+                    await fetch('/api/projects/' + encodeURIComponent(active.id) + '/defaults', {
+                        method: 'PATCH',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ path: newPath || undefined, defaults: active.defaults || {} })
+                    });
+                } catch (_) { /* non-fatal */ }
+            }
+        }
+        await finishOnboarding();
+        return;
+    }
+
+    onboardingState.step = Math.min(onboardingState.total, onboardingState.step + 1);
+    renderOnboardingStep();
+}
+
+function onboardingBack() {
+    onboardingState.step = Math.max(1, onboardingState.step - 1);
+    renderOnboardingStep();
+}
+
+async function finishOnboarding(skipped = false) {
+    try {
+        await fetch('/api/onboarding/complete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ skipped })
+        });
+    } catch (_) { /* best effort */ }
+    const modal = document.getElementById('onboarding-modal');
+    if (modal) modal.classList.add('hidden');
+    // Refresh everything the wizard may have changed.
+    try {
+        currentConfig = await (await fetch('/api/config')).json();
+        if (typeof renderConfiguredProviders === 'function') renderConfiguredProviders();
+        if (typeof fetchProjects === 'function') await fetchProjects();
+        if (typeof fetchRemoteModels === 'function') fetchRemoteModels();
+        if (typeof updateModelPillDisplay === 'function') updateModelPillDisplay();
+    } catch (_) { /* ignore */ }
+    showToast(skipped ? 'Onboarding skipped — add a provider in Settings when ready.' : 'You are all set.', 'success', 6000);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const nextBtn = document.getElementById('btn-onboarding-next');
+    if (nextBtn) nextBtn.addEventListener('click', onboardingNext);
+    const backBtn = document.getElementById('btn-onboarding-back');
+    if (backBtn) backBtn.addEventListener('click', onboardingBack);
+    const skipBtn = document.getElementById('btn-onboarding-skip');
+    if (skipBtn) skipBtn.addEventListener('click', () => finishOnboarding(true));
+    const presetSel = document.getElementById('onboarding-preset');
+    if (presetSel) presetSel.addEventListener('change', onboardingPresetChanged);
+    // Run after the initial config load settles.
+    setTimeout(checkOnboarding, 900);
+});
+// ==========================================================================
+// Browser context menu (right-click on file/folder rows)
+// ==========================================================================
+let __browserContextMenuEl = null;
+
+function closeBrowserContextMenu() {
+    if (__browserContextMenuEl) {
+        __browserContextMenuEl.remove();
+        __browserContextMenuEl = null;
+    }
+}
+
+function showBrowserContextMenu(ev, entry) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    closeBrowserContextMenu();
+
+    const menu = document.createElement('div');
+    menu.className = 'browser-context-menu';
+    menu.style.cssText = [
+        'position:fixed', `left:${ev.clientX}px`, `top:${ev.clientY}px`,
+        'z-index:10000', 'background:#1e2430', 'border:1px solid #3d4757',
+        'border-radius:8px', 'padding:4px', 'min-width:180px',
+        'box-shadow:0 8px 24px rgba(0,0,0,.5)', 'font-size:0.82rem'
+    ].join(';');
+
+    const addItem = (label, fn, opts = {}) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = label;
+        b.style.cssText = [
+            'display:block', 'width:100%', 'text-align:left', 'padding:6px 10px',
+            'background:transparent', 'border:0', 'border-radius:5px', 'cursor:pointer',
+            'color:' + (opts.danger ? '#f85149' : '#e6edf3')
+        ].join(';');
+        b.addEventListener('mouseenter', () => { b.style.background = '#2b3340'; });
+        b.addEventListener('mouseleave', () => { b.style.background = 'transparent'; });
+        b.addEventListener('click', async () => { closeBrowserContextMenu(); await fn(); });
+        menu.appendChild(b);
+    };
+
+    const sep = () => {
+        const d = document.createElement('div');
+        d.style.cssText = 'height:1px;background:#3d4757;margin:4px 2px;';
+        menu.appendChild(d);
+    };
+
+    if (entry.is_dir) {
+        addItem('Open', () => fetchDirectory(entry.path, { pushHistory: true }));
+        addItem('Use this folder', () => {
+            selectedBrowsePath = entry.path;
+            if (browserSelectedLabel) browserSelectedLabel.textContent = entry.path;
+            document.querySelectorAll('.browser-entry-row').forEach(r => r.classList.remove('selected'));
+        });
+        addItem('New folder inside', () => createFolderIn(entry.path));
+        sep();
+    }
+
+    addItem('Copy path', async () => {
+        try {
+            await navigator.clipboard.writeText(entry.path);
+            showToast('Path copied.', 'success');
+        } catch (_) {
+            showToast(entry.path, 'info', 8000);
+        }
+    });
+
+    addItem('Rename...', async () => {
+        const next = window.prompt('New name:', entry.name);
+        if (!next || next.trim() === entry.name) return;
+        try {
+            const res = await fetch('/api/filesystem/rename', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path: entry.path, new_name: next.trim() })
+            });
+            if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
+            showToast('Renamed.', 'success');
+            fetchDirectory(currentBrowsePath);
+        } catch (e) {
+            showToast('Rename failed: ' + e.message, 'error', 7000);
+        }
+    });
+
+    sep();
+    addItem('Delete', async () => {
+        const ok = await uiConfirm(
+            `Delete ${entry.is_dir ? 'folder' : 'file'} "${entry.name}"?${entry.is_dir ? ' This removes its contents.' : ''}`,
+            { title: 'Delete', confirmText: 'Delete', danger: true }
+        );
+        if (!ok) return;
+        try {
+            const res = await fetch('/api/filesystem/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path: entry.path })
+            });
+            if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
+            showToast('Deleted.', 'info');
+            fetchDirectory(currentBrowsePath);
+        } catch (e) {
+            showToast('Delete failed: ' + e.message, 'error', 7000);
+        }
+    }, { danger: true });
+
+    document.body.appendChild(menu);
+    __browserContextMenuEl = menu;
+
+    // Keep the menu on screen.
+    const rect = menu.getBoundingClientRect();
+    if (rect.right > window.innerWidth) menu.style.left = (window.innerWidth - rect.width - 8) + 'px';
+    if (rect.bottom > window.innerHeight) menu.style.top = (window.innerHeight - rect.height - 8) + 'px';
+}
+
+function createFolderIn(parentPath) {
+    const name = window.prompt('New folder name:');
+    if (!name || !name.trim()) return;
+    fetch('/api/filesystem/mkdir', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parent_path: parentPath, name: name.trim() })
+    }).then(async res => {
+        if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
+        showToast('Folder created.', 'success');
+        fetchDirectory(currentBrowsePath);
+    }).catch(e => showToast('Create folder failed: ' + e.message, 'error', 7000));
+}
+
+document.addEventListener('click', closeBrowserContextMenu);
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeBrowserContextMenu(); });
+window.addEventListener('blur', closeBrowserContextMenu);
+// ==========================================================================
+// Project context menu (right-click a project in the sidebar)
+// ==========================================================================
+function openProjectContextMenu(ev, project) {
+    closeBrowserContextMenu();
+    const menu = document.createElement('div');
+    menu.className = 'browser-context-menu';
+    menu.style.cssText = [
+        'position:fixed', `left:${ev.clientX}px`, `top:${ev.clientY}px`,
+        'z-index:10000', 'background:#1e2430', 'border:1px solid #3d4757',
+        'border-radius:8px', 'padding:4px', 'min-width:190px',
+        'box-shadow:0 8px 24px rgba(0,0,0,.5)', 'font-size:0.82rem'
+    ].join(';');
+
+    const addItem = (label, fn, opts = {}) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = label;
+        b.style.cssText = [
+            'display:block', 'width:100%', 'text-align:left', 'padding:6px 10px',
+            'background:transparent', 'border:0', 'border-radius:5px', 'cursor:pointer',
+            'color:' + (opts.danger ? '#f85149' : '#e6edf3')
+        ].join(';');
+        b.addEventListener('mouseenter', () => { b.style.background = '#2b3340'; });
+        b.addEventListener('mouseleave', () => { b.style.background = 'transparent'; });
+        b.addEventListener('click', async () => { closeBrowserContextMenu(); await fn(); });
+        menu.appendChild(b);
+    };
+
+    addItem('Project settings...', () => openProjectSettingsModal(project.id));
+    addItem('New conversation', () => createSavedConversation(project.id));
+    addItem('Open in file browser', () => openFileBrowser(project.path));
+    addItem('Copy path', async () => {
+        try {
+            await navigator.clipboard.writeText(project.path);
+            showToast('Path copied.', 'success');
+        } catch (_) { showToast(project.path, 'info', 8000); }
+    });
+
+    if ((allProjects || []).length > 1) {
+        const d = document.createElement('div');
+        d.style.cssText = 'height:1px;background:#3d4757;margin:4px 2px;';
+        menu.appendChild(d);
+        addItem('Delete project', async () => {
+            const ok = await uiConfirm(
+                `Delete project "${project.name}"? Conversations are kept but moved out of this project.`,
+                { title: 'Delete Project', confirmText: 'Delete Project', danger: true }
+            );
+            if (!ok) return;
+            try {
+                const res = await fetch(`/api/projects/${encodeURIComponent(project.id)}`, { method: 'DELETE' });
+                if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
+                showToast(`Deleted project "${project.name}".`, 'info');
+                await fetchProjects();
+                await fetchSessions();
+            } catch (e) {
+                showToast('Delete failed: ' + e.message, 'error', 7000);
+            }
+        }, { danger: true });
+    }
+
+    document.body.appendChild(menu);
+    __browserContextMenuEl = menu;
+    const rect = menu.getBoundingClientRect();
+    if (rect.right > window.innerWidth) menu.style.left = (window.innerWidth - rect.width - 8) + 'px';
+    if (rect.bottom > window.innerHeight) menu.style.top = (window.innerHeight - rect.height - 8) + 'px';
+}

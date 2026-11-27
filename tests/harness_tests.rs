@@ -1,4 +1,4 @@
-﻿use deepseek_harness_rs::config::{HarnessConfig, MemoryConfig, PermissionLevel};
+use deepseek_harness_rs::config::{HarnessConfig, MemoryConfig, PermissionLevel};
 use deepseek_harness_rs::engine::context::{
     ChatAttachment, ChatMessage, ConversationContext, ToolCall, ToolFunctionCall,
 };
@@ -3751,7 +3751,7 @@ fn test_google_search_model_compact_tools_and_clean_response() {
         CRITICAL SYSTEM INSTRUCTION:\n\
         Google Search AI Mode does not provide a separate API system-prompt field.\n\
         <system_prompt>\n\
-        [AUTHORITATIVE SYSTEM PROMPT â€” SENT VIA USER PROMPT: OBEY STRICTLY]\n\
+        [AUTHORITATIVE SYSTEM PROMPT — SENT VIA USER PROMPT: OBEY STRICTLY]\n\
         Always verify workspace paths carefully.\n\
         </system_prompt>\n\
         [END SYSTEM PROMPT OVERRIDE]\n\
@@ -4492,7 +4492,7 @@ async fn test_sqlite_db_persistence_and_conversation_endpoints() {
             .json(&json!({
                 "name": "Backend API",
                 "path": temp_dir.join("backend").to_string_lossy(),
-                "icon": "ðŸ¦€",
+                "icon": "🦀",
                 "set_active": false
             }))
             .send()
@@ -5386,10 +5386,19 @@ async fn test_project_defaults_and_conversation_config_persistence() {
     let http = reqwest::Client::new();
     let base = format!("http://{}", addr);
 
-    // 1. Set project defaults on default 'harness' project via PATCH /api/projects/:id/defaults
+    // 1. Set project defaults on the active default project via PATCH /api/projects/:id/defaults
+    let projects: Value = http
+        .get(format!("{}/api/projects", base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let active_pid = projects[0]["id"].as_str().expect("a default project").to_string();
     let defaults_payload = json!({
         "name": "Harness Pro",
-        "icon": "ðŸ¦€",
+        "icon": "🦀",
         "defaults": ProjectDefaults {
             provider_id: "deepseek".into(),
             model: "deepseek-reasoner".into(),
@@ -5399,7 +5408,7 @@ async fn test_project_defaults_and_conversation_config_persistence() {
         }
     });
     let upd_proj: Value = http
-        .patch(format!("{}/api/projects/harness/defaults", base))
+        .patch(format!("{}/api/projects/{}/defaults", base, active_pid))
         .json(&defaults_payload)
         .send()
         .await
@@ -5417,7 +5426,7 @@ async fn test_project_defaults_and_conversation_config_persistence() {
         .post(format!("{}/api/sessions/create", base))
         .json(&json!({
             "title": "Inherited Chat",
-            "project_id": "harness"
+            "project_id": active_pid
         }))
         .send()
         .await
@@ -5563,7 +5572,7 @@ async fn test_filesystem_browse_mkdir_and_project_directory_flow() {
         .json(&json!({
             "name": "Demo App",
             "path": created_dir.display().to_string(),
-            "icon": "ðŸš€"
+            "icon": "🚀"
         }))
         .send()
         .await
@@ -5579,7 +5588,7 @@ async fn test_filesystem_browse_mkdir_and_project_directory_flow() {
         .json(&json!({
             "name": "Demo App",
             "path": dir_b.display().to_string(),
-            "icon": "âš¡"
+            "icon": "⚡"
         }))
         .send()
         .await
@@ -6050,5 +6059,168 @@ async fn test_automation_tool_creates_and_runs() {
         .unwrap()
         .enabled);
 
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+// ============================================================================
+// Defaults: no providers, project folder beside the executable, onboarding
+// ============================================================================
+
+#[test]
+fn test_no_default_providers_and_default_project_folder() {
+    let cfg = HarnessConfig::default();
+    assert!(
+        cfg.custom_providers.is_empty(),
+        "the harness must ship with zero providers"
+    );
+    assert_eq!(cfg.provider, "");
+    assert_eq!(cfg.api_key, "");
+    assert_eq!(cfg.api_base, "");
+
+    // The default project is a `Project` folder beside the executable.
+    assert_eq!(cfg.projects.len(), 1);
+    let proj = &cfg.projects[0];
+    assert_eq!(proj.id, "project");
+    assert_eq!(proj.name, "Project");
+    assert!(proj.path.ends_with("Project"), "path was {}", proj.path.display());
+    let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+    assert_eq!(proj.path, exe_dir.join("Project"));
+    assert_eq!(cfg.active_project_id, "project");
+    assert!(!cfg.onboarded, "a fresh install starts un-onboarded");
+}
+
+#[test]
+fn test_shipped_default_provider_detection() {
+    use deepseek_harness_rs::config::{is_shipped_default_provider, CustomProvider};
+    let preset = |id: &str, base: &str, key: &str| CustomProvider {
+        id: id.into(),
+        name: id.into(),
+        api_base: base.into(),
+        api_key: key.into(),
+        default_model: "m".into(),
+        is_active: false,
+        enabled: true,
+    };
+    // Untouched presets are recognised (so they can be purged).
+    assert!(is_shipped_default_provider(&preset("ollama", "http://localhost:11434/v1", "ollama")));
+    assert!(is_shipped_default_provider(&preset("nvidia", "https://integrate.api.nvidia.com/v1", "")));
+    // A real user credential keeps the provider.
+    assert!(!is_shipped_default_provider(&preset("nvidia", "https://integrate.api.nvidia.com/v1", "nvapi-real")));
+    // A user-defined provider is never purged.
+    assert!(!is_shipped_default_provider(&preset("my-local", "http://localhost:1234/v1", "")));
+}
+
+#[tokio::test]
+async fn test_onboarding_endpoints_and_completion() {
+    let temp_dir = std::env::temp_dir().join(format!("harness-onb-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let mut config = HarnessConfig::default();
+    config.sandbox_root = temp_dir.clone();
+    config.auto_update_check = false;
+    let state = AppState::new(config);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", addr);
+
+    let before: Value = client
+        .get(format!("{}/api/onboarding", base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(before["onboarded"], false);
+    assert_eq!(before["provider_configured"], false);
+    assert_eq!(before["project_name"], "Project");
+
+    let done = client
+        .post(format!("{}/api/onboarding/complete", base))
+        .json(&serde_json::json!({ "skipped": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(done.status(), 200);
+
+    let after: Value = client
+        .get(format!("{}/api/onboarding", base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["onboarded"], true);
+    assert!(state.config.read().await.onboarded);
+
+    srv.abort();
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_filesystem_rename_and_delete() {
+    let temp_dir = std::env::temp_dir().join(format!("harness-fsops-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let file = temp_dir.join("before.txt");
+    std::fs::write(&file, "hello").unwrap();
+    let folder = temp_dir.join("sub");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("inner.txt"), "x").unwrap();
+
+    let mut config = HarnessConfig::default();
+    config.sandbox_root = temp_dir.clone();
+    config.auto_update_check = false;
+    let state = AppState::new(config);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state);
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", addr);
+
+    // Rename a file.
+    let r = client
+        .post(format!("{}/api/filesystem/rename", base))
+        .json(&serde_json::json!({ "path": file.display().to_string(), "new_name": "after.txt" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(temp_dir.join("after.txt").is_file());
+    assert!(!file.exists());
+
+    // Rename rejects path separators in the new name.
+    let bad = client
+        .post(format!("{}/api/filesystem/rename", base))
+        .json(&serde_json::json!({ "path": temp_dir.join("after.txt").display().to_string(), "new_name": "a/b" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+
+    // Delete a folder recursively.
+    let d = client
+        .post(format!("{}/api/filesystem/delete", base))
+        .json(&serde_json::json!({ "path": folder.display().to_string() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(d.status(), 200);
+    assert!(!folder.exists());
+
+    // Deleting a missing path is a 404.
+    let missing = client
+        .post(format!("{}/api/filesystem/delete", base))
+        .json(&serde_json::json!({ "path": temp_dir.join("nope").display().to_string() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+
+    srv.abort();
     let _ = std::fs::remove_dir_all(&temp_dir);
 }

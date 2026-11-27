@@ -45,6 +45,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/skills/:name", delete(handlers::delete_skill))
         .route("/api/filesystem/browse", get(handlers::browse_filesystem))
         .route("/api/filesystem/mkdir", post(handlers::create_directory))
+        .route("/api/filesystem/rename", post(handlers::rename_path))
+        .route("/api/filesystem/delete", post(handlers::delete_path))
         .route("/api/permissions/:perm_id/decision", post(handlers::decide_permission))
         .route("/api/metrics", get(handlers::get_metrics))
         .route("/api/config", get(handlers::get_config).post(handlers::update_config))
@@ -52,6 +54,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/update/check", get(handlers::check_update))
         .route("/api/update/apply", post(handlers::apply_update))
         .route("/api/security/status", get(handlers::security_status))
+        .route("/api/onboarding", get(handlers::onboarding_state))
+        .route(
+            "/api/onboarding/complete",
+            post(handlers::complete_onboarding),
+        )
         .route(
             "/api/automations",
             get(handlers::list_automations).post(handlers::save_automation),
@@ -112,6 +119,8 @@ pub fn build_server_router(state: AppState) -> Router {
         .route("/api/workspace/file", get(handlers::get_workspace_file))
         .route("/api/filesystem/browse", get(handlers::browse_filesystem))
         .route("/api/filesystem/mkdir", post(handlers::create_directory))
+        .route("/api/filesystem/rename", post(handlers::rename_path))
+        .route("/api/filesystem/delete", post(handlers::delete_path))
         .route("/api/metrics", get(handlers::get_metrics))
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .layer(CompressionLayer::new())

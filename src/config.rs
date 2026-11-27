@@ -530,6 +530,28 @@ fn default_mcp_servers() -> Vec<McpServerConfig> {
 /// so the UI shows "no provider configured" until the user adds one. Presets
 /// (NVIDIA NIM, DeepSeek, OpenRouter, Groq, Ollama, vLLM) are offered in the UI
 /// "Add Provider" form.
+/// Preset providers that older builds shipped by default.
+const SHIPPED_DEFAULT_PROVIDERS: &[(&str, &str)] = &[
+    ("nvidia", "https://integrate.api.nvidia.com/v1"),
+    ("deepseek", "https://api.deepseek.com/v1"),
+    ("openrouter", "https://openrouter.ai/api/v1"),
+    ("groq", "https://api.groq.com/openai/v1"),
+    ("ollama", "http://localhost:11434/v1"),
+    ("vllm", "http://localhost:8000/v1"),
+];
+
+/// True when `p` still looks exactly like a shipped preset (same id, same base,
+/// and no real credential). Used to purge leftovers from older configs once.
+pub fn is_shipped_default_provider(p: &CustomProvider) -> bool {
+    let base = p.api_base.trim().trim_end_matches('/').to_ascii_lowercase();
+    let has_real_key = !p.api_key.trim().is_empty() && p.api_key.trim() != "ollama";
+    if has_real_key {
+        return false;
+    }
+    SHIPPED_DEFAULT_PROVIDERS
+        .iter()
+        .any(|(id, preset_base)| p.id == *id && base == *preset_base)
+}
 fn default_providers() -> Vec<CustomProvider> {
     Vec::new()
 }
@@ -590,13 +612,21 @@ impl Project {
 }
 
 fn default_projects() -> Vec<Project> {
-    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // The default project is a `Project` folder beside the harness executable, so a
+    // fresh install never points at whatever directory the binary was launched from.
+    let base = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let project_dir = base.join("Project");
+    let _ = std::fs::create_dir_all(&project_dir);
     vec![
         Project {
-            id: "harness".to_string(),
-            name: "Harness".to_string(),
-            path: current_dir,
-            icon: "📁".to_string(),
+            id: "project".to_string(),
+            name: "Project".to_string(),
+            path: project_dir,
+            icon: "\u{1F4C1}".to_string(),
             created_at: chrono::Local::now().to_rfc3339(),
             is_active: true,
             defaults: ProjectDefaults::default(),
@@ -606,7 +636,7 @@ fn default_projects() -> Vec<Project> {
 }
 
 fn default_active_project_id() -> String {
-    "harness".to_string()
+    "project".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -691,7 +721,11 @@ pub struct HarnessConfig {
     /// outside the project workspace.
     #[serde(default)]
     pub extra_access_roots: Vec<PathBuf>,
+    /// False until the first-run onboarding has been completed.
+    #[serde(default)]
+    pub onboarded: bool,
 }
+
 
 pub fn default_update_repo() -> String {
     crate::updater::DEFAULT_REPO.to_string()
@@ -743,6 +777,7 @@ impl Default for HarnessConfig {
             auto_update_apply: false,
             automations: Vec::new(),
             extra_access_roots: Vec::new(),
+            onboarded: false,
         }
     }
 }

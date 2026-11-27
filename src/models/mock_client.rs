@@ -63,7 +63,7 @@ impl ModelAdapter for MockClient {
             }
 
             let response_chunks = [
-                "### DeepSeek Harness (Rust Edition) - Execution Report\n\n",
+                "### Harness - Execution Report\n\n",
                 "The task executed successfully with the following highlights:\n\n",
                 "- **Language & Architecture:** 100% Rust with zero-cost abstractions\n",
                 "- **Resource Efficiency:** Zero runtime garbage collection, bounded memory buffers, HTTP compression\n",

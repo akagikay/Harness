@@ -4368,3 +4368,162 @@ pub async fn run_automation_now(
         "session_id": session_id
     })))
 }
+// ============================================================================
+// First-run onboarding
+// ============================================================================
+
+/// `GET /api/onboarding` — what the first-run wizard should show.
+pub async fn onboarding_state(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let conf = state.config.read().await;
+    let provider_configured = conf
+        .custom_providers
+        .iter()
+        .any(|p| !p.api_key.trim().is_empty() || p.api_base.contains("localhost"));
+    let project = conf
+        .projects
+        .iter()
+        .find(|p| p.id == conf.active_project_id)
+        .or_else(|| conf.projects.first());
+    Json(serde_json::json!({
+        "onboarded": conf.onboarded,
+        "provider_configured": provider_configured,
+        "providers": conf.custom_providers.len(),
+        "project_name": project.map(|p| p.name.clone()).unwrap_or_default(),
+        "project_path": project.map(|p| p.path.display().to_string()).unwrap_or_default(),
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct CompleteOnboardingRequest {
+    #[serde(default)]
+    pub skipped: bool,
+}
+
+/// `POST /api/onboarding/complete` — mark the wizard as done.
+pub async fn complete_onboarding(
+    State(state): State<AppState>,
+    Json(payload): Json<CompleteOnboardingRequest>,
+) -> Json<serde_json::Value> {
+    {
+        let mut conf = state.config.write().await;
+        conf.onboarded = true;
+    }
+    state.persist_config().await;
+    Json(serde_json::json!({
+        "status": "ok",
+        "skipped": payload.skipped
+    }))
+}
+// ============================================================================
+// Filesystem rename / delete (used by the browser context menu)
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct FsPathRequest {
+    pub path: String,
+}
+
+#[derive(Deserialize)]
+pub struct FsRenameRequest {
+    pub path: String,
+    pub new_name: String,
+}
+
+/// Refuse to touch a drive root or a home directory root.
+fn is_protected_fs_root(path: &std::path::Path) -> bool {
+    // A drive root has no parent (e.g. `C:\`) and `components().count() <= 1` on Unix.
+    let has_no_parent = path.parent().is_none();
+    let looks_like_drive_root = path
+        .to_str()
+        .map(|s| s.len() <= 3 && s.ends_with(":\\") || s.ends_with(":/"))
+        .unwrap_or(false);
+    if has_no_parent || looks_like_drive_root {
+        return true;
+    }
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()
+        .map(std::path::PathBuf::from);
+    if let Some(h) = home {
+        if let (Ok(a), Ok(b)) = (path.canonicalize(), h.canonicalize()) {
+            return a == b;
+        }
+    }
+    false
+}
+
+/// `POST /api/filesystem/rename` — rename a file or folder in place.
+pub async fn rename_path(
+    Json(payload): Json<FsRenameRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let raw = payload.path.trim();
+    if raw.is_empty() {
+        return Err(json_api_error(StatusCode::BAD_REQUEST, "Path is empty."));
+    }
+    let clean_name = payload.new_name.trim();
+    if clean_name.is_empty()
+        || clean_name.contains('/')
+        || clean_name.contains('\\')
+        || clean_name.contains(':')
+        || clean_name == ".."
+        || clean_name == "."
+    {
+        return Err(json_api_error(StatusCode::BAD_REQUEST, "Invalid name."));
+    }
+    let src = std::path::PathBuf::from(raw);
+    if !src.exists() {
+        return Err(json_api_error(StatusCode::NOT_FOUND, "Path does not exist."));
+    }
+    if is_protected_fs_root(&src) {
+        return Err(json_api_error(
+            StatusCode::BAD_REQUEST,
+            "Refusing to rename a drive root or home directory.",
+        ));
+    }
+    let dest = src.with_file_name(clean_name);
+    if dest.exists() {
+        return Err(json_api_error(
+            StatusCode::CONFLICT,
+            format!("'{}' already exists.", clean_name),
+        ));
+    }
+    tokio::fs::rename(&src, &dest)
+        .await
+        .map_err(|e| json_api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Rename failed: {e}")))?;
+    Ok(Json(serde_json::json!({
+        "status": "renamed",
+        "path": normalize_display_path(&dest)
+    })))
+}
+
+/// `POST /api/filesystem/delete` — delete a file, or a folder recursively.
+pub async fn delete_path(
+    Json(payload): Json<FsPathRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let raw = payload.path.trim();
+    if raw.is_empty() {
+        return Err(json_api_error(StatusCode::BAD_REQUEST, "Path is empty."));
+    }
+    let target = std::path::PathBuf::from(raw);
+    if !target.exists() {
+        return Err(json_api_error(StatusCode::NOT_FOUND, "Path does not exist."));
+    }
+    if is_protected_fs_root(&target) {
+        return Err(json_api_error(
+            StatusCode::BAD_REQUEST,
+            "Refusing to delete a drive root or home directory.",
+        ));
+    }
+    let meta = tokio::fs::metadata(&target)
+        .await
+        .map_err(|e| json_api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let result = if meta.is_dir() {
+        tokio::fs::remove_dir_all(&target).await
+    } else {
+        tokio::fs::remove_file(&target).await
+    };
+    result
+        .map_err(|e| json_api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Delete failed: {e}")))?;
+    Ok(Json(serde_json::json!({ "status": "deleted", "path": raw })))
+}

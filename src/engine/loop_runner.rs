@@ -19,6 +19,20 @@ use crate::state::AppState;
 
 static PERM_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// Detect the harness's own system prompt so a resumed session can replace it
+/// with a freshly built one instead of stacking a duplicate.
+///
+/// Recognises the current prefix and the historical ones, so sessions persisted
+/// by older builds still refresh cleanly.
+fn is_harness_system_prompt(content: &str) -> bool {
+    const PREFIXES: [&str; 3] = [
+        "You are Harness, an autonomous agent runtime",
+        "You are an autonomous agent runtime",
+        "You are an autonomous agent runtime powered by",
+    ];
+    PREFIXES.iter().any(|p| content.starts_with(p))
+}
+
 /// Best-effort human message from a caught panic payload.
 fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
@@ -439,7 +453,7 @@ impl AgentLoopRunner {
         };
 
         format!(
-            "You are an autonomous agent runtime powered by DeepSeek Harness (Rust Edition).\n\
+            "You are Harness, an autonomous agent runtime\n\
              Workspace Root: {}\n\
              {}{}{}\n\
              Principles & Capabilities:\n\
@@ -532,7 +546,7 @@ impl AgentLoopRunner {
                 m.role == "system"
                     && m.content
                         .as_deref()
-                        .is_some_and(|c| c.starts_with("You are an autonomous agent runtime"))
+                        .is_some_and(|c| is_harness_system_prompt(c))
             });
             if has_base_system {
                 ctx.messages[0] = ChatMessage::system(self.build_system_prompt());
