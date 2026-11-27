@@ -5376,7 +5376,9 @@ async fn test_project_defaults_and_conversation_config_persistence() {
     let mut cfg = HarnessConfig::default();
     cfg.sandbox_root = temp_dir.clone();
     cfg.db_path = Some(db_path.clone());
-    cfg.mock_mode = true;
+    // Mock mode forces the model to "mock"; keep it off so project model defaults
+    // can be asserted.
+    cfg.mock_mode = false;
 
     let db = HarnessDb::open(&db_path).expect("open sqlite db");
     let state = AppState::with_db(cfg, db);
@@ -5447,6 +5449,29 @@ async fn test_project_defaults_and_conversation_config_persistence() {
     let cid = conv["id"].as_str().unwrap().to_string();
     assert_eq!(conv["reasoning_effort"], "extra_high");
     assert_eq!(conv["orchestrator_mode"], true);
+    assert_eq!(conv["model"], "deepseek-reasoner");
+    assert_eq!(conv["provider_id"], "deepseek");
+
+    // 2b. Regression: the UI sends empty strings for untouched fields. Those must
+    // mean "use the project default", not "clear the override".
+    let conv_empty: Value = http
+        .post(format!("{}/api/sessions/create", base))
+        .json(&json!({
+            "title": "Empty Overrides",
+            "project_id": active_pid,
+            "model": "",
+            "provider_id": "",
+            "reasoning_effort": ""
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(conv_empty["model"], "deepseek-reasoner");
+    assert_eq!(conv_empty["provider_id"], "deepseek");
+    assert_eq!(conv_empty["reasoning_effort"], "extra_high");
 
     // 3. Update chat-specific model/provider/effort via PATCH /api/sessions/:id
     let patch_res = http
