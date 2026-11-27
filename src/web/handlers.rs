@@ -822,6 +822,9 @@ pub fn merge_config_update(existing: &HarnessConfig, incoming: HarnessConfig) ->
     // Onboarding is a server-owned one-way flag: a stale or minimal client payload
     // must never re-trigger the first-run wizard.
     merged.onboarded = existing.onboarded;
+    // The auto-updater writes this marker; a stale client snapshot must not
+    // clear it and restart an install loop.
+    merged.last_auto_update_target = existing.last_auto_update_target.clone();
     merged
 }
 
@@ -976,6 +979,19 @@ mod handlers_config_merge_tests {
         assert!(!incoming.onboarded);
         let merged = merge_config_update(&existing, incoming);
         assert!(merged.onboarded, "onboarded must survive a settings save");
+    }
+
+    #[test]
+    fn merge_keeps_the_auto_update_install_marker() {
+        let mut existing = base();
+        existing.last_auto_update_target = "1.1.1".into();
+        let mut incoming = base();
+        incoming.last_auto_update_target = String::new();
+        let merged = merge_config_update(&existing, incoming);
+        assert_eq!(
+            merged.last_auto_update_target, "1.1.1",
+            "a stale snapshot must not clear the updater's install marker"
+        );
     }
 
     #[test]

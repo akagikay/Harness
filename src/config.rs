@@ -796,6 +796,10 @@ pub struct HarnessConfig {
     /// False until the first-run onboarding has been completed.
     #[serde(default)]
     pub onboarded: bool,
+    /// Version the auto-updater last attempted to install (loop guard: never
+    /// auto-install the same release twice in a row).
+    #[serde(default)]
+    pub last_auto_update_target: String,
 }
 
 
@@ -849,6 +853,7 @@ impl Default for HarnessConfig {
             auto_update_apply: true,
             automations: Vec::new(),
             extra_access_roots: Vec::new(),
+            last_auto_update_target: String::new(),
             onboarded: false,
         }
     }

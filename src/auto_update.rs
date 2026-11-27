@@ -61,6 +61,19 @@ async fn run_once(
     };
 
     if !info.available {
+        // Running the newest release: forget any previous install marker so a
+        // later release can be installed again.
+        let stale = {
+            let conf = state.config.read().await;
+            !conf.last_auto_update_target.is_empty()
+                && conf.last_auto_update_target != info.latest_version
+        };
+        if stale {
+            let mut conf = state.config.write().await;
+            conf.last_auto_update_target = String::new();
+            drop(conf);
+            state.persist_config().await;
+        }
         state
             .set_update_status(|s| {
                 s.phase = UpdatePhase::UpToDate;
@@ -94,6 +107,33 @@ async fn run_once(
             info.latest_version, info.html_url
         );
         return Some(info);
+    }
+
+    // Never re-install the same target forever: a release whose binary reports
+    // an older internal version than its tag would otherwise loop endlessly.
+    let already_installed = {
+        let conf = state.config.read().await;
+        conf.last_auto_update_target == info.latest_version
+    };
+    if already_installed {
+        state
+            .set_update_status(|s| {
+                s.progress_phase(
+                    UpdatePhase::Available,
+                    format!("v{} available (awaiting a fixed release)", info.latest_version),
+                );
+                s.touch();
+            })
+            .await;
+        return Some(info);
+    }
+
+    // Mark the target first, so even a crash mid-install cannot loop.
+    {
+        let mut conf = state.config.write().await;
+        conf.last_auto_update_target = info.latest_version.clone();
+        drop(conf);
+        state.persist_config().await;
     }
 
     if let Err(e) = install(state, &info).await {
@@ -189,7 +229,12 @@ pub async fn install(state: &AppState, info: &UpdateInfo) -> Result<(), String> 
 
     // The staged copy is already installed; drop the temp file.
     let _ = std::fs::remove_file(&staged);
-    Ok(())
+
+    // Hand over to the new process: this one MUST exit, otherwise it keeps
+    // holding the listening port and the relaunched binary can never bind.
+    // The short delay lets the UI poll the "Restarting" status once.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    std::process::exit(0);
 }
 
 /// Wait until nothing is running (capped by [`IDLE_GRACE`]).
