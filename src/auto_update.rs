@@ -28,11 +28,25 @@ const INITIAL_DELAY: Duration = Duration::from_secs(3);
 const IDLE_GRACE: Duration = Duration::from_secs(30 * 60);
 
 /// Kick off the background auto-update loop (standalone/UI mode only).
-pub fn spawn(state: Arc<AppState>, repo: String, current_version: &'static str, auto_install: bool) {
+///
+/// The repo/flags are read from the *live* config on every pass: `main` builds
+/// `AppState::with_db(config)` from CLI/env defaults, and a stale local snapshot
+/// would ignore whatever the user saved in Settings.
+pub fn spawn(state: Arc<AppState>, current_version: &'static str) {
     tokio::spawn(async move {
         tokio::time::sleep(INITIAL_DELAY).await;
         loop {
-            let _ = run_once(&state, &repo, current_version, auto_install).await;
+            let (repo, do_check, do_install) = {
+                let conf = state.config.read().await;
+                (
+                    conf.update_repo.clone(),
+                    conf.auto_update_check,
+                    conf.auto_update_apply,
+                )
+            };
+            if do_check {
+                let _ = run_once(&state, &repo, current_version, do_install).await;
+            }
             tokio::time::sleep(RECHECK_INTERVAL).await;
         }
     });

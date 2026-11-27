@@ -163,26 +163,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Background auto-update: check, download with progress, verify, install,
     // and relaunch - fully automatic on launch (unless disabled in settings).
-    let auto_update = {
-        let conf = config.clone();
-        (
-            conf.update_repo.clone(),
-            conf.auto_update_check,
-            conf.auto_update_apply,
-        )
-    };
-    if auto_update.1 && !is_server_only {
+    // The pipeline reads the live config itself, so the settings toggles take
+    // effect without a restart. Execution-server mode only reports availability.
+    if !is_server_only {
         deepseek_harness_rs::auto_update::spawn(
             std::sync::Arc::new(state.clone()),
-            auto_update.0.clone(),
             env!("CARGO_PKG_VERSION"),
-            auto_update.2,
         );
-    } else if auto_update.1 && is_server_only {
-        // Execution servers still report availability, but never self-restart.
+    } else {
+        let repo = {
+            let conf = state.config.read().await;
+            conf.update_repo.clone()
+        };
         tokio::spawn(async move {
-            match deepseek_harness_rs::updater::check(&auto_update.0, env!("CARGO_PKG_VERSION")).await
-            {
+            match deepseek_harness_rs::updater::check(&repo, env!("CARGO_PKG_VERSION")).await {
                 Ok(info) if info.available => println!(
                     "Update available: v{} -> v{} ({})",
                     info.current_version, info.latest_version, info.html_url
