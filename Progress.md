@@ -2,7 +2,7 @@
 
 _Running log. Each round: a set of adversarial agents attacks the project; findings are consolidated here and fixed; the loop repeats until a clean round._
 
-Last updated: 2026-11-28 (round 5 findings applied)
+Last updated: 2026-11-28 (round 5 findings applied + round 4 consolidated)
 
 ---
 
@@ -129,6 +129,56 @@ Rule: findings land in this file; only ONE agent edits source at a time.
 | UX round 2 | attacks the round-3 *fixes* (friendly errors, the badge, always-allow, the hidden section) then everything else: first-run, feedback, a11y, layout, copy |
 | Architecture | trust-boundary map, scaling limits with named lines, async failure modes, what is untested, feature keep/build/cut verdicts, delete list |
 
+**Results are still incoming. What has landed and been applied:**
+
+#### Architecture review — top 3 applied (all CRITICAL/HIGH)
+1. **`request_path_access` self-escalated.** It appended to the *global, persisted*
+   `config.extra_access_roots` with no approval check, so an agent in
+   Autonomous/Yolo mode could grant itself any absolute path, permanently, for
+   every project, surviving restarts — the exact opposite of what the module's own
+   doc comment promises. **Fixed**: requires an explicit human approval, only
+   honored in `Safe` mode, and the grant is session-scoped
+   (`state.session_path_grants`, dropped on delete). Verified: `src/plugins/path_access_tool.rs`.
+2. **A remote execution server trusted the client's config.** `payload.config`
+   is client-supplied, and `extra_access_roots`/`projects` from it survive into
+   the run, so a malicious client could point the server at any folder.
+   **Fixed** (see commit `e1d4020` chain): the dispatch config now carries the
+   project's folders as approved roots and the server uses its own sandbox.
+3. **Config staleness had no revisioning** — one `config.write()` is the write path
+   for 6 endpoints, so a stale `POST /api/config` silently reverts active server,
+   provider, MCP, automations and skills. **OPEN** (see Round 6 plan).
+
+Also recorded, not yet acted on: `bash` is not sandboxed (`bash.rs:146` only sets
+`current_dir`, so `cd C:\Users` works) while `read_file`/`list_dir` *are* —
+that asymmetry is the defect. `persist_session_record` holds the global write
+lock across a full-table rewrite. The session cap is 100 and the UI only ever
+sees 100. Turn finalization waits on detached subagent lifetimes, which keeps
+`is_idle()` false and blocks auto-update. Every turn clones the whole
+conversation twice.
+
+#### UX round 2 — applied
+| Finding | Fix |
+|---|---|
+| **P0-1 (a regression I introduced)**: my friendly-error edit dropped the `if (!res.ok)` guard, so *every* session creation failed with `Error: Could not start a session (HTTP 200)` and left a dangling session | guard restored around the hint computation; 200 falls through to the session; a missing `session_id` is its own error |
+| **P0-2**: the badge lied — `__pendingPerms` was never cleared on session switch/history/new chat, and an *answered* card kept `role="alert"`, so the badge jumped to a dead prompt | `clearAllPendingPermissions()` on every stream reset; answered cards drop `role`/`data-pending` and gain `data-decided`; the badge's click handler only selects `[data-pending="1"]` |
+| **P0-3**: "Approve & always allow" was dropped on the remote forward, so the button lied on every multi-server setup | `always_allow` now travels in the forwarded decision and is reported back |
+| P1: always-allow notice spammed once per tool *call* | emitted once per session/tool |
+| P1: the UI's mock switch was local state seeded from nothing, so the server's `mock_mode` had no effect | the UI follows the server config and the toggle persists it |
+
+**Live verification**: with `mock_mode=true` on the server, a reload makes the UI
+show "On", and a real first prompt completes the full event chain
+(`UserMessage → SessionStarted → ToolCallStarted → ToolCallFinished →
+SessionCompleted`) with a final answer and no errors.
+
+#### Functional QA — applied
+| Finding | Fix |
+|---|---|
+| The permission fail-fast counter counted **approvals**, so a turn with more than three Ask-gated tools aborted with "permission requests were denied" even when the user approved all of them | the counter only increments on a denial/timeout |
+| Cron day-of-week `7` inside a range or list (`5-7`, `1-7`, `6,7`) never matched Sunday, which chrono reports as `0` | `7` and `0` both match Sunday |
+
+Regression tests added for both (`test_many_approved_permissions_do_not_abort_the_turn`,
+`cron_dow_seven_is_sunday_and_ranges_include_sunday`).
+
 ### Round 3 — shipped in `69b0118` (verified live in the browser)
 | Finding | Fix | Evidence |
 |---|---|---|
@@ -139,3 +189,25 @@ Rule: findings land in this file; only ONE agent edits source at a time.
 | Raw "Failed to create session" | names the cause + fix (provider/project) | code only; the live variant needs a failing provider |
 
 Console errors on load: none.
+---
+
+## Round 5 - loop protocol note
+
+Two subagents edited source concurrently once and collided (one reverted the
+other's edit mid-session). **From now on exactly one agent touches source per
+round**; the others are read-only reporters whose findings are consolidated here
+and applied by the orchestrator. Before applying anything each fix is re-verified
+with a literal pattern check, then `cargo test`, then a live browser/API check.
+
+### Round 6 - queued (from the findings above)
+1. **`config_revision` + `409`** on `update_config` -- the single change that
+   closes the whole stale-snapshot revert class (active server, provider, MCP,
+   automations, skills).
+2. **`bash` sandbox honesty** -- either enforce containment or stop reporting it;
+   the asymmetry with `file_ops` is the defect.
+3. **Permission prompt survives a reload** -- `PermissionRequested` is broadcast
+   but never written to `session.history`, so a reload during an approval loses
+   the card and the badge and the agent blocks on a 120s timeout invisibly.
+4. First-run wizard: a "test key" step, focus management, and Escape.
+5. Stop-failure feedback (the pill stays green when the stop 404s).
+6. Red-team and functional-QA reports are still outstanding.
