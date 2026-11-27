@@ -1509,7 +1509,12 @@ if !saved_conf.onboarded {
                     }
                 }
                 if let Some(p) = provider_id {
-                    session.provider_id = p.trim().to_string();
+                    // An empty value means "unchanged": the UI sends "" for fields it
+                    // does not intend to modify, and blanking it here would discard a
+                    // provider that was resolved from the project defaults.
+                    if !p.trim().is_empty() {
+                        session.provider_id = p.trim().to_string();
+                    }
                 }
                 if let Some(eff) = reasoning_effort {
                     if !eff.trim().is_empty() {

@@ -615,11 +615,26 @@ pub async fn create_session(
             project_id.clone(),
             payload.server_id.clone(),
             payload.orchestrator_mode,
-            payload.model.clone(),
+            // An empty model string means "use the project default", not an override.
+            payload
+                .model
+                .clone()
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty()),
             "running",
         )
         .await;
-    if payload.provider_id.is_some() || payload.reasoning_effort.is_some() {
+    if payload
+        .provider_id
+        .as_deref()
+        .map(|p| !p.trim().is_empty())
+        .unwrap_or(false)
+        || payload
+            .reasoning_effort
+            .as_deref()
+            .map(|e| !e.trim().is_empty())
+            .unwrap_or(false)
+    {
         state
             .update_session_meta(
                 &session_id,
@@ -804,6 +819,9 @@ pub fn merge_config_update(existing: &HarnessConfig, incoming: HarnessConfig) ->
     merged.projects = existing.projects.clone();
     merged.active_project_id = existing.active_project_id.clone();
     merged.sandbox_root = existing.sandbox_root.clone();
+    // Onboarding is a server-owned one-way flag: a stale or minimal client payload
+    // must never re-trigger the first-run wizard.
+    merged.onboarded = existing.onboarded;
     merged
 }
 
@@ -947,6 +965,17 @@ mod handlers_config_merge_tests {
         incoming.display_verbosity = "verbose".into();
         let merged = merge_config_update(&existing, incoming);
         assert_eq!(merged.display_verbosity, "verbose");
+    }
+
+    #[test]
+    fn merge_never_clears_the_onboarded_flag() {
+        let mut existing = base();
+        existing.onboarded = true;
+        // A client that omits the flag deserializes it as the default `false`.
+        let incoming = base();
+        assert!(!incoming.onboarded);
+        let merged = merge_config_update(&existing, incoming);
+        assert!(merged.onboarded, "onboarded must survive a settings save");
     }
 
     #[test]
@@ -1993,12 +2022,69 @@ pub async fn set_active_project(
     }
 }
 
-#[derive(Deserialize, Default)]
+/// Resolve, validate and canonicalize a list of additional project folders.
+///
+/// Missing folders are created (matching project creation), relative paths resolve
+/// against the process cwd, and the primary project path is never duplicated.
+async fn resolve_extra_paths(
+    raw_paths: &[String],
+) -> Result<Vec<std::path::PathBuf>, (StatusCode, Json<serde_json::Value>)> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    for raw in raw_paths {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let candidate = {
+            let p = if trimmed.len() == 2
+                && trimmed.as_bytes()[1] == b':'
+                && trimmed.as_bytes()[0].is_ascii_alphabetic()
+            {
+                std::path::PathBuf::from(format!("{}\\", trimmed))
+            } else {
+                std::path::PathBuf::from(trimmed)
+            };
+            if p.is_absolute() {
+                p
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    .join(p)
+            }
+        };
+        if candidate.is_file() {
+            return Err(json_api_error(
+                StatusCode::BAD_REQUEST,
+                format!("'{}' is a file, not a directory.", candidate.display()),
+            ));
+        }
+        if let Err(e) = tokio::fs::create_dir_all(&candidate).await {
+            return Err(json_api_error(
+                StatusCode::BAD_REQUEST,
+                format!("Failed to create folder '{}': {}", candidate.display(), e),
+            ));
+        }
+        let resolved = tokio::fs::canonicalize(&candidate)
+            .await
+            .map(|p| std::path::PathBuf::from(normalize_display_path(&p)))
+            .unwrap_or(candidate);
+        if !out.iter().any(|existing| existing == &resolved) {
+            out.push(resolved);
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Deserialize)]
 pub struct UpdateProjectDefaultsRequest {
     pub name: Option<String>,
     pub icon: Option<String>,
     pub path: Option<String>,
     pub defaults: crate::config::ProjectDefaults,
+    /// Additional folders the agent may read/write in this project.
+    /// `None` leaves the current list untouched; `Some` replaces it.
+    #[serde(default)]
+    pub extra_paths: Option<Vec<String>>,
 }
 
 pub async fn update_project_defaults(
@@ -2045,6 +2131,12 @@ pub async fn update_project_defaults(
         }
     }
 
+    // Additional folders, when supplied, replace the current list. `None` keeps them.
+    let validated_extra_paths = match payload.extra_paths.as_deref() {
+        Some(raw) => Some(resolve_extra_paths(raw).await?),
+        None => None,
+    };
+
     let updated = {
         let mut conf = state.config.write().await;
         let is_active_proj = conf.active_project_id == id;
@@ -2062,6 +2154,15 @@ pub async fn update_project_defaults(
             }
             if let Some(ref np) = validated_new_path {
                 p.path = np.clone();
+            }
+            if let Some(ref extras) = validated_extra_paths {
+                // Never list the primary project path twice.
+                let primary = p.path.clone();
+                p.extra_paths = extras
+                    .iter()
+                    .filter(|e| e.as_path() != primary.as_path())
+                    .cloned()
+                    .collect();
             }
             p.defaults = payload.defaults;
             found_proj = Some(p.clone());
@@ -2575,7 +2676,18 @@ pub async fn create_idle_conversation(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "New Conversation".to_string());
-    let project_id = payload.project_id.unwrap_or_default();
+    // Fall back to the active project so project defaults still apply.
+    let project_id = payload
+        .project_id
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| {
+            state
+                .config
+                .try_read()
+                .map(|c| c.active_project_id.clone())
+                .unwrap_or_default()
+        });
 
     let _ = state
         .create_session_with_options(
@@ -2584,11 +2696,25 @@ pub async fn create_idle_conversation(
             project_id,
             payload.server_id,
             payload.orchestrator_mode,
-            payload.model,
+            // An empty model means "use the project default", not an override.
+            payload
+                .model
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty()),
             "idle",
         )
         .await;
-    if payload.provider_id.is_some() || payload.reasoning_effort.is_some() {
+    if payload
+        .provider_id
+        .as_deref()
+        .map(|p| !p.trim().is_empty())
+        .unwrap_or(false)
+        || payload
+            .reasoning_effort
+            .as_deref()
+            .map(|e| !e.trim().is_empty())
+            .unwrap_or(false)
+    {
         state
             .update_session_meta(
                 &session_id,
@@ -4436,7 +4562,7 @@ fn is_protected_fs_root(path: &std::path::Path) -> bool {
     let has_no_parent = path.parent().is_none();
     let looks_like_drive_root = path
         .to_str()
-        .map(|s| s.len() <= 3 && s.ends_with(":\\") || s.ends_with(":/"))
+        .map(|s| s.len() <= 3 && (s.ends_with(":\\") || s.ends_with(":/")))
         .unwrap_or(false);
     if has_no_parent || looks_like_drive_root {
         return true;

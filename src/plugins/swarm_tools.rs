@@ -245,12 +245,34 @@ fn resolve_effective_model_name(spec: &SubagentSpec, ctx: &SessionToolContext) -
             return trimmed.to_string();
         }
     }
-    let orch_sub = ctx.config.orchestrator.subagent_model.trim();
+    let orch = &ctx.config.orchestrator;
+    let orch_sub = orch.subagent_model.trim();
+    // "inherit"/"follow" means: use the orchestrator model, then the session model.
+    if crate::config::is_inherit_sentinel(orch_sub) {
+        let orch_model = orch.model.trim();
+        if !orch_model.is_empty() {
+            return if is_google_search_model(orch_model) {
+                EXPERIMENTAL_GOOGLE_SEARCH_MODEL_ID.to_string()
+            } else {
+                orch_model.to_string()
+            };
+        }
+        return ctx.config.model.clone();
+    }
     if !orch_sub.is_empty() {
         if is_google_search_model(orch_sub) {
             return EXPERIMENTAL_GOOGLE_SEARCH_MODEL_ID.to_string();
         }
         return orch_sub.to_string();
+    }
+    // No subagent override: follow the orchestrator model when it has one.
+    let orch_model = orch.model.trim();
+    if !orch_model.is_empty() {
+        return if is_google_search_model(orch_model) {
+            EXPERIMENTAL_GOOGLE_SEARCH_MODEL_ID.to_string()
+        } else {
+            orch_model.to_string()
+        };
     }
     ctx.config.model.clone()
 }
@@ -416,15 +438,28 @@ async fn run_subagent_task(
             let s = ctx.config.orchestrator.subagent_provider_id.trim();
             (!s.is_empty()).then_some(s)
         });
-    let effective_effort = spec
+    // Resolve the subagent reasoning effort. A per-call effort wins; otherwise the
+    // orchestrator setting applies, where `inherit` copies the orchestrator level and
+    // `step_down` runs one notch cheaper (high -> medium -> low -> ...).
+    let orch_cfg = &ctx.config.orchestrator;
+    let orchestrator_effort = if orch_cfg.thinking_effort.trim().is_empty() {
+        ctx.config.reasoning_effort.trim()
+    } else {
+        orch_cfg.thinking_effort.trim()
+    };
+    let configured_effort = spec
         .thinking_effort
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .or_else(|| {
-            let s = ctx.config.orchestrator.subagent_thinking_effort.trim();
-            (!s.is_empty()).then_some(s)
-        });
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| orch_cfg.subagent_thinking_effort.clone());
+    let resolved_effort = crate::config::resolve_subagent_effort(
+        &configured_effort,
+        orchestrator_effort,
+        "medium",
+    );
+    let effective_effort = Some(resolved_effort.as_str());
 
     let mut child_config = ctx
         .config

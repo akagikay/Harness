@@ -977,6 +977,17 @@
                                         <span class="arrow-down">⌵</span>
                                     </button>
                                     <span class="settings-sub-caption" id="label-subagent-provider-hint">Provider resolved from selected model</span>
+                                    <label for="orch-subagent-effort" style="margin-top:8px;">Subagent Thinking Effort</label>
+                                    <select id="orch-subagent-effort" class="form-input">
+                                        <option value="step_down">One level below orchestrator (recommended)</option>
+                                        <option value="inherit">Same as orchestrator</option>
+                                        <option value="high">High (fixed)</option>
+                                        <option value="medium">Medium (fixed)</option>
+                                        <option value="low">Low (fixed)</option>
+                                        <option value="minimal">Minimal (fixed)</option>
+                                        <option value="none">None (fixed)</option>
+                                    </select>
+                                    <span class="settings-sub-caption" id="label-subagent-effort-resolved">Subagents run one thinking level below the orchestrator.</span>
                                 </div>
                                 <div class="form-group">
                                     <label for="orch-subagent-server">Default Subagent Server</label>

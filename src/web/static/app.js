@@ -39,7 +39,7 @@ const modelModalitiesCache = new Map();
 const CONVERSATIONS_PROJECT_ID = '__conversations__';
 let allProjects = [];
 let allSessions = [];
-let activeProjectId = 'harness';
+let activeProjectId = 'project';
 let activeComposerScope = 'project'; // 'project' | 'conversation'
 let allServers = [];
 const serverHealthMap = new Map();
@@ -52,7 +52,7 @@ let draftOrchState = {
     subagent_mode: 'single',
     subagent_provider_id: '',
     subagent_model: '',
-    subagent_thinking_effort: 'medium',
+    subagent_thinking_effort: 'step_down',
     subagent_server_id: 'local',
     subagent_profiles: []
 };
@@ -3195,10 +3195,19 @@ function switchCustomizationsTab(tab) {
     switchSettingsTab(tab === 'permissions' ? 'tools' : 'skills');
 }
 
+/**
+ * Append `?session_id=` (or `&session_id=`) so workspace-scoped endpoints such as
+ * `/api/skills` resolve the session's active project instead of the global sandbox.
+ */
+function sessionScopedUrl(url) {
+    if (!currentSessionId) return url;
+    const sep = url.includes('?') ? '&' : '?';
+    return `${url}${sep}session_id=${encodeURIComponent(currentSessionId)}`;
+}
+
 async function fetchSkills() {
     try {
-        let url = '/api/skills';
-        if (currentSessionId) url += `?session_id=${encodeURIComponent(currentSessionId)}`;
+        let url = sessionScopedUrl('/api/skills');
         const res = await fetch(url);
         if (!res.ok) return;
         allSkills = await res.json();
@@ -3277,7 +3286,7 @@ async function saveSkill() {
     }
 
     try {
-        const res = await fetch('/api/skills', {
+        const res = await fetch(sessionScopedUrl('/api/skills'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ name, description, content, enabled })
@@ -3296,7 +3305,7 @@ async function saveSkill() {
 
 async function toggleSkillEnabled(skill) {
     try {
-        const res = await fetch('/api/skills', {
+        const res = await fetch(sessionScopedUrl('/api/skills'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -3320,7 +3329,7 @@ async function deleteSkill(name) {
     });
     if (!ok) return;
     try {
-        const res = await fetch(`/api/skills/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        const res = await fetch(sessionScopedUrl(`/api/skills/${encodeURIComponent(name)}`), { method: 'DELETE' });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         await fetchSkills();
         showToast(`Deleted skill "/${name}".`, 'info');
@@ -4063,6 +4072,7 @@ function renderBrowserEntries(data) {
         const row = document.createElement('div');
         const isSelected = entry.is_dir && entry.path === selectedBrowsePath;
         row.className = `browser-entry-row ${isSelected ? 'selected' : ''} ${entry.is_dir ? '' : 'disabled-file'}`;
+        row.dataset.path = entry.path;
         const icon = entry.is_dir ? '📁' : '📄';
         const sizeStr = entry.is_dir ? '--' : formatBytes(entry.size_bytes || 0);
         const dateStr = entry.modified ? formatTimeAgo(entry.modified) : '--';
@@ -9170,8 +9180,13 @@ function updateOrchPickerLabels() {
 
     const subModel = draftOrchState.subagent_model;
     if (labelSubagentModel) labelSubagentModel.textContent = subModel ? subModel.split('/').pop() : 'Inherit Orchestrator';
-    if (labelSubagentEffort) labelSubagentEffort.textContent = formatReasoningLevelLabel(draftOrchState.subagent_thinking_effort || 'medium');
+    if (labelSubagentEffort) {
+        const orchEffort = draftOrchState.thinking_effort || (currentConfig && currentConfig.reasoning_effort) || 'high';
+        const resolved = resolveSubagentEffort(draftOrchState.subagent_thinking_effort, orchEffort);
+        labelSubagentEffort.textContent = formatReasoningLevelLabel ? formatReasoningLevelLabel(resolved) : resolved;
+    }
     if (labelSubagentProviderHint) labelSubagentProviderHint.textContent = getProviderNameLabel(draftOrchState.subagent_provider_id);
+    if (typeof syncSubagentEffortControls === 'function') syncSubagentEffortControls();
 }
 
 function syncSubagentStrategyVisibility() {
@@ -9297,7 +9312,7 @@ function syncOrchestratorControls() {
         subagent_mode: orch.subagent_mode || 'single',
         subagent_provider_id: orch.subagent_provider_id || '',
         subagent_model: orch.subagent_model || '',
-        subagent_thinking_effort: orch.subagent_thinking_effort || 'medium',
+        subagent_thinking_effort: orch.subagent_thinking_effort || 'step_down',
         subagent_server_id: orch.subagent_server_id || 'local',
         subagent_profiles: Array.isArray(orch.subagent_profiles)
             ? JSON.parse(JSON.stringify(orch.subagent_profiles))
@@ -9334,7 +9349,7 @@ async function saveOrchestratorConfig() {
         subagent_mode: draftOrchState.subagent_mode || 'single',
         subagent_provider_id: draftOrchState.subagent_provider_id || '',
         subagent_model: draftOrchState.subagent_model || '',
-        subagent_thinking_effort: draftOrchState.subagent_thinking_effort || 'medium',
+        subagent_thinking_effort: draftOrchState.subagent_thinking_effort || 'step_down',
         subagent_server_id: orchSubagentServer ? orchSubagentServer.value : (draftOrchState.subagent_server_id || 'local'),
         subagent_profiles: cleanedProfiles,
         system_prompt: orchSystemPrompt ? orchSystemPrompt.value : DEFAULT_ORCHESTRATOR_PROMPT
@@ -11552,10 +11567,13 @@ async function onboardingNext() {
             const active = currentConfig.projects.find(p => p.id === currentConfig.active_project_id) || currentConfig.projects[0];
             if (active && (newPath || extras.length)) {
                 try {
+                    const body = { defaults: active.defaults || {} };
+                    if (newPath) body.path = newPath;
+                    if (extras.length) body.extra_paths = extras;
                     await fetch('/api/projects/' + encodeURIComponent(active.id) + '/defaults', {
                         method: 'PATCH',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ path: newPath || undefined, defaults: active.defaults || {} })
+                        body: JSON.stringify(body)
                     });
                 } catch (_) { /* non-fatal */ }
             }
@@ -11658,7 +11676,10 @@ function showBrowserContextMenu(ev, entry) {
         addItem('Use this folder', () => {
             selectedBrowsePath = entry.path;
             if (browserSelectedLabel) browserSelectedLabel.textContent = entry.path;
-            document.querySelectorAll('.browser-entry-row').forEach(r => r.classList.remove('selected'));
+            // Highlight the chosen row instead of clearing the selection.
+            document.querySelectorAll('.browser-entry-row').forEach(r => {
+                r.classList.toggle('selected', r.dataset.path === entry.path);
+            });
         });
         addItem('New folder inside', () => createFolderIn(entry.path));
         sep();
@@ -11804,3 +11825,73 @@ function openProjectContextMenu(ev, project) {
     if (rect.right > window.innerWidth) menu.style.left = (window.innerWidth - rect.width - 8) + 'px';
     if (rect.bottom > window.innerHeight) menu.style.top = (window.innerHeight - rect.height - 8) + 'px';
 }
+
+// ==========================================================================
+// Subagent thinking effort: "step down" / "inherit" / fixed
+// ==========================================================================
+const REASONING_LEVEL_ORDER = ['none', 'minimal', 'low', 'medium', 'high'];
+
+function normalizeReasoningLevel(raw) {
+    const v = String(raw || '').trim().toLowerCase().replace(/-/g, '_');
+    if (!v) return null;
+    if (v === 'off' || v === 'disabled') return 'none';
+    if (v === 'min' || v === 'minimum') return 'minimal';
+    if (v === 'med' || v === 'mid' || v === 'middle' || v === 'normal' || v === 'default') return 'medium';
+    if (v === 'max' || v === 'maximum' || v === 'extra_high' || v === 'xhigh' || v === 'ultra') return 'high';
+    return REASONING_LEVEL_ORDER.includes(v) ? v : null;
+}
+
+function stepDownEffort(raw) {
+    const level = normalizeReasoningLevel(raw);
+    if (!level) return String(raw || '').trim();
+    const idx = REASONING_LEVEL_ORDER.indexOf(level);
+    return REASONING_LEVEL_ORDER[Math.max(0, idx - 1)];
+}
+
+/** Resolve the level a subagent will actually run at, for display. */
+function resolveSubagentEffort(configured, orchestratorEffort) {
+    const c = String(configured || '').trim().toLowerCase().replace(/-/g, '_');
+    if (c === 'step_down' || c === 'one_lower' || c === 'lower' || c === 'downgrade' || c === 'reduce') {
+        return stepDownEffort(orchestratorEffort);
+    }
+    if (c === 'inherit' || c === 'follow' || c === 'orchestrator' || c === 'same' || c === 'parent') {
+        return String(orchestratorEffort || 'medium').trim() || 'medium';
+    }
+    if (!c) return 'medium';
+    return String(configured).trim();
+}
+
+function syncSubagentEffortControls() {
+    const sel = document.getElementById('orch-subagent-effort');
+    const hint = document.getElementById('label-subagent-effort-resolved');
+    if (!sel) return;
+    const configured = draftOrchState.subagent_thinking_effort || 'step_down';
+    // Only set the select when it holds a known option value.
+    if ([...sel.options].some(o => o.value === configured)) {
+        sel.value = configured;
+    } else {
+        sel.value = 'medium';
+    }
+    if (hint) {
+        const orchEffort = draftOrchState.thinking_effort || (currentConfig && currentConfig.reasoning_effort) || 'high';
+        const resolved = resolveSubagentEffort(configured, orchEffort);
+        const label = formatReasoningLevelLabel ? formatReasoningLevelLabel(resolved) : resolved;
+        if (sel.value === 'step_down') {
+            hint.textContent = `Subagents run at ${label} — one level below the orchestrator (${formatReasoningLevelLabel ? formatReasoningLevelLabel(orchEffort) : orchEffort}).`;
+        } else if (sel.value === 'inherit') {
+            hint.textContent = `Subagents follow the orchestrator (${label}).`;
+        } else {
+            hint.textContent = `Subagents always run at ${label}.`;
+        }
+    }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const sel = document.getElementById('orch-subagent-effort');
+    if (sel) {
+        sel.addEventListener('change', () => {
+            draftOrchState.subagent_thinking_effort = sel.value;
+            syncSubagentEffortControls();
+        });
+    }
+});

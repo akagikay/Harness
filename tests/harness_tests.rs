@@ -5370,6 +5370,8 @@ async fn test_project_defaults_and_conversation_config_persistence() {
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     tokio::fs::create_dir_all(&temp_dir).await.unwrap();
     let db_path = temp_dir.join("proj_defaults.db");
+    let extra_dir = temp_dir.join("extra-folder");
+    tokio::fs::create_dir_all(&extra_dir).await.unwrap();
 
     let mut cfg = HarnessConfig::default();
     cfg.sandbox_root = temp_dir.clone();
@@ -5399,6 +5401,7 @@ async fn test_project_defaults_and_conversation_config_persistence() {
     let defaults_payload = json!({
         "name": "Harness Pro",
         "icon": "🦀",
+        "extra_paths": [extra_dir.to_string_lossy().to_string()],
         "defaults": ProjectDefaults {
             provider_id: "deepseek".into(),
             model: "deepseek-reasoner".into(),
@@ -5420,6 +5423,13 @@ async fn test_project_defaults_and_conversation_config_persistence() {
     assert_eq!(upd_proj["defaults"]["model"], "deepseek-reasoner");
     assert_eq!(upd_proj["defaults"]["reasoning_effort"], "extra_high");
     assert_eq!(upd_proj["defaults"]["orchestrator_mode"], true);
+    let extra_paths = upd_proj["extra_paths"].as_array().expect("extra_paths array");
+    assert_eq!(extra_paths.len(), 1, "extra folder should be persisted");
+    assert!(
+        extra_paths[0].as_str().unwrap_or("").contains("extra-folder"),
+        "expected the extra folder path, got {:?}",
+        extra_paths[0]
+    );
 
     // 2. Create idle conversation inside 'harness' and verify it inherits project defaults & stores reasoning_effort
     let conv: Value = http

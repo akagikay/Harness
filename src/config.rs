@@ -358,6 +358,76 @@ pub struct OrchestratorConfig {
     pub system_prompt: String,
 }
 
+/// Canonical ordering of reasoning-effort levels, least to most intensive.
+pub const REASONING_LEVELS: &[&str] = &["none", "minimal", "low", "medium", "high"];
+
+/// Normalize an effort label to a canonical level, or `None` when unknown.
+pub fn normalize_reasoning_level(raw: &str) -> Option<&'static str> {
+    let v = raw.trim().to_ascii_lowercase().replace('-', "_");
+    let v = match v.as_str() {
+        "" => return None,
+        "off" | "disabled" => "none",
+        "min" | "minimum" => "minimal",
+        "med" | "mid" | "middle" | "normal" | "default" => "medium",
+        "max" | "maximum" | "extra_high" | "xhigh" | "ultra" => "high",
+        other => other,
+    };
+    REASONING_LEVELS.iter().copied().find(|l| *l == v)
+}
+
+/// Step one level down (`high` -> `medium` -> `low` -> `minimal` -> `none`).
+///
+/// This is what a subagent inherits from its orchestrator: the parent reasons at
+/// full effort while workers run a notch cheaper. An unknown level is returned
+/// unchanged so a typo never silently disables reasoning.
+pub fn step_down_effort(raw: &str) -> String {
+    match normalize_reasoning_level(raw) {
+        Some(level) => {
+            let idx = REASONING_LEVELS
+                .iter()
+                .position(|l| *l == level)
+                .unwrap_or(REASONING_LEVELS.len() - 1);
+            REASONING_LEVELS[idx.saturating_sub(1)].to_string()
+        }
+        None => raw.trim().to_string(),
+    }
+}
+
+/// Sentinel values that mean "follow the orchestrator" rather than a fixed value.
+pub fn is_inherit_sentinel(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().replace('-', "_").as_str(),
+        "inherit" | "follow" | "orchestrator" | "same" | "parent"
+    )
+}
+
+/// Sentinel values that mean "one level below the orchestrator".
+pub fn is_step_down_sentinel(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().replace('-', "_").as_str(),
+        "step_down" | "one_lower" | "lower" | "downgrade" | "reduce"
+    )
+}
+
+/// Resolve the effective reasoning effort for a subagent.
+///
+/// * `inherit`  -> the orchestrator's effort unchanged
+/// * `step_down` -> one level below the orchestrator's effort
+/// * anything else -> that fixed level (empty falls back to `default`)
+pub fn resolve_subagent_effort(configured: &str, orchestrator_effort: &str, default: &str) -> String {
+    let c = configured.trim();
+    if is_step_down_sentinel(c) {
+        return step_down_effort(orchestrator_effort);
+    }
+    if is_inherit_sentinel(c) {
+        let o = orchestrator_effort.trim();
+        return if o.is_empty() { default.to_string() } else { o.to_string() };
+    }
+    if c.is_empty() {
+        return default.to_string();
+    }
+    c.to_string()
+}
 impl Default for OrchestratorConfig {
     fn default() -> Self {
         Self {
@@ -367,7 +437,8 @@ impl Default for OrchestratorConfig {
             thinking_effort: "high".to_string(),
             subagent_model: String::new(),
             subagent_provider_id: String::new(),
-            subagent_thinking_effort: "medium".to_string(),
+            // Default: workers reason one level below the orchestrator.
+            subagent_thinking_effort: "step_down".to_string(),
             subagent_server_id: String::new(),
             subagent_mode: default_subagent_mode(),
             subagent_profiles: default_subagent_profiles(),
@@ -1142,5 +1213,69 @@ mod builtin_skills_discovery_tests {
         assert_eq!(code[0].description, "custom");
         assert!(code[0].content.contains("custom body"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod subagent_effort_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_step_down() {
+        let cfg = OrchestratorConfig::default();
+        assert_eq!(cfg.subagent_thinking_effort, "step_down");
+    }
+
+    #[test]
+    fn step_down_lowers_one_level() {
+        assert_eq!(step_down_effort("high"), "medium");
+        assert_eq!(step_down_effort("medium"), "low");
+        assert_eq!(step_down_effort("low"), "minimal");
+        assert_eq!(step_down_effort("minimal"), "none");
+        // Never goes below the floor.
+        assert_eq!(step_down_effort("none"), "none");
+    }
+
+    #[test]
+    fn step_down_normalizes_aliases() {
+        assert_eq!(step_down_effort("HIGH"), "medium");
+        assert_eq!(step_down_effort("xhigh"), "medium");
+        assert_eq!(step_down_effort("med"), "low");
+        // Unknown labels are passed through untouched.
+        assert_eq!(step_down_effort("turbo"), "turbo");
+    }
+
+    #[test]
+    fn resolve_follows_orchestrator_and_steps_down() {
+        // The headline behaviour: orchestrator high -> subagent medium.
+        assert_eq!(resolve_subagent_effort("step_down", "high", "medium"), "medium");
+        assert_eq!(resolve_subagent_effort("step_down", "medium", "medium"), "low");
+        // Explicit inherit copies the orchestrator level.
+        assert_eq!(resolve_subagent_effort("inherit", "high", "medium"), "high");
+        // A fixed level always wins.
+        assert_eq!(resolve_subagent_effort("low", "high", "medium"), "low");
+        // Empty configuration falls back to the default.
+        assert_eq!(resolve_subagent_effort("", "high", "medium"), "medium");
+        // Inherit with no orchestrator level uses the default.
+        assert_eq!(resolve_subagent_effort("inherit", "", "medium"), "medium");
+    }
+
+    #[test]
+    fn sentinels_are_recognized() {
+        for s in ["step_down", "STEP-DOWN", "one_lower", "lower", "downgrade", "reduce"] {
+            assert!(is_step_down_sentinel(s), "{s} should be a step-down sentinel");
+        }
+        for s in ["inherit", "follow", "orchestrator", "same", "parent"] {
+            assert!(is_inherit_sentinel(s), "{s} should be an inherit sentinel");
+        }
+        assert!(!is_step_down_sentinel("high"));
+        assert!(!is_inherit_sentinel("high"));
+    }
+
+    #[test]
+    fn missing_field_deserializes_to_step_down() {
+        // Configs written before this field existed must default to step_down.
+        let cfg: OrchestratorConfig = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert_eq!(cfg.subagent_thinking_effort, "step_down");
     }
 }
