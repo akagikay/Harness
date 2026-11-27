@@ -6297,6 +6297,151 @@ async fn test_ui_assets_are_served_without_browser_caching() {
     assert!(html.contains("id=\"project-settings-modal\""));
     assert!(html.contains("id=\"file-browser-modal\""));
     assert!(html.contains("id=\"btn-sidebar-new-automation\""));
+    // Automatic update progress drawer + restart overlay must ship with the UI.
+    assert!(html.contains("id=\"update-drawer\""));
+    assert!(html.contains("id=\"update-restart-overlay\""));
+
+    srv.abort();
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_update_download_streams_progress_and_verifies_checksum() {
+    use deepseek_harness_rs::updater::{download_with_progress, ReleaseAsset, UpdateInfo};
+
+    let payload: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+    let digest = deepseek_harness_rs::crypto::sha256_hex(&payload);
+    let good_sums = format!("{digest}  harness.exe\n");
+    let bad_sums = format!("{}  harness.exe\n", "0".repeat(64));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{}", addr);
+    let router = axum::Router::new()
+        .route(
+            "/release/harness.exe",
+            axum::routing::get({
+                let body = payload.clone();
+                move || async move { body }
+            }),
+        )
+        .route(
+            "/release/SHA256SUMS",
+            axum::routing::get({
+                let body = good_sums.clone();
+                move || async move { body }
+            }),
+        )
+        .route(
+            "/release/BAD-SHA256SUMS",
+            axum::routing::get({
+                let body = bad_sums.clone();
+                move || async move { body }
+            }),
+        );
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let mk_info = |sums_name: &str| UpdateInfo {
+        current_version: "1.0.0".into(),
+        latest_version: "9.9.9".into(),
+        available: true,
+        html_url: String::new(),
+        notes: String::new(),
+        published_at: String::new(),
+        asset: Some(ReleaseAsset {
+            name: "harness.exe".into(),
+            url: format!("{base}/release/harness.exe"),
+            size: payload.len() as u64,
+        }),
+        checksums: Some(ReleaseAsset {
+            name: sums_name.into(),
+            url: format!("{base}/release/{sums_name}"),
+            size: 0,
+        }),
+    };
+
+    let dest = std::env::temp_dir().join(format!("harness-upd-dl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dest);
+    std::fs::create_dir_all(&dest).unwrap();
+
+    // 1) A good download reports streamed progress and writes the payload.
+    let mut calls = 0usize;
+    let mut last_done = 0u64;
+    let path = download_with_progress(&mk_info("SHA256SUMS"), &dest, |done, total| {
+        calls += 1;
+        last_done = done;
+        assert!(done <= total.unwrap_or(u64::MAX), "progress must not exceed the total");
+    })
+    .await
+    .expect("verified download must succeed");
+    assert!(calls >= 2, "progress must fire at least on start and at the end");
+    assert_eq!(last_done, payload.len() as u64, "final progress equals the size");
+    assert_eq!(std::fs::read(&path).unwrap(), payload, "payload must be intact");
+    assert!(
+        !dest.join("harness.exe.part").exists(),
+        "no .part leftovers after a successful download"
+    );
+
+    // 2) A wrong published digest must abort the install.
+    let mismatch = download_with_progress(&mk_info("BAD-SHA256SUMS"), &dest, |_, _| {}).await;
+    let err = mismatch.expect_err("a checksum mismatch must fail").to_string();
+    assert!(err.contains("Checksum mismatch"), "got: {err}");
+    assert!(
+        !dest.join("harness.exe.part").exists(),
+        "a rejected payload must never be staged under its final name"
+    );
+
+    // 3) A missing checksums asset must also fail closed.
+    let missing = download_with_progress(&mk_info("NOPE"), &dest, |_, _| {}).await;
+    assert!(missing.is_err(), "an unavailable checksums asset must fail the install");
+
+    srv.abort();
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[tokio::test]
+async fn test_update_status_endpoint_exposes_phase() {
+    let temp_dir = std::env::temp_dir().join(format!("harness-upd-status-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let mut config = HarnessConfig::default();
+    config.sandbox_root = temp_dir.clone();
+    config.auth_token = String::new();
+    let state = AppState::new(config);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", addr);
+
+    let got: Value = client
+        .get(format!("{base}/api/update/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // The UI polls this to render the progress drawer; the phase is required.
+    let phase = got["phase"].as_str().unwrap_or_default();
+    assert!(
+        [
+            "idle",
+            "checking",
+            "available",
+            "downloading",
+            "verifying",
+            "waiting_for_idle",
+            "installing",
+            "restarting",
+            "up_to_date",
+            "failed"
+        ]
+        .contains(&phase),
+        "unexpected update phase: {phase}"
+    );
+    assert!(got["current_version"].as_str().is_some());
 
     srv.abort();
     let _ = std::fs::remove_dir_all(&temp_dir);

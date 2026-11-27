@@ -3,17 +3,22 @@
 //! Flow:
 //! 1. [`check`] asks the GitHub Releases API for the latest release and compares
 //!    its tag with the running `CARGO_PKG_VERSION`.
-//! 2. [`download`] fetches the platform binary asset into a temp file and, when
-//!    the release publishes `SHA256SUMS`, verifies the digest.
-//! 3. [`apply_and_restart`] swaps the running executable and relaunches.
+//! 2. [`download`] / [`download_with_progress`] fetch the platform binary asset
+//!    into a temp file and, when the release publishes `SHA256SUMS`, verify the
+//!    digest (streamed so the UI can show progress).
+//! 3. [`apply_and_restart`] swaps the running executable and relaunches it with
+//!    the *same* command-line arguments, so a port/db override survives updates.
 //!
-//! Updates are never applied implicitly: the caller must opt in
-//! (`auto_update_apply` config, `--update`, or `POST /api/update/apply`).
+//! Updates can be fully automatic: see [`super::auto_update`] and the
+//! `auto_update_apply` config flag.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 
 /// Default repository that publishes harness releases.
 pub const DEFAULT_REPO: &str = "akagikay/Harness";
@@ -38,6 +43,84 @@ pub struct UpdateInfo {
     pub asset: Option<ReleaseAsset>,
     /// `SHA256SUMS` asset, when published.
     pub checksums: Option<ReleaseAsset>,
+}
+
+/// Progress of an in-flight update, mirrored for the UI (and logs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdatePhase {
+    /// Nothing has happened yet.
+    Idle,
+    /// Asking GitHub whether a newer release exists.
+    Checking,
+    /// A newer release was found but not downloaded yet.
+    Available,
+    /// Streaming the new binary.
+    Downloading,
+    /// Comparing the downloaded digest with `SHA256SUMS`.
+    Verifying,
+    /// Downloaded and verified; waiting for running work to settle.
+    WaitingForIdle,
+    /// Swapping the executable on disk.
+    Installing,
+    /// The new binary has been launched; this process is on the way out.
+    Restarting,
+    /// Already running the newest release.
+    UpToDate,
+    /// The pipeline stopped with an error.
+    Failed,
+}
+
+impl Default for UpdatePhase {
+    fn default() -> Self {
+        UpdatePhase::Idle
+    }
+}
+
+/// Live, cloneable snapshot of the update pipeline (safe to expose to the UI).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateStatus {
+    pub phase: UpdatePhase,
+    pub current_version: String,
+    pub target_version: String,
+    #[serde(default)]
+    pub downloaded_bytes: u64,
+    #[serde(default)]
+    pub total_bytes: u64,
+    /// 0-100 when the total size is known.
+    #[serde(default)]
+    pub percent: Option<u8>,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub html_url: String,
+    #[serde(default)]
+    pub notes: String,
+    /// Wall-clock (unix seconds) of the last change.
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+impl UpdateStatus {
+    pub fn touch(&mut self) {
+        self.updated_at = chrono::Utc::now().timestamp().max(0) as u64;
+    }
+
+    pub fn progress_phase(&mut self, phase: UpdatePhase, message: impl Into<String>) {
+        self.phase = phase;
+        self.message = message.into();
+        self.error = None;
+        self.touch();
+    }
+
+    pub fn fail(&mut self, error: impl Into<String>) {
+        self.phase = UpdatePhase::Failed;
+        self.error = Some(error.into());
+        self.message = self.error.clone().unwrap_or_default();
+        self.touch();
+    }
 }
 
 /// The file name of the running executable (`harness.exe` on Windows).
@@ -198,16 +281,32 @@ pub async fn check_for_exe(
 }
 
 /// Expected digest for `asset_name` from a `SHA256SUMS` file.
+///
+/// Deliberately liberal about format, because a mismatched release file must
+/// never block an update: accepts `sha256sum` order (`<hex>  <name>`), binary
+/// mode (`<hex> *<name>`), reversed order (`<name> <hex>`), and CRLF endings.
 fn digest_for(sums: &str, asset_name: &str) -> Option<String> {
+    fn is_hex(s: &str) -> bool {
+        let s = s.trim_start_matches('*');
+        s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+    }
     for line in sums.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // Formats: "<hex>  <name>" (sha256sum) or "<hex> *<name>" (binary mode).
-        let mut it = line.split_whitespace();
-        let hex = it.next()?;
-        let name = it.next()?.trim_start_matches('*');
+        let mut parts = line.split_whitespace();
+        let first = parts.next()?;
+        let second = parts.next()?;
+        // Determine which token is the digest and which is the file name.
+        let (hex, name) = if is_hex(first) {
+            (first, second)
+        } else if is_hex(second) {
+            (second, first)
+        } else {
+            continue;
+        };
+        let name = name.trim_start_matches('*');
         if name.eq_ignore_ascii_case(asset_name) {
             return Some(hex.to_ascii_lowercase());
         }
@@ -218,28 +317,68 @@ fn digest_for(sums: &str, asset_name: &str) -> Option<String> {
 /// Download the release binary to `dest_dir`, verifying its checksum when the
 /// release publishes `SHA256SUMS`. Returns the written path.
 pub async fn download(info: &UpdateInfo, dest_dir: &Path) -> Result<PathBuf, String> {
+    download_with_progress(info, dest_dir, |_, _| {}).await
+}
+
+/// Like [`download`], but streams the payload so `on_progress(done, total)`
+/// can drive a progress bar. The digest is computed incrementally and verified
+/// against `SHA256SUMS` before the file is swapped into place.
+pub async fn download_with_progress<F>(
+    info: &UpdateInfo,
+    dest_dir: &Path,
+    mut on_progress: F,
+) -> Result<PathBuf, String>
+where
+    F: FnMut(u64, Option<u64>),
+{
     let asset = info
         .asset
         .as_ref()
         .ok_or_else(|| format!("Release {} has no asset named {}", info.latest_version, current_exe_name()))?;
     std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
 
-    let bytes = client()?
+    let resp = client()?
         .get(&asset.url)
         .send()
         .await
-        .map_err(|e| format!("Download failed: {e}"))?
+        .map_err(|e| format!("Download failed: {e}"))?;
+    let resp = resp
         .error_for_status()
-        .map_err(|e| format!("Download failed: {e}"))?
-        .bytes()
-        .await
         .map_err(|e| format!("Download failed: {e}"))?;
 
+    let total = if asset.size > 0 {
+        Some(asset.size)
+    } else {
+        resp.content_length()
+    };
+
+    let dest = dest_dir.join(&asset.name);
+    let part = dest_dir.join(format!("{}.part", asset.name));
+    let mut file = tokio::fs::File::create(&part)
+        .await
+        .map_err(|e| format!("Failed to create update file: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut done: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    on_progress(0, total);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Download failed: {e}"))?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("Failed to write update: {e}"))?;
+        hasher.update(&chunk);
+        done += chunk.len() as u64;
+        on_progress(done, total);
+    }
+    file.flush()
+        .await
+        .map_err(|e| format!("Failed to flush update: {e}"))?;
+
     // Guard against a truncated or swapped payload.
-    if asset.size > 0 && bytes.len() as u64 != asset.size {
+    if asset.size > 0 && done != asset.size {
+        let _ = tokio::fs::remove_file(&part).await;
         return Err(format!(
-            "Downloaded size {} does not match published size {}",
-            bytes.len(),
+            "Downloaded size {done} does not match published size {}",
             asset.size
         ));
     }
@@ -255,20 +394,26 @@ pub async fn download(info: &UpdateInfo, dest_dir: &Path) -> Result<PathBuf, Str
             .map_err(|e| format!("Checksum download failed: {e}"))?;
         match digest_for(&sums, &asset.name) {
             Some(expected) => {
-                let actual = crate::crypto::sha256_hex(&bytes);
+                let actual = hex::encode(hasher.finalize());
                 if actual != expected {
+                    let _ = tokio::fs::remove_file(&part).await;
                     return Err(format!(
                         "Checksum mismatch for {}: expected {expected}, got {actual}",
                         asset.name
                     ));
                 }
             }
-            None => return Err(format!("{} missing from SHA256SUMS", asset.name)),
+            None => {
+                let _ = tokio::fs::remove_file(&part).await;
+                return Err(format!("{} missing from SHA256SUMS", asset.name));
+            }
         }
     }
 
-    let dest = dest_dir.join(&asset.name);
-    std::fs::write(&dest, &bytes).map_err(|e| format!("Failed to write update: {e}"))?;
+    // Only now is the payload trusted; publish it under its final name.
+    tokio::fs::rename(&part, &dest)
+        .await
+        .map_err(|e| format!("Failed to stage update: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -277,40 +422,149 @@ pub async fn download(info: &UpdateInfo, dest_dir: &Path) -> Result<PathBuf, Str
     Ok(dest)
 }
 
+/// The arguments this process was started with, minus the executable path.
+///
+/// Restarting without them would silently drop `--port`, `--db`, `--sandbox`,
+/// `--mode`, ... and the updated process would come up somewhere else.
+pub fn relaunch_args() -> Vec<String> {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Our own flags are one-shot: never replay them into the child process.
+    args.retain(|a| a != "--update" && a != "--check-update");
+    args
+}
+
+/// Spawn a fresh copy of `exe` (defaults to the current binary) with the given
+/// arguments, detached from this process. Returns the child's PID.
+pub fn spawn_detached(exe: Option<&Path>, args: &[String]) -> Result<u32, String> {
+    let exe = match exe {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_exe().map_err(|e| format!("Cannot locate current exe: {e}"))?,
+    };
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Don't flash a console window when a GUI-launched harness restarts.
+        cmd.creation_flags(0x0800_0000);
+    }
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to launch {}: {e}", exe.display()))?;
+    Ok(child.id())
+}
+
+/// Remove stale `*.old-*` backups next to `current` (best effort, keeps at most
+/// the newest one).
+fn prune_old_backups(current: &Path) {
+    let Some(dir) = current.parent() else { return };
+    let stem = current.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let prefix = format!("{stem}.old-");
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut olds: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().starts_with(&prefix))
+                .unwrap_or(false)
+        })
+        .collect();
+    if olds.len() <= 1 {
+        return;
+    }
+    olds.sort();
+    let keep = olds.pop();
+    for old in olds {
+        let _ = std::fs::remove_file(old);
+    }
+    drop(keep);
+}
+
 /// Replace the running executable with `new_exe` and relaunch.
 ///
 /// On Windows a running executable cannot be overwritten but *can* be renamed,
 /// so the current binary is moved aside first. The caller should exit right
 /// after this returns `Ok`.
 pub fn apply_and_restart(new_exe: &Path) -> Result<PathBuf, String> {
+    let args = relaunch_args();
+    apply_and_restart_with_args(new_exe, &args)
+}
+
+pub fn apply_and_restart_with_args(new_exe: &Path, args: &[String]) -> Result<PathBuf, String> {
     let current = std::env::current_exe().map_err(|e| format!("Cannot locate current exe: {e}"))?;
     if !new_exe.is_file() {
         return Err(format!("Update file not found: {}", new_exe.display()));
     }
 
+    // Relaunch from a temp copy only if it equals the current binary (a caller
+    // may hand us a differently named download).
+    let install_target = current.clone();
+
     let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
-    let backup = current.with_extension(format!("old-{stamp}"));
-    // Move the running binary aside (allowed on Windows).
-    std::fs::rename(&current, &backup)
+    let stem = current
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "harness.exe".to_string());
+    let backup = current
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("{stem}.old-{stamp}"));
+    // Move the running binary aside (allowed on Windows even while executing).
+    std::fs::rename(&install_target, &backup)
         .map_err(|e| format!("Failed to move current executable aside: {e}"))?;
 
-    if let Err(e) = std::fs::copy(new_exe, &current) {
+    if let Err(e) = std::fs::copy(new_exe, &install_target) {
         // Roll back so the user is not left without a binary.
-        let _ = std::fs::rename(&backup, &current);
+        let _ = std::fs::rename(&backup, &install_target);
         return Err(format!("Failed to install update: {e}"));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(&install_target, std::fs::Permissions::from_mode(0o755));
     }
+    prune_old_backups(&install_target);
 
-    // Relaunch the updated binary.
-    std::process::Command::new(&current)
-        .spawn()
+    // Relaunch the updated binary with the *same* arguments (port, db, sandbox).
+    spawn_detached(Some(&install_target), args)
         .map_err(|e| format!("Update installed but restart failed: {e}"))?;
 
     Ok(backup)
+}
+
+/// Bind the UI listener, retrying for a while. The old process may still be
+/// shutting down (or the freshly relaunched one may start before its parent
+/// released the port), which used to make an update look like a crash.
+pub async fn bind_with_retry(addr: std::net::SocketAddr, timeout: Duration) -> std::io::Result<tokio::net::TcpListener> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut attempt = 0;
+    loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => return Ok(l),
+            Err(e) => {
+                if std::time::Instant::now() >= deadline || !is_addr_in_use(&e) {
+                    return Err(e);
+                }
+                attempt += 1;
+                if attempt == 1 {
+                    println!("Waiting for port {addr} to be released...");
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+}
+
+fn is_addr_in_use(err: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        err.raw_os_error() == Some(10048) // WSAEADDRINUSE
+    }
+    #[cfg(not(windows))]
+    {
+        err.kind() == std::io::ErrorKind::AddrInUse
+    }
 }
 
 /// Convenience: check, download to `dest_dir`, and install.
@@ -344,21 +598,126 @@ mod tests {
     #[test]
     fn parses_sha256sums_formats() {
         let sums = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  harness.exe\n\
-                    d3b07384d113edec49eaa6238ad5ff00  *harness-server.exe\n";
+                    e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 *harness-server.exe\n";
         assert_eq!(
             digest_for(sums, "harness.exe").unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert_eq!(
             digest_for(sums, "harness-server.exe").unwrap(),
-            "d3b07384d113edec49eaa6238ad5ff00"
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
         assert!(digest_for(sums, "missing.exe").is_none());
+    }
+
+    /// A release file written as "<name> <hex>" (as v1.1.1 accidentally shipped)
+    /// must still resolve - otherwise no update could ever install.
+    #[test]
+    fn parses_name_then_hash_order() {
+        let sums = "harness.exe DD991C8E1B19DF15BE0039FEF4941A7882082CC1BCDC5925028F9F57653750B3\n\
+                    harness-server.exe E8C73A077FEBBC4A3E68B5BE5B1383223B1381363608D389553EF1F912A68A37\n";
+        assert_eq!(
+            digest_for(sums, "harness.exe").unwrap(),
+            "dd991c8e1b19df15be0039fef4941a7882082cc1bcdc5925028f9f57653750b3"
+        );
+        assert_eq!(
+            digest_for(sums, "harness-server.exe").unwrap(),
+            "e8c73a077febbc4a3e68b5be5b1383223b1381363608d389553ef1f912a68a37"
+        );
+    }
+
+    /// CRLF endings (what `sha256sum | Out-File` produces on Windows) must work.
+    #[test]
+    fn parses_crlf_and_uppercase_digests() {
+        let sums = "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD  harness.exe\r\n";
+        assert_eq!(
+            digest_for(sums, "harness.exe").unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// A file that is not a digest list must not be mistaken for one.
+    #[test]
+    fn rejects_non_digest_lines() {
+        assert!(digest_for("not a digest at all\n", "harness.exe").is_none());
+        // too short / wrong character set
+        assert!(digest_for("abc123  harness.exe\n", "harness.exe").is_none());
     }
 
     #[test]
     fn exe_name_is_non_empty() {
         assert!(!current_exe_name().is_empty());
+    }
+
+    #[test]
+    fn relaunch_args_drop_one_shot_flags() {
+        // `cargo test` passes its own args, so just assert the filter behaves.
+        let args: Vec<String> = vec!["--port".into(), "8099".into(), "--db".into(), "x.db".into()];
+        let mut kept: Vec<String> = args
+            .iter()
+            .filter(|a| *a != "--update" && *a != "--check-update")
+            .cloned()
+            .collect();
+        assert_eq!(kept, vec!["--port", "8099", "--db", "x.db"]);
+        kept.retain(|a| a != "--update" && a != "--check-update");
+        assert_eq!(kept.len(), 4);
+    }
+
+    #[test]
+    fn status_tracks_progress() {
+        let mut st = UpdateStatus::default();
+        assert_eq!(st.phase, UpdatePhase::Idle);
+        st.progress_phase(UpdatePhase::Downloading, "fetching harness.exe");
+        assert_eq!(st.message, "fetching harness.exe");
+        assert!(st.error.is_none());
+        assert!(st.updated_at > 0);
+        st.fail("network");
+        assert_eq!(st.phase, UpdatePhase::Failed);
+        assert_eq!(st.error.as_deref(), Some("network"));
+        // Failed stays sticky until an explicit progress phase clears it.
+        st.progress_phase(UpdatePhase::Checking, "retry");
+        assert!(st.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn bind_with_retry_accepts_a_free_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let bound = bind_with_retry(addr, Duration::from_secs(3)).await;
+        assert!(bound.is_ok(), "a free port must bind immediately");
+    }
+
+    #[tokio::test]
+    async fn bind_with_retry_gives_up_on_a_busy_port() {
+        // Hold a port, then assert the retry loop times out instead of hanging.
+        let deadline_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = deadline_listener.local_addr().unwrap().port();
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let started = std::time::Instant::now();
+        let res = bind_with_retry(addr, Duration::from_millis(400)).await;
+        assert!(res.is_err(), "an in-use port must fail after the timeout");
+        assert!(is_addr_in_use(res.as_ref().err().unwrap()));
+        assert!(started.elapsed() >= Duration::from_millis(350));
+        drop(deadline_listener);
+    }
+
+    #[test]
+    fn relaunch_args_keep_runtime_flags_and_get_them_back() {
+        let args = vec![
+            "--port".to_string(),
+            "8099".to_string(),
+            "--db".to_string(),
+            "harness.db".to_string(),
+            "--update".to_string(),
+        ];
+        let kept: Vec<String> = args
+            .iter()
+            .filter(|a| *a != "--update" && *a != "--check-update")
+            .cloned()
+            .collect();
+        assert_eq!(kept, vec!["--port", "8099", "--db", "harness.db"]);
     }
 }
 

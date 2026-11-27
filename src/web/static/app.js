@@ -456,6 +456,8 @@ const cfgMaxToolRetries = document.getElementById('cfg-max-tool-retries');
 const cfgEnableWorkingMemory = document.getElementById('cfg-enable-working-memory');
 const cfgSummarizeCompactedTurns = document.getElementById('cfg-summarize-compacted-turns');
 const cfgVoiceActivityDetection = document.getElementById('cfg-voice-activity-detection');
+const cfgAutoUpdateCheck = document.getElementById('cfg-auto-update-check');
+const cfgAutoUpdateApply = document.getElementById('cfg-auto-update-apply');
 const cfgReasoningCapabilityBadge = document.getElementById('cfg-reasoning-capability-badge');
 
 const DEFAULT_NVIDIA_KEY = ""; // no bundled key; user supplies their own NVIDIA key
@@ -518,69 +520,150 @@ function harnessSseUrl(url) {
 }
 
 // ==========================================================================
-// Auto-update banner (GitHub Releases)
+// Automatic updates: live progress drawer (checkbox + download + install)
 // ==========================================================================
-async function checkForHarnessUpdate() {
-    try {
-        const res = await fetch('/api/update/check');
-        if (!res.ok) return;
-        const info = await res.json();
-        if (!info.available) return;
-        showUpdateBanner(info);
-    } catch (_) { /* offline or rate-limited: stay quiet */ }
+let updateStatus = { phase: 'idle' };
+let updateDrawerDismissed = false;
+let updateRestartOverlayShown = false;
+
+function fmtBytes(bytes) {
+    if (!bytes || bytes < 0) return '';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let n = bytes;
+    let u = 0;
+    while (n >= 1024 && u < units.length - 1) { n /= 1024; u++; }
+    return `${n >= 100 || u === 0 ? Math.round(n) : n.toFixed(1)} ${units[u]}`;
 }
 
-function showUpdateBanner(info) {
-    if (document.getElementById('harness-update-banner')) return;
-    const bar = document.createElement('div');
-    bar.id = 'harness-update-banner';
-    bar.style.cssText = [
-        'position:fixed', 'right:16px', 'bottom:16px', 'z-index:9999',
-        'background:#1e2430', 'color:#e6edf3', 'border:1px solid #3d4757',
-        'border-radius:10px', 'padding:12px 14px', 'max-width:340px',
-        'font-size:13px', 'box-shadow:0 8px 24px rgba(0,0,0,.45)',
-        'display:flex', 'flex-direction:column', 'gap:8px'
-    ].join(';');
-    const title = document.createElement('strong');
-    title.textContent = `Update available: v${info.latest_version}`;
-    const note = document.createElement('span');
-    note.style.cssText = 'opacity:.8';
-    note.textContent = `You are running v${info.current_version}.`;
-    const actions = document.createElement('div');
-    actions.style.cssText = 'display:flex;gap:8px;justify-content:flex-end';
+async function fetchUpdateStatus() {
+    const drawer = document.getElementById('update-drawer');
+    if (!drawer) return;
+    const overlay = document.getElementById('update-restart-overlay');
+    let data;
+    try {
+        const res = await fetch('/api/update/status');
+        data = await res.json();
+    } catch (_) {
+        return; // server mid-restart; keep the last rendered state
+    }
+    if (!data || typeof data !== 'object') return;
+    const previous = updateStatus.phase;
+    updateStatus = data;
 
-    const view = document.createElement('a');
-    view.href = info.html_url;
-    view.target = '_blank';
-    view.rel = 'noopener noreferrer';
-    view.textContent = 'Release notes';
-    view.style.cssText = 'color:#7cb7ff;text-decoration:none;margin-right:auto';
-
-    const apply = document.createElement('button');
-    apply.textContent = 'Install & restart';
-    apply.style.cssText = 'background:#2f6feb;color:#fff;border:0;border-radius:6px;padding:5px 10px;cursor:pointer';
-    apply.onclick = async () => {
-        apply.disabled = true;
-        apply.textContent = 'Installing...';
-        try {
-            const res = await fetch('/api/update/apply', { method: 'POST' });
-            if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
-            apply.textContent = 'Restarting...';
-        } catch (e) {
-            apply.disabled = false;
-            apply.textContent = 'Install & restart';
-            showToast('Update failed: ' + e.message, 'error', 7000);
+    // Once the install lands, block the UI and reload into the new binary.
+    if (data.phase === 'restarting') {
+        updateRestartOverlayShown = true;
+        drawer.classList.add('hidden');
+        if (overlay) {
+            overlay.classList.remove('hidden');
+            const title = document.getElementById('update-restart-title');
+            const msg = document.getElementById('update-restart-message');
+            if (title) title.textContent = `Updated to v${data.target_version || ''}`;
+            if (msg) msg.textContent = 'Restarting Harness. This tab will reload automatically.';
         }
+        setTimeout(() => { window.location.reload(); }, 3500);
+    } else if (updateRestartOverlayShown) {
+        updateRestartOverlayShown = false;
+        overlay?.classList.add('hidden');
+    }
+
+    if (data.phase === 'available' && previous !== 'available') {
+        showToast(`Harness v${data.target_version} is available - installing automatically.`, 'info', 8000);
+    }
+    if (data.phase === 'failed' && previous !== 'failed') {
+        showToast('Update failed: ' + (data.error || 'unknown error'), 'error', 9000);
+    }
+    const runningVersionEl = document.getElementById('cfg-running-version');
+    if (runningVersionEl && data.current_version) {
+        const label = 'v' + data.current_version;
+        if (runningVersionEl.textContent !== label) runningVersionEl.textContent = label;
+    }
+    renderUpdateDrawer(data);
+}
+
+function renderUpdateDrawer(data) {
+    const drawer = document.getElementById('update-drawer');
+    if (!drawer) return;
+
+    const quiet = data.phase === 'idle' || data.phase === 'up_to_date';
+    if (quiet || (updateDrawerDismissed && data.phase !== 'failed')) {
+        drawer.classList.add('hidden');
+        return;
+    }
+
+    const icon = document.getElementById('update-drawer-icon');
+    const title = document.getElementById('update-drawer-title');
+    const barWrap = document.getElementById('update-drawer-bar');
+    const fill = document.getElementById('update-drawer-bar-fill');
+    const bytes = document.getElementById('update-drawer-bytes');
+    const pct = document.getElementById('update-drawer-percent');
+    const installBtn = document.getElementById('update-drawer-install');
+    const link = document.getElementById('update-drawer-link');
+
+    drawer.classList.remove('hidden');
+    drawer.setAttribute('data-phase', data.phase);
+
+    const total = data.total_bytes || 0;
+    const done = data.downloaded_bytes || 0;
+    const percent = data.percent != null
+        ? data.percent
+        : (total > 0 ? Math.min(100, Math.round((done / total) * 100)) : null);
+
+    const labels = {
+        checking: 'Checking for updates\u2026',
+        available: `Harness v${data.target_version || ''} available`,
+        downloading: `Downloading v${data.target_version || ''}\u2026`,
+        verifying: 'Verifying checksum\u2026',
+        waiting_for_idle: 'Waiting for running work to finish\u2026',
+        installing: 'Installing update\u2026',
+        restarting: 'Restarting\u2026',
+        failed: 'Update failed'
     };
+    if (title) {
+        title.textContent = data.phase === 'failed'
+            ? (data.error || labels.failed)
+            : (labels[data.phase] || data.message || 'Updating\u2026');
+    }
+    if (icon) icon.textContent = data.phase === 'failed' ? '\u26A0' : '\u21BB';
 
-    const dismiss = document.createElement('button');
-    dismiss.textContent = 'Later';
-    dismiss.style.cssText = 'background:transparent;color:#9aa7b8;border:1px solid #3d4757;border-radius:6px;padding:5px 10px;cursor:pointer';
-    dismiss.onclick = () => bar.remove();
+    const downloading = data.phase === 'downloading';
+    if (barWrap) barWrap.classList.toggle('active', downloading);
+    if (fill) fill.style.width = `${downloading ? (percent == null ? 0 : percent) : 100}%`;
+    if (bytes) bytes.textContent = downloading
+        ? `${fmtBytes(done)}${total ? ' / ' + fmtBytes(total) : ''}`
+        : '';
+    if (pct) pct.textContent = downloading && percent != null ? `${percent}%` : '';
 
-    actions.append(view, dismiss, apply);
-    bar.append(title, note, actions);
-    document.body.appendChild(bar);
+    if (installBtn) {
+        installBtn.classList.toggle('hidden', data.phase !== 'available');
+        installBtn.onclick = manualUpdateInstall;
+    }
+    if (link) {
+        if (data.html_url) {
+            link.href = data.html_url;
+            link.classList.remove('hidden');
+        } else {
+            link.classList.add('hidden');
+        }
+    }
+}
+
+async function manualUpdateInstall() {
+    const btn = document.getElementById('update-drawer-install');
+    if (btn) { btn.disabled = true; btn.textContent = 'Starting\u2026'; }
+    try {
+        const res = await fetch('/api/update/apply', { method: 'POST' });
+        if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
+        showToast('Update started.', 'success');
+    } catch (e) {
+        showToast('Update failed: ' + e.message, 'error', 7000);
+        if (btn) { btn.disabled = false; btn.textContent = 'Install now'; }
+    }
+}
+
+// Kept for callers/tests: the background loop is authoritative now.
+async function checkForHarnessUpdate() {
+    await fetchUpdateStatus();
 }
 
 // ==========================================================================
@@ -1009,6 +1092,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
     fetchMetrics();
     setInterval(fetchMetrics, 2500);
+    // Live auto-update progress (download %, verify, install, restart).
+    fetchUpdateStatus();
+    setInterval(fetchUpdateStatus, 1200);
+    const hideUpdateDrawer = document.getElementById('update-drawer-close');
+    if (hideUpdateDrawer) {
+        hideUpdateDrawer.addEventListener('click', () => {
+            updateDrawerDismissed = true;
+            document.getElementById('update-drawer')?.classList.add('hidden');
+        });
+    }
     fetchProjects();
     fetchSessions();
     fetchSkills();
@@ -1612,6 +1705,60 @@ document.addEventListener('DOMContentLoaded', () => {
             if (voiceInputActive) {
                 if (isVoiceActivityEnabled()) startVadMonitor();
                 else stopVadMonitor();
+            }
+        });
+    }
+    // Automatic updates: persist the toggles straight away.
+    if (cfgAutoUpdateCheck) {
+        cfgAutoUpdateCheck.addEventListener('change', () => {
+            if (currentConfig) {
+                currentConfig.auto_update_check = !!cfgAutoUpdateCheck.checked;
+                persistDisplayVerbosityConfig();
+                showToast(
+                    cfgAutoUpdateCheck.checked
+                        ? 'Automatic update checks enabled.'
+                        : 'Automatic update checks disabled.',
+                    'info'
+                );
+            }
+        });
+    }
+    if (cfgAutoUpdateApply) {
+        cfgAutoUpdateApply.addEventListener('change', () => {
+            if (currentConfig) {
+                currentConfig.auto_update_apply = !!cfgAutoUpdateApply.checked;
+                persistDisplayVerbosityConfig();
+                showToast(
+                    cfgAutoUpdateApply.checked
+                        ? 'Harness will install new releases automatically.'
+                        : 'Harness will only notify about new releases.',
+                    'info'
+                );
+            }
+        });
+    }
+    const btnCheckUpdateNow = document.getElementById('btn-check-update-now');
+    if (btnCheckUpdateNow) {
+        btnCheckUpdateNow.addEventListener('click', async () => {
+            btnCheckUpdateNow.disabled = true;
+            btnCheckUpdateNow.textContent = 'Checking...';
+            try {
+                const res = await fetch('/api/update/check');
+                if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
+                const info = await res.json();
+                const runningEl = document.getElementById('cfg-running-version');
+                if (runningEl) runningEl.textContent = 'v' + (info.current_version || '?');
+                showToast(
+                    info.available
+                        ? `Harness v${info.latest_version} is available.`
+                        : `Harness is up to date (v${info.current_version}).`,
+                    info.available ? 'info' : 'success'
+                );
+            } catch (e) {
+                showToast('Update check failed: ' + e.message, 'error', 7000);
+            } finally {
+                btnCheckUpdateNow.disabled = false;
+                btnCheckUpdateNow.textContent = 'Check for updates';
             }
         });
     }
@@ -9112,6 +9259,12 @@ async function loadConfig() {
         if (cfgEnableWorkingMemory) cfgEnableWorkingMemory.checked = mem.enable_working_memory !== false;
         if (cfgSummarizeCompactedTurns) cfgSummarizeCompactedTurns.checked = mem.summarize_compacted_turns !== false;
         if (cfgVoiceActivityDetection) cfgVoiceActivityDetection.checked = Boolean(currentConfig.voice_activity_detection);
+        if (cfgAutoUpdateCheck) cfgAutoUpdateCheck.checked = currentConfig.auto_update_check !== false;
+        if (cfgAutoUpdateApply) cfgAutoUpdateApply.checked = currentConfig.auto_update_apply !== false;
+        const runningVersionEl = document.getElementById('cfg-running-version');
+        if (runningVersionEl) {
+            runningVersionEl.textContent = 'v' + (updateStatus.current_version || '?');
+        }
 
         syncAutoContextUiState();
         const maxCtx = mem.max_context_tokens || 128000;
@@ -9833,6 +9986,8 @@ async function saveConfig() {
     currentConfig.display_verbosity = activeDisplayVerbosity;
     currentConfig.send_mode = activeSendMode;
     if (cfgVoiceActivityDetection) currentConfig.voice_activity_detection = !!cfgVoiceActivityDetection.checked;
+    if (cfgAutoUpdateCheck) currentConfig.auto_update_check = !!cfgAutoUpdateCheck.checked;
+    if (cfgAutoUpdateApply) currentConfig.auto_update_apply = !!cfgAutoUpdateApply.checked;
 
     const prevMem = currentConfig.memory || {};
     const autoDetectCtx = cfgAutoDetectContext ? !!cfgAutoDetectContext.checked : (prevMem.auto_detect_context !== false);

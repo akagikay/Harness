@@ -52,6 +52,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/config", get(handlers::get_config).post(handlers::update_config))
         .route("/api/db/optimize", post(handlers::db_optimize))
         .route("/api/update/check", get(handlers::check_update))
+        .route("/api/update/status", get(handlers::update_status_handler))
         .route("/api/update/apply", post(handlers::apply_update))
         .route("/api/security/status", get(handlers::security_status))
         .route("/api/onboarding", get(handlers::onboarding_state))

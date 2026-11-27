@@ -782,8 +782,9 @@ pub struct HarnessConfig {
     /// Check GitHub for a newer release at startup.
     #[serde(default = "default_true")]
     pub auto_update_check: bool,
-    /// Automatically download and install a newer release (requires explicit opt-in).
-    #[serde(default)]
+    /// Automatically download *and install* a newer release in the background
+    /// (progress is shown in the UI; the app restarts itself when done).
+    #[serde(default = "default_true")]
     pub auto_update_apply: bool,
     /// First-class automations: scheduled agent runs, standalone or project-bound.
     #[serde(default)]
@@ -845,7 +846,7 @@ impl Default for HarnessConfig {
             update_repo: std::env::var("HARNESS_UPDATE_REPO")
                 .unwrap_or_else(|_| default_update_repo()),
             auto_update_check: true,
-            auto_update_apply: false,
+            auto_update_apply: true,
             automations: Vec::new(),
             extra_access_roots: Vec::new(),
             onboarded: false,

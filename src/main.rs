@@ -156,43 +156,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let router = if is_server_only {
-        web::build_server_router(state)
+        web::build_server_router(state.clone())
     } else {
-        web::build_router(state)
+        web::build_router(state.clone())
     };
 
-    // Background auto-update: notify (and optionally install) a newer release.
-    {
-        let (repo, do_check, do_apply) = {
-            let conf = config.clone();
-            (conf.update_repo.clone(), conf.auto_update_check, conf.auto_update_apply)
-        };
-        if do_check {
-            tokio::spawn(async move {
-                match deepseek_harness_rs::updater::check(&repo, env!("CARGO_PKG_VERSION")).await {
-                    Ok(info) if info.available => {
-                        println!(
-                            "Update available: v{} -> v{} ({})",
-                            info.current_version, info.latest_version, info.html_url
-                        );
-                        if do_apply {
-                            let dest = std::env::temp_dir().join("harness-update");
-                            if let Err(e) = deepseek_harness_rs::updater::update_now(
-                                &repo,
-                                env!("CARGO_PKG_VERSION"),
-                                &dest,
-                            )
-                            .await
-                            {
-                                eprintln!("[harness-update] auto-update failed: {e}");
-                            }
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => eprintln!("[harness-update] check failed: {e}"),
-                }
-            });
-        }
+    // Background auto-update: check, download with progress, verify, install,
+    // and relaunch - fully automatic on launch (unless disabled in settings).
+    let auto_update = {
+        let conf = config.clone();
+        (
+            conf.update_repo.clone(),
+            conf.auto_update_check,
+            conf.auto_update_apply,
+        )
+    };
+    if auto_update.1 && !is_server_only {
+        deepseek_harness_rs::auto_update::spawn(
+            std::sync::Arc::new(state.clone()),
+            auto_update.0.clone(),
+            env!("CARGO_PKG_VERSION"),
+            auto_update.2,
+        );
+    } else if auto_update.1 && is_server_only {
+        // Execution servers still report availability, but never self-restart.
+        tokio::spawn(async move {
+            match deepseek_harness_rs::updater::check(&auto_update.0, env!("CARGO_PKG_VERSION")).await
+            {
+                Ok(info) if info.available => println!(
+                    "Update available: v{} -> v{} ({})",
+                    info.current_version, info.latest_version, info.html_url
+                ),
+                Ok(_) => {}
+                Err(e) => eprintln!("[harness-update] check failed: {e}"),
+            }
+        });
     }
 
     let mut sys = System::new();
@@ -222,7 +220,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting RSS RAM    : {:.2} MB", start_rss);
     println!("============================================================");
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // A relaunched process can start before its predecessor released the port, so
+    // retry briefly instead of crashing (this is the normal update path).
+    let listener =
+        deepseek_harness_rs::updater::bind_with_retry(addr, std::time::Duration::from_secs(30))
+            .await?;
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await?;

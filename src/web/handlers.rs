@@ -4393,36 +4393,54 @@ pub async fn db_optimize(
 // Auto-update (GitHub Releases)
 // ============================================================================
 
-/// `GET /api/update/check` — compare the running version with the latest release.
+/// `GET /api/update/check` - compare the running version with the latest release.
+///
+/// The outcome is also recorded in the shared status so the UI reflects it.
 pub async fn check_update(
     State(state): State<AppState>,
 ) -> Result<Json<crate::updater::UpdateInfo>, (StatusCode, String)> {
     let repo = state.config.read().await.update_repo.clone();
-    crate::updater::check(&repo, env!("CARGO_PKG_VERSION"))
+    let info = crate::updater::check(&repo, env!("CARGO_PKG_VERSION"))
         .await
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e))
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    state
+        .set_update_status(|s| {
+            s.current_version = info.current_version.clone();
+            if info.available {
+                s.progress_phase(
+                    crate::updater::UpdatePhase::Available,
+                    format!("v{} available", info.latest_version),
+                );
+                s.target_version = info.latest_version.clone();
+                s.html_url = info.html_url.clone();
+                s.notes = info.notes.clone();
+            } else {
+                s.phase = crate::updater::UpdatePhase::UpToDate;
+                s.target_version = info.current_version.clone();
+                s.message = "Up to date".into();
+                s.error = None;
+                s.percent = None;
+                s.downloaded_bytes = 0;
+                s.total_bytes = 0;
+                s.touch();
+            }
+        })
+        .await;
+    Ok(Json(info))
 }
 
-/// `POST /api/update/apply` — download, verify, install, and restart.
+/// `GET /api/update/status` - live progress of the update pipeline.
+pub async fn update_status_handler(State(state): State<AppState>) -> Json<crate::updater::UpdateStatus> {
+    Json(state.update_status().await)
+}
+
+/// `POST /api/update/apply` - download (with progress), verify, install, restart.
 ///
-/// Destructive (replaces the running binary), so it is only performed when the
-/// user explicitly asks for it via this endpoint.
+/// Explicit user action, so it never depends on `auto_update_apply`.
 pub async fn apply_update(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let (repo, allowed) = {
-        let conf = state.config.read().await;
-        (conf.update_repo.clone(), conf.auto_update_apply)
-    };
-    if !allowed {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Automatic updates are disabled. Set `auto_update_apply = true` in the config \
-             to allow installing updates."
-                .to_string(),
-        ));
-    }
+    let repo = state.config.read().await.update_repo.clone();
     let info = crate::updater::check(&repo, env!("CARGO_PKG_VERSION"))
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
@@ -4432,25 +4450,18 @@ pub async fn apply_update(
             "version": info.current_version
         })));
     }
-    let dest = std::env::temp_dir().join("harness-update");
-    let staged = crate::updater::download(&info, &dest)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
     let latest = info.latest_version.clone();
-    // Restart happens in the background so this response can be delivered first.
+    let from = info.current_version.clone();
+    let st = std::sync::Arc::new(state.clone());
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        match crate::updater::apply_and_restart(&staged) {
-            Ok(backup) => {
-                eprintln!("[harness-update] installed; previous binary at {}", backup.display());
-                std::process::exit(0);
-            }
-            Err(e) => eprintln!("[harness-update] failed to apply update: {e}"),
+        if let Err(e) = crate::auto_update::install(&st, &info).await {
+            st.set_update_status(|s| s.fail(e)).await;
         }
     });
     Ok(Json(serde_json::json!({
         "status": "updating",
-        "from": info.current_version,
+        "from": from,
         "to": latest
     })))
 }

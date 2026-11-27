@@ -9,6 +9,7 @@ pub mod web;
 
 pub mod automation;
 pub mod automation_runner;
+pub mod auto_update;
 pub mod builtin_skills;
 pub mod crypto;
 pub mod secret_redaction;

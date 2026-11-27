@@ -312,6 +312,8 @@ pub struct AppState {
     pub recently_deleted_sessions: Arc<Mutex<HashSet<String>>>,
     /// Automation ids currently executing (prevents overlapping scheduled runs).
     pub automation_runs: Arc<Mutex<crate::automation_runner::AutomationRuns>>,
+    /// Live auto-update progress, mirrored to the UI (`GET /api/update/status`).
+    pub update_status: Arc<RwLock<crate::updater::UpdateStatus>>,
 }
 
 impl AppState {
@@ -331,6 +333,7 @@ impl AppState {
             automation_runs: Arc::new(Mutex::new(
                 crate::automation_runner::AutomationRuns::default(),
             )),
+            update_status: Arc::new(RwLock::new(crate::updater::UpdateStatus::default())),
         }
     }
 
@@ -491,6 +494,7 @@ if !saved_conf.onboarded {
             automation_runs: Arc::new(Mutex::new(
                 crate::automation_runner::AutomationRuns::default(),
             )),
+            update_status: Arc::new(RwLock::new(crate::updater::UpdateStatus::default())),
         }
     }
 
@@ -502,6 +506,50 @@ if !saved_conf.onboarded {
         if let Err(e) = db.save_config(&*guard) {
             eprintln!("[harness-db] failed to persist config: {}", e);
         }
+    }
+
+    /// Read a snapshot of the live update pipeline state.
+    pub async fn update_status(&self) -> crate::updater::UpdateStatus {
+        self.update_status.read().await.clone()
+    }
+
+    /// Mutate the live update pipeline state.
+    pub async fn set_update_status<F: FnOnce(&mut crate::updater::UpdateStatus)>(
+        &self,
+        f: F,
+    ) -> crate::updater::UpdateStatus {
+        let mut guard = self.update_status.write().await;
+        f(&mut guard);
+        guard.clone()
+    }
+
+    /// True while the app has work that must not be interrupted by a restart:
+    /// a running conversation, an automation run, a live subagent, or a remote
+    /// server run. An update is only installed once this is `false`.
+    pub async fn is_idle(&self) -> bool {
+        let busy_sessions = {
+            let lock = self.sessions.read().await;
+            lock.values().any(|s| {
+                s.status.trim() == "running"
+                    || !s.queued_prompts.is_empty()
+            })
+        };
+        if busy_sessions {
+            return false;
+        }
+        if self.total_active_subagents().await > 0 {
+            return false;
+        }
+        if !self.automation_runs.lock().await.running.is_empty() {
+            return false;
+        }
+        if !self.server_runs.read().await.is_empty() {
+            return false;
+        }
+        if !self.active_remote_runs.read().await.is_empty() {
+            return false;
+        }
+        true
     }
 
     pub async fn persist_session_record(&self, session_id: &str) {
@@ -1718,6 +1766,75 @@ if !saved_conf.onboarded {
 mod core_state_tests {
     use super::*;
     use std::time::Duration;
+
+    // ---------- Auto-update: idle detection gates a self-restart ----------
+
+    #[tokio::test]
+    async fn is_idle_is_true_on_a_fresh_state() {
+        let state = AppState::new(HarnessConfig::default());
+        assert!(state.is_idle().await, "nothing is running on a fresh state");
+        assert_eq!(state.update_status().await.phase, crate::updater::UpdatePhase::Idle);
+    }
+
+    #[tokio::test]
+    async fn is_idle_is_false_while_a_conversation_runs() {
+        let db = HarnessDb::open_in_memory().expect("open in-memory db");
+        let mut cfg = HarnessConfig::default();
+        cfg.mock_mode = true;
+        let state = AppState::with_db(cfg, db);
+        let id = "ses-update-busy".to_string();
+        state
+            .create_session_with_options(id.clone(), "busy".into(), "project".into(), None, None, None, "running")
+            .await;
+        assert!(!state.is_idle().await, "a running conversation blocks an update");
+
+        state.update_session_status(&id, "completed").await;
+        assert!(state.is_idle().await, "an idle conversation no longer blocks");
+    }
+
+    #[tokio::test]
+    async fn update_status_is_observable_and_mutable() {
+        let state = AppState::new(HarnessConfig::default());
+        state
+            .set_update_status(|s| {
+                s.current_version = "1.0.0".into();
+                s.progress_phase(crate::updater::UpdatePhase::Downloading, "Downloading v1.0.1...");
+                s.downloaded_bytes = 512;
+                s.total_bytes = 1024;
+                s.percent = Some(50);
+            })
+            .await;
+        let snap = state.update_status().await;
+        assert_eq!(snap.current_version, "1.0.0");
+        assert_eq!(snap.phase, crate::updater::UpdatePhase::Downloading);
+        assert_eq!(snap.percent, Some(50));
+        assert!(snap.updated_at > 0);
+    }
+
+    #[tokio::test]
+    async fn queued_prompts_also_block_an_update() {
+        let db = HarnessDb::open_in_memory().expect("open in-memory db");
+        let mut cfg = HarnessConfig::default();
+        cfg.mock_mode = true;
+        let state = AppState::with_db(cfg, db);
+        let id = "ses-update-queued".to_string();
+        state
+            .create_session_with_options(id.clone(), "queued".into(), "project".into(), None, None, None, "completed")
+            .await;
+        assert!(state.is_idle().await);
+        {
+            let mut sessions = state.sessions.write().await;
+            sessions.get_mut(&id).unwrap().queued_prompts = VecDeque::from(vec![QueuedPrompt {
+                id: "q1".into(),
+                content: "keep working".into(),
+                attachments: Vec::new(),
+                slash_command: None,
+                slash_args: None,
+                created_at: "now".into(),
+            }]);
+        }
+        assert!(!state.is_idle().await, "a queued prompt means a turn is still owed");
+    }
 
     // ---------- Finding 1: stop must cancel a loop that is not currently parked ----------
 

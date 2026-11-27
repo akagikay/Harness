@@ -825,6 +825,28 @@
                                 </span>
                                 <span>Voice Activity Detection (VAD)</span>
                             </label>
+                            <label class="settings-toggle-card ui-switch-row" title="Check GitHub for a newer release on launch">
+                                <span class="ui-switch">
+                                    <input type="checkbox" id="cfg-auto-update-check" checked>
+                                    <span class="ui-switch-track"><span class="ui-switch-thumb"></span></span>
+                                </span>
+                                <span>Automatic Update Checks</span>
+                            </label>
+                            <label class="settings-toggle-card ui-switch-row" title="Download and install new releases automatically. Harness waits for running work, then replaces its own executable and restarts.">
+                                <span class="ui-switch">
+                                    <input type="checkbox" id="cfg-auto-update-apply" checked>
+                                    <span class="ui-switch-track"><span class="ui-switch-thumb"></span></span>
+                                </span>
+                                <span>Auto-Install Updates & Self-Restart</span>
+                            </label>
+                        </div>
+
+                        <div class="settings-toggles-row" style="margin-top:10px;">
+                            <div class="settings-version-strip">
+                                <span>Running</span>
+                                <strong id="cfg-running-version">harness</strong>
+                                <button type="button" class="btn-secondary btn-small" id="btn-check-update-now">Check for updates</button>
+                            </div>
                         </div>
                     </section>
 
@@ -1912,6 +1934,31 @@
 
     <!-- Custom Non-Blocking Toast Notifications (replaces browser alert) -->
     <div id="toast-container" class="toast-container" aria-live="polite" aria-atomic="true"></div>
+
+    <!-- Automatic Update Progress (download / verify / install / restart) -->
+    <div id="update-drawer" class="update-drawer hidden" role="status" aria-live="polite">
+        <div class="update-drawer-head">
+            <span class="update-drawer-icon" id="update-drawer-icon">&#8682;</span>
+            <span class="update-drawer-title" id="update-drawer-title">Checking for updates&hellip;</span>
+            <button type="button" class="update-drawer-close" id="update-drawer-close" title="Hide">&times;</button>
+        </div>
+        <div class="update-drawer-bar" id="update-drawer-bar"><span id="update-drawer-bar-fill" style="width:0%"></span></div>
+        <div class="update-drawer-meta">
+            <span id="update-drawer-bytes"></span>
+            <span id="update-drawer-percent"></span>
+        </div>
+        <div class="update-drawer-actions">
+            <button type="button" class="btn-primary btn-small" id="update-drawer-install">Install now</button>
+            <a class="btn-secondary btn-small" id="update-drawer-link" href="#" target="_blank" rel="noopener">Release notes</a>
+        </div>
+    </div>
+    <div id="update-restart-overlay" class="update-restart-overlay hidden">
+        <div class="update-restart-card">
+            <div class="update-restart-spinner"></div>
+            <h3 id="update-restart-title">Update installed</h3>
+            <p id="update-restart-message">Restarting Harness&hellip;</p>
+        </div>
+    </div>
 
     <!-- FIRST-RUN ONBOARDING -->
 <div id="onboarding-modal" class="modal-backdrop hidden">

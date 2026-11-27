@@ -5528,6 +5528,184 @@ input[type="number"].form-input::-webkit-inner-spin-button {
     background: linear-gradient(135deg, #f87171, #ef4444);
 }
 
+/* Automatic-update settings strip */
+.settings-version-strip {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px dashed var(--border-hover);
+    color: var(--text-dim);
+    font-size: 0.78rem;
+}
+.settings-version-strip strong {
+    color: var(--text-primary);
+    font-size: 0.84rem;
+}
+.settings-version-strip button,
+.settings-version-strip .btn-small {
+    margin-left: auto;
+}
+
+/* Automatic update drawer (progress of the background updater) */
+.update-drawer {
+    position: fixed;
+    right: 20px;
+    bottom: 20px;
+    z-index: 9998;
+    width: min(340px, 92vw);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 14px;
+    border-radius: 12px;
+    background: #14182165;
+    backdrop-filter: blur(14px);
+    border: 1px solid var(--border-hover);
+    color: var(--text-primary);
+    font-size: 0.8rem;
+    box-shadow: 0 14px 34px rgba(0, 0, 0, 0.55);
+}
+.update-drawer[data-phase="failed"] {
+    border-color: rgba(239, 68, 68, 0.6);
+}
+.update-drawer[data-phase="restarting"] {
+    border-color: rgba(16, 185, 129, 0.55);
+}
+.update-drawer.hidden {
+    display: none;
+}
+.update-drawer-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.update-drawer-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: rgba(47, 111, 235, 0.18);
+    color: #7cb7ff;
+    font-size: 0.9rem;
+    flex: 0 0 auto;
+}
+.update-drawer[data-phase="failed"] .update-drawer-icon {
+    background: rgba(239, 68, 68, 0.18);
+    color: #f87171;
+}
+.update-drawer-title {
+    font-weight: 600;
+    flex: 1 1 auto;
+    line-height: 1.3;
+}
+.update-drawer-close {
+    background: transparent;
+    border: 0;
+    color: var(--text-dim);
+    font-size: 1rem;
+    line-height: 1;
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: 5px;
+}
+.update-drawer-close:hover {
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.07);
+}
+.update-drawer-bar {
+    position: relative;
+    height: 6px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.09);
+    overflow: hidden;
+    display: none;
+}
+.update-drawer-bar.active {
+    display: block;
+}
+.update-drawer-bar > span {
+    position: absolute;
+    inset: 0 auto 0 0;
+    display: block;
+    height: 100%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #2f6feb, #38bdf8);
+    transition: width 0.25s ease-out;
+}
+.update-drawer[data-phase="failed"] .update-drawer-bar > span {
+    background: linear-gradient(90deg, #ef4444, #f87171);
+}
+.update-drawer-meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    font-size: 0.72rem;
+    color: var(--text-dim);
+    min-height: 0.9rem;
+}
+.update-drawer-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+.btn-small {
+    font-size: 0.74rem;
+    padding: 5px 10px;
+    border-radius: 7px;
+    text-decoration: none;
+    line-height: 1.2;
+}
+.update-restart-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(8, 10, 14, 0.82);
+    backdrop-filter: blur(6px);
+}
+.update-restart-overlay.hidden {
+    display: none;
+}
+.update-restart-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    padding: 28px 34px;
+    border-radius: 16px;
+    background: #141821;
+    border: 1px solid var(--border-hover);
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+    text-align: center;
+}
+.update-restart-card h3 {
+    margin: 0;
+    font-size: 1.02rem;
+}
+.update-restart-card p {
+    margin: 0;
+    color: var(--text-dim);
+    font-size: 0.82rem;
+}
+.update-restart-spinner {
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    border: 3px solid rgba(255, 255, 255, 0.15);
+    border-top-color: #38bdf8;
+    animation: update-spin 0.9s linear infinite;
+}
+@keyframes update-spin {
+    to { transform: rotate(360deg); }
+}
+
 /* Toast Notifications */
 .toast-container {
     position: fixed;
