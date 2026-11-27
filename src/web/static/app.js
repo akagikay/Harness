@@ -458,6 +458,9 @@ const cfgSummarizeCompactedTurns = document.getElementById('cfg-summarize-compac
 const cfgVoiceActivityDetection = document.getElementById('cfg-voice-activity-detection');
 const cfgAutoUpdateCheck = document.getElementById('cfg-auto-update-check');
 const cfgAutoUpdateApply = document.getElementById('cfg-auto-update-apply');
+const cfgAutoSkillRouter = document.getElementById('cfg-auto-skill-router');
+const cfgSkillRouterConfidence = document.getElementById('cfg-skill-router-confidence');
+const cfgSkillRouterMax = document.getElementById('cfg-skill-router-max');
 const cfgReasoningCapabilityBadge = document.getElementById('cfg-reasoning-capability-badge');
 
 const DEFAULT_NVIDIA_KEY = ""; // no bundled key; user supplies their own NVIDIA key
@@ -1753,6 +1756,42 @@ document.addEventListener('DOMContentLoaded', () => {
                         : 'Automatic update checks disabled.',
                     'info'
                 );
+            }
+        });
+    }
+    if (cfgAutoSkillRouter) {
+        cfgAutoSkillRouter.addEventListener('change', () => {
+            if (currentConfig) {
+                currentConfig.auto_skill_router = !!cfgAutoSkillRouter.checked;
+                persistDisplayVerbosityConfig();
+                showToast(
+                    currentConfig.auto_skill_router
+                        ? 'Automatic skill routing enabled - matching skills are injected automatically.'
+                        : 'Automatic skill routing disabled - use /skill-name to invoke a skill.',
+                    'info'
+                );
+            }
+        });
+    }
+    if (cfgSkillRouterConfidence) {
+        cfgSkillRouterConfidence.addEventListener('change', () => {
+            if (currentConfig) {
+                const v = parseFloat(cfgSkillRouterConfidence.value);
+                currentConfig.skill_router_min_confidence = Number.isFinite(v)
+                    ? Math.min(0.95, Math.max(0.05, v))
+                    : 0.35;
+                persistDisplayVerbosityConfig();
+            }
+        });
+    }
+    if (cfgSkillRouterMax) {
+        cfgSkillRouterMax.addEventListener('change', () => {
+            if (currentConfig) {
+                const v = parseInt(cfgSkillRouterMax.value, 10);
+                currentConfig.skill_router_max_skills = Number.isFinite(v)
+                    ? Math.min(4, Math.max(0, v))
+                    : 2;
+                persistDisplayVerbosityConfig();
             }
         });
     }
@@ -9294,6 +9333,20 @@ async function loadConfig() {
         if (cfgVoiceActivityDetection) cfgVoiceActivityDetection.checked = Boolean(currentConfig.voice_activity_detection);
         if (cfgAutoUpdateCheck) cfgAutoUpdateCheck.checked = currentConfig.auto_update_check !== false;
         if (cfgAutoUpdateApply) cfgAutoUpdateApply.checked = currentConfig.auto_update_apply !== false;
+        // Automatic skill routing (defaults on).
+        if (cfgAutoSkillRouter) cfgAutoSkillRouter.checked = currentConfig.auto_skill_router !== false;
+        if (cfgSkillRouterConfidence) {
+            const conf = typeof currentConfig.skill_router_min_confidence === 'number'
+                ? currentConfig.skill_router_min_confidence
+                : 0.35;
+            cfgSkillRouterConfidence.value = conf;
+        }
+        if (cfgSkillRouterMax) {
+            const max = typeof currentConfig.skill_router_max_skills === 'number'
+                ? currentConfig.skill_router_max_skills
+                : 2;
+            cfgSkillRouterMax.value = max;
+        }
         const runningVersionEl = document.getElementById('cfg-running-version');
         if (runningVersionEl) {
             runningVersionEl.textContent = 'v' + (updateStatus.current_version || '?');
@@ -10021,6 +10074,19 @@ async function saveConfig() {
     if (cfgVoiceActivityDetection) currentConfig.voice_activity_detection = !!cfgVoiceActivityDetection.checked;
     if (cfgAutoUpdateCheck) currentConfig.auto_update_check = !!cfgAutoUpdateCheck.checked;
     if (cfgAutoUpdateApply) currentConfig.auto_update_apply = !!cfgAutoUpdateApply.checked;
+    if (cfgAutoSkillRouter) currentConfig.auto_skill_router = !!cfgAutoSkillRouter.checked;
+    if (cfgSkillRouterConfidence) {
+        const v = parseFloat(cfgSkillRouterConfidence.value);
+        currentConfig.skill_router_min_confidence = Number.isFinite(v)
+            ? Math.min(0.95, Math.max(0.05, v))
+            : 0.35;
+    }
+    if (cfgSkillRouterMax) {
+        const v = parseInt(cfgSkillRouterMax.value, 10);
+        currentConfig.skill_router_max_skills = Number.isFinite(v)
+            ? Math.min(4, Math.max(0, v))
+            : 2;
+    }
 
     const prevMem = currentConfig.memory || {};
     const autoDetectCtx = cfgAutoDetectContext ? !!cfgAutoDetectContext.checked : (prevMem.auto_detect_context !== false);
@@ -11391,6 +11457,119 @@ async function fetchAutomations() {
     } catch (_) { /* offline: keep previous list */ }
 }
 
+// Which automation the editor is editing (null = creating a new one).
+let editingAutomationId = null;
+let automationLogs = [];
+let automationLogFilterId = null;
+
+function automationRowStatus(a) {
+    if (a.is_running) return { text: 'Running', cls: 'badge-running' };
+    if (!a.enabled) return { text: 'Paused', cls: 'badge-idle' };
+    if (a.last_status === 'failed') return { text: 'Failed', cls: 'badge-danger' };
+    if (a.last_status === 'stopped') return { text: 'Stopped', cls: 'badge-idle' };
+    return { text: 'Idle', cls: 'badge-active' };
+}
+
+async function openAutomationLogs(automationId) {
+    automationLogFilterId = automationId;
+    const modal = document.getElementById('automation-logs-modal');
+    if (!modal) return;
+    const title = document.getElementById('automation-logs-title');
+    const nameOf = (allAutomations || []).find(a => a.id === automationId);
+    if (title) {
+        title.textContent = nameOf ? `${nameOf.name} - Run Log` : 'Automation Run Log';
+    }
+    modal.classList.remove('hidden');
+    await refreshAutomationLogs();
+}
+
+function closeAutomationLogs() {
+    document.getElementById('automation-logs-modal')?.classList.add('hidden');
+    automationLogFilterId = null;
+}
+
+async function refreshAutomationLogs() {
+    const body = document.getElementById('automation-logs-body');
+    const summary = document.getElementById('automation-logs-summary');
+    if (!body) return;
+    body.innerHTML = '<div class="automation-log-empty">Loading run log...</div>';
+    try {
+        const q = automationLogFilterId ? `?automation_id=${encodeURIComponent(automationLogFilterId)}` : '';
+        const res = await fetch(`/api/automation/logs${q}`);
+        if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
+        const data = await res.json();
+        automationLogs = data.logs || [];
+        const one = automationLogFilterId
+            ? await (await fetch(`/api/automations/${encodeURIComponent(automationLogFilterId)}/logs`)).json().catch(() => null)
+            : null;
+        renderAutomationLogs(automationLogs, one);
+    } catch (e) {
+        body.innerHTML = `<div class="automation-log-empty" style="color:var(--accent-red)">Failed to load run log: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function renderAutomationLogs(logs, detail) {
+    const body = document.getElementById('automation-logs-body');
+    const summary = document.getElementById('automation-logs-summary');
+    if (!body) return;
+    body.innerHTML = '';
+    if (summary) {
+        if (!logs.length) {
+            summary.textContent = 'No runs yet.';
+        } else {
+            const ok = logs.filter(l => l.status === 'success').length;
+            const bad = logs.filter(l => l.status === 'failed').length;
+            const stopped = logs.filter(l => l.status === 'stopped').length;
+            const avg = detail && detail.summary
+                ? `${Math.round(detail.summary.avg_duration_ms / 1000)}s avg`
+                : null;
+            const parts = [`${logs.length} run${logs.length === 1 ? '' : 's'} loaded`, `${ok} ok`];
+            if (bad) parts.push(`${bad} failed`);
+            if (stopped) parts.push(`${stopped} stopped`);
+            if (avg) parts.push(avg);
+            summary.textContent = parts.join(' - ');
+        }
+    }
+    if (!logs.length) {
+        const empty = document.createElement('div');
+        empty.className = 'automation-log-empty';
+        empty.textContent = 'This automation has not run yet. Run it once and the output will appear here - never in your conversations.';
+        body.appendChild(empty);
+        return;
+    }
+    logs.forEach(log => {
+        const row = document.createElement('div');
+        row.className = `automation-log-row status-${log.status}`;
+        const head = document.createElement('div');
+        head.className = 'automation-log-head';
+        const status = document.createElement('span');
+        status.className = `automation-log-status ${log.status}`;
+        status.textContent = log.status;
+        const title = document.createElement('strong');
+        title.textContent = log.automation_name || log.automation_id;
+        const when = document.createElement('span');
+        when.className = 'automation-log-time';
+        const started = new Date(log.started_at);
+        when.textContent = started.toLocaleString() + (log.duration_ms != null ? ` - ${(log.duration_ms / 1000).toFixed(1)}s` : '');
+        head.append(status, title, when);
+
+        const meta = document.createElement('div');
+        meta.className = 'automation-log-meta';
+        const bits = [];
+        if (log.trigger) bits.push(`trigger: ${log.trigger}`);
+        if (log.model) bits.push(`model: ${log.model}`);
+        if (log.tool_calls) bits.push(`${log.tool_calls} tool calls`);
+        if (log.tokens) bits.push(`${log.tokens} tokens`);
+        meta.textContent = bits.join(' - ');
+
+        const out = document.createElement('pre');
+        out.className = 'automation-log-output';
+        out.textContent = log.error ? `Error: ${log.error}` : (log.output || '(no output)');
+        row.append(head, meta, out);
+        body.appendChild(row);
+    });
+}
+
 function renderAutomations() {
     const list = document.getElementById('automations-list');
     if (!list) return;
@@ -11418,6 +11597,7 @@ function renderAutomations() {
         if (a.project_id) parts.push(`project: ${a.project_id}`);
         if (a.run_count) parts.push(`${a.run_count} run(s)`);
         if (a.last_status && a.last_status !== 'idle') parts.push(a.last_status);
+        if (a.is_running) parts.push('in progress');
         sub.textContent = parts.join(' · ');
         meta.append(name, sub);
 
@@ -11425,8 +11605,9 @@ function renderAutomations() {
         actions.style.cssText = 'display:flex;gap:6px;align-items:center';
 
         const badge = document.createElement('span');
-        badge.className = a.enabled ? 'badge-active' : 'badge-idle';
-        badge.textContent = a.enabled ? 'Enabled' : 'Paused';
+        const status = automationRowStatus(a);
+        badge.className = status.cls;
+        badge.textContent = status.text;
 
         const runBtn = document.createElement('button');
         runBtn.type = 'button';
@@ -11434,15 +11615,41 @@ function renderAutomations() {
         runBtn.textContent = 'Run';
         runBtn.onclick = async () => {
             runBtn.disabled = true;
+            runBtn.textContent = 'Starting...';
             try {
                 const res = await fetch(`/api/automations/${encodeURIComponent(a.id)}/run`, { method: 'POST' });
                 if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
-                showToast(`Started '${a.name}'.`, 'success');
+                const data = await res.json().catch(() => ({}));
+                showToast(`Started '${a.name}' - output will appear in its run log.`, 'success', 6000);
                 fetchAutomations();
+                // Open the run log so the user can watch it, like a job view.
+                if (data.run_id) {
+                    automationLogFilterId = a.id;
+                }
             } catch (e) {
                 showToast('Failed to run automation: ' + e.message, 'error', 7000);
             } finally {
                 runBtn.disabled = false;
+                runBtn.textContent = 'Run';
+            }
+        };
+
+        // Stop only appears while the automation is actually running.
+        const stopBtn = document.createElement('button');
+        stopBtn.type = 'button';
+        stopBtn.className = 'btn-card-action danger';
+        stopBtn.textContent = 'Stop';
+        stopBtn.style.display = a.is_running ? '' : 'none';
+        stopBtn.onclick = async () => {
+            stopBtn.disabled = true;
+            try {
+                const res = await fetch(`/api/automations/${encodeURIComponent(a.id)}/stop`, { method: 'POST' });
+                if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
+                showToast(`Stopping '${a.name}'...`, 'info');
+                fetchAutomations();
+            } catch (e) {
+                showToast('Failed to stop automation: ' + e.message, 'error', 7000);
+                stopBtn.disabled = false;
             }
         };
 
@@ -11483,18 +11690,35 @@ function renderAutomations() {
             }
         };
 
-        actions.append(badge, runBtn, toggleBtn, delBtn);
+        const logsBtn = document.createElement('button');
+        logsBtn.type = 'button';
+        logsBtn.className = 'btn-card-action';
+        logsBtn.textContent = 'Logs';
+        logsBtn.title = 'Run output for this automation (not conversations)';
+        logsBtn.onclick = () => openAutomationLogs(a.id);
+
+        const editBtn = document.createElement('button');
+        editBtn.type = 'button';
+        editBtn.className = 'btn-card-action';
+        editBtn.textContent = 'Edit';
+        editBtn.onclick = () => showAutomationEditor(a.id);
+
+        actions.append(badge, runBtn, stopBtn, logsBtn, editBtn, toggleBtn, delBtn);
         item.append(meta, actions);
         list.appendChild(item);
     });
 }
 
-function showAutomationEditor() {
+function showAutomationEditor(automationId = null) {
     const editor = document.getElementById('automation-editor');
     if (!editor) return;
     editor.classList.remove('hidden');
-    const nameEl = document.getElementById('automation-name');
-    if (nameEl) nameEl.focus();
+    // Remember what we are editing: null = create a new automation.
+    editingAutomationId = automationId;
+    const existing = automationId ? (allAutomations || []).find(a => a.id === automationId) : null;
+    const saveBtn = document.getElementById('btn-save-automation');
+    if (saveBtn) saveBtn.textContent = existing ? 'Save Changes' : 'Save Automation';
+
     const projectSel = document.getElementById('automation-project');
     if (projectSel) {
         projectSel.innerHTML = '<option value="">Standalone (no project)</option>';
@@ -11504,12 +11728,36 @@ function showAutomationEditor() {
             opt.textContent = p.name;
             projectSel.appendChild(opt);
         });
+        projectSel.value = existing && existing.project_id ? existing.project_id : '';
     }
+
+    // Prefill the form so any automation can be edited after it was made.
+    if (document.getElementById('automation-name')) document.getElementById('automation-name').value = existing ? existing.name : '';
+    if (document.getElementById('automation-description')) document.getElementById('automation-description').value = existing ? (existing.description || '') : '';
+    if (document.getElementById('automation-prompt')) document.getElementById('automation-prompt').value = existing ? existing.prompt : '';
+    const triggerSel = document.getElementById('automation-trigger');
+    const everyEl = document.getElementById('automation-every');
+    const cronEl = document.getElementById('automation-cron');
+    let kind = 'manual';
+    let every = '';
+    let cron = '';
+    if (existing && existing.trigger) {
+        kind = existing.trigger.kind || 'manual';
+        if (kind === 'interval') every = `${existing.trigger.every_secs || 1800}s`;
+        if (kind === 'cron') cron = existing.trigger.expr || '';
+    }
+    if (triggerSel) triggerSel.value = kind;
+    if (everyEl) everyEl.value = every;
+    if (cronEl) cronEl.value = cron;
+    document.getElementById('automation-name')?.focus();
 }
 
 function hideAutomationEditor() {
     const editor = document.getElementById('automation-editor');
     if (editor) editor.classList.add('hidden');
+    editingAutomationId = null;
+    const saveBtn = document.getElementById('btn-save-automation');
+    if (saveBtn) saveBtn.textContent = 'Save Automation';
 }
 
 async function saveAutomationFromForm() {
@@ -11546,13 +11794,24 @@ async function saveAutomationFromForm() {
     };
 
     try {
-        const res = await fetch('/api/automations', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
+        let res;
+        if (editingAutomationId) {
+            // PATCH only the edited fields; the server preserves the rest
+            // (including run history).
+            res = await fetch(`/api/automations/${encodeURIComponent(editingAutomationId)}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+        } else {
+            res = await fetch('/api/automations', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+        }
         if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
-        showToast(`Saved automation '${name}'.`, 'success');
+        showToast(editingAutomationId ? `Updated automation '${name}'.` : `Saved automation '${name}'.`, 'success');
         hideAutomationEditor();
         fetchAutomations();
     } catch (e) {
@@ -11571,7 +11830,20 @@ function parseEveryToSecs(raw) {
 
 document.addEventListener('DOMContentLoaded', () => {
     const newBtn = document.getElementById('btn-new-automation');
-    if (newBtn) newBtn.addEventListener('click', showAutomationEditor);
+    if (newBtn) newBtn.addEventListener('click', () => showAutomationEditor(null));
+    const closeLogsBtn = document.getElementById('btn-close-automation-logs');
+    if (closeLogsBtn) closeLogsBtn.addEventListener('click', closeAutomationLogs);
+    const doneLogsBtn = document.getElementById('btn-done-automation-logs');
+    if (doneLogsBtn) doneLogsBtn.addEventListener('click', closeAutomationLogs);
+    const refreshLogsBtn = document.getElementById('btn-refresh-automation-logs');
+    if (refreshLogsBtn) refreshLogsBtn.addEventListener('click', refreshAutomationLogs);
+    // Clicking the backdrop of the run-log modal dismisses it.
+    const logsModal = document.getElementById('automation-logs-modal');
+    if (logsModal) {
+        logsModal.addEventListener('click', (e) => {
+            if (e.target === logsModal) closeAutomationLogs();
+        });
+    }
     const cancelBtn = document.getElementById('btn-cancel-automation');
     if (cancelBtn) cancelBtn.addEventListener('click', hideAutomationEditor);
     const saveBtn = document.getElementById('btn-save-automation');
@@ -11591,37 +11863,26 @@ function renderSidebarAutomations() {
         return;
     }
     allAutomations.forEach(a => {
+        // A row per automation: name + live status, opening its run log.
         const row = document.createElement('button');
         row.type = 'button';
         row.className = 'nav-item-link';
         row.style.cssText = 'display:flex;align-items:center;gap:8px;width:100%;text-align:left;';
+        const running = !!a.is_running;
         const dot = document.createElement('span');
-        dot.textContent = a.enabled ? '\u25CF' : '\u25CB';
-        dot.style.cssText = 'font-size:0.7rem;color:' + (a.enabled ? '#3fb950' : '#8b949e');
+        dot.textContent = running ? '\u25D0' : (a.enabled ? '\u25CF' : '\u25CB');
+        dot.style.cssText = 'font-size:0.7rem;color:' + (running ? '#38bdf8' : (a.enabled ? '#3fb950' : '#8b949e'));
         const label = document.createElement('span');
         label.textContent = a.name;
         label.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
         const when = document.createElement('span');
-        when.textContent = a.trigger_label || '';
-        when.style.cssText = 'font-size:0.68rem;color:var(--text-dim);';
+        when.textContent = running ? 'running' : (a.trigger_label || '');
+        when.style.cssText = 'font-size:0.68rem;color:' + (running ? '#38bdf8' : 'var(--text-dim)');
         row.append(dot, label, when);
-        row.title = `${a.name} — ${a.trigger_label}${a.project_id ? ` (project: ${a.project_id})` : ''}`;
-        row.onclick = async () => {
-            try {
-                const res = await fetch(`/api/automations/${encodeURIComponent(a.id)}/run`, { method: 'POST' });
-                if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
-                const data = await res.json();
-                showToast(`Started '${a.name}'.`, 'success');
-                if (data.session_id) {
-                    if (typeof fetchSessions === 'function') await fetchSessions();
-                    if (typeof loadHistoricalSession === 'function') {
-                        await loadHistoricalSession(data.session_id, a.name);
-                    }
-                }
-            } catch (e) {
-                showToast('Failed to run automation: ' + e.message, 'error', 7000);
-            }
-        };
+        const status = automationRowStatus(a);
+        row.title = a.name + ' - ' + (a.trigger_label || '') + (a.project_id ? ' (project: ' + a.project_id + ')' : '') + '\nStatus: ' + status.text;
+        // Clicking opens the run log: automation output never becomes a conversation.
+        row.onclick = () => openAutomationLogs(a.id);
         list.appendChild(row);
     });
 }

@@ -1441,6 +1441,37 @@
                             <button type="button" class="btn-card-action primary" id="btn-new-automation" style="margin-top:10px;">+ New Automation</button>
                         </div>
                     </section>
+
+                    <!-- AUTO SKILL ROUTING -->
+                    <section class="settings-subsection" id="settings-skill-router">
+                        <h5>Automatic Skill Routing</h5>
+                        <p class="settings-hint">
+                            Let Harness pick a matching skill on its own from how you phrase a task.
+                            Skill output is injected as a system directive, exactly like typing
+                            <code>/skill-name</code>. Off = only explicit slash commands.
+                        </p>
+                        <div class="settings-toggles-row">
+                            <label class="settings-toggle-card ui-switch-row" title="Automatically route a task to a matching skill">
+                                <span class="ui-switch">
+                                    <input type="checkbox" id="cfg-auto-skill-router" checked>
+                                    <span class="ui-switch-track"><span class="ui-switch-thumb"></span></span>
+                                </span>
+                                <span>Automatic Skill Routing</span>
+                            </label>
+                        </div>
+                        <div class="form-grid" style="margin-top:10px;">
+                            <div class="form-group">
+                                <label for="cfg-skill-router-confidence">Minimum Match Confidence</label>
+                                <input type="number" id="cfg-skill-router-confidence" class="form-input" min="0.05" max="0.95" step="0.05" value="0.35">
+                                <span class="form-hint">Lower = more matches. 0.35 is a good default.</span>
+                            </div>
+                            <div class="form-group">
+                                <label for="cfg-skill-router-max">Max Skills Injected Per Message</label>
+                                <input type="number" id="cfg-skill-router-max" class="form-input" min="0" max="4" step="1" value="2">
+                                <span class="form-hint">0 disables routing. Use 1 to keep it single-intent.</span>
+                            </div>
+                        </div>
+                    </section>
                 </div>
             </div>
 
@@ -1957,6 +1988,27 @@
             <div class="update-restart-spinner"></div>
             <h3 id="update-restart-title">Update installed</h3>
             <p id="update-restart-message">Restarting Harness&hellip;</p>
+        </div>
+    </div>
+
+    <!-- AUTOMATION RUN LOGS (output of automation runs, never conversations) -->
+    <div id="automation-logs-modal" class="modal-backdrop hidden">
+        <div class="modal-card modal-large">
+            <div class="modal-header">
+                <div class="modal-title">
+                    <span class="modal-icon" id="automation-logs-icon">&#9784;</span>
+                    <h3 id="automation-logs-title">Automation Run Log</h3>
+                </div>
+                <button class="close-btn" id="btn-close-automation-logs" title="Close">&times;</button>
+            </div>
+            <div class="modal-body automation-logs-body" id="automation-logs-summary-wrap">
+                <div class="automation-logs-summary" id="automation-logs-summary">Loading...</div>
+                <div class="automation-logs-scroll" id="automation-logs-body"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn-secondary" id="btn-refresh-automation-logs">Refresh</button>
+                <button type="button" class="btn-primary" id="btn-done-automation-logs">Done</button>
+            </div>
         </div>
     </div>
 
