@@ -6259,3 +6259,45 @@ async fn test_filesystem_rename_and_delete() {
     srv.abort();
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[tokio::test]
+async fn test_ui_assets_are_served_without_browser_caching() {
+    // Embedded assets change when the binary updates. If a browser reuses an
+    // old app.js or index.html, the UI can break until a manual hard refresh.
+    let temp_dir = std::env::temp_dir().join(format!("harness-ui-cache-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let mut config = HarnessConfig::default();
+    config.sandbox_root = temp_dir.clone();
+    config.auth_token = String::new();
+    let state = AppState::new(config);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state);
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", addr);
+
+    for path in ["/", "/static/app.js", "/static/style.css"] {
+        let resp = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "{path} should be served");
+        let cache = resp
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            cache.contains("no-store"),
+            "{path} must not be cached, got Cache-Control: '{cache}'"
+        );
+    }
+
+    // The shell must keep the top-level modals and the fixed automation button.
+    let html = client.get(format!("{base}/")).send().await.unwrap().text().await.unwrap();
+    assert!(html.contains("id=\"project-settings-modal\""));
+    assert!(html.contains("id=\"file-browser-modal\""));
+    assert!(html.contains("id=\"btn-sidebar-new-automation\""));
+
+    srv.abort();
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

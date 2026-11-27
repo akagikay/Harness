@@ -220,6 +220,14 @@ pub async fn security_headers(req: Request<Body>, next: Next) -> Response {
                  form-action 'self'",
             ),
         );
+        // Assets are compiled into the binary, so an update can change HTML and
+        // JS at the same URLs. Never let the browser mix an old app.js with new
+        // markup (or vice versa); always revalidate from the running binary.
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store, max-age=0"),
+        );
+        headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
     }
     resp
 }

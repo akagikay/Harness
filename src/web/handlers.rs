@@ -996,6 +996,97 @@ mod handlers_config_merge_tests {
     }
 }
 
+#[cfg(test)]
+mod ui_structure_tests {
+    use super::INDEX_HTML;
+
+    /// Strip HTML comments so markup quoted inside them is not counted.
+    fn strip_comments(html: &str) -> String {
+        let mut out = String::with_capacity(html.len());
+        let mut rest = html;
+        while let Some(start) = rest.find("<!--") {
+            out.push_str(&rest[..start]);
+            match rest[start + 4..].find("-->") {
+                Some(end) => rest = &rest[start + 4 + end + 3..],
+                None => return out,
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Track `<div>` nesting and report the depth of each requested modal id.
+    fn modal_depths(html: &str, ids: &[&str]) -> (Vec<(String, i32)>, i32, bool) {
+        let lower = strip_comments(html).to_ascii_lowercase();
+        let bytes = lower.as_bytes();
+        let mut depth = 0i32;
+        let mut went_negative = false;
+        let mut found: Vec<(String, i32)> = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'<' {
+                i += 1;
+                continue;
+            }
+            let is_open = lower[i..].starts_with("<div")
+                && bytes
+                    .get(i + 4)
+                    .is_some_and(|b| b.is_ascii_whitespace() || *b == b'>');
+            let is_close = lower[i..].starts_with("</div");
+            if is_open || is_close {
+                let end = lower[i..]
+                    .find('>')
+                    .map(|e| i + e + 1)
+                    .unwrap_or(lower.len());
+                if is_open {
+                    depth += 1;
+                    let tag = &lower[i..end];
+                    for id in ids {
+                        let needle = format!("id=\"{id}\"");
+                        if tag.contains(&needle) && !found.iter().any(|(k, _)| k.as_str() == *id) {
+                            found.push((id.to_string(), depth));
+                        }
+                    }
+                } else {
+                    depth -= 1;
+                    if depth < 0 {
+                        went_negative = true;
+                    }
+                }
+                i = end;
+                continue;
+            }
+            i += 1;
+        }
+        (found, depth, went_negative)
+    }
+
+    /// Regression: several modals were nested inside the hidden project modal,
+    /// so opening them produced an invisible (zero-size) element.
+    #[test]
+    fn modals_are_top_level_so_they_can_open() {
+        let ids = [
+            "config-modal",
+            "project-modal",
+            "project-settings-modal",
+            "file-browser-modal",
+            "command-palette-modal",
+            "onboarding-modal",
+        ];
+        let (found, final_depth, went_negative) = modal_depths(INDEX_HTML, &ids);
+        assert!(!went_negative, "index.html closes more <div>s than it opens");
+        assert_eq!(final_depth, 0, "index.html has unclosed <div> elements");
+        for id in ids {
+            let depth = found.iter().find(|(k, _)| k == id).map(|(_, d)| *d);
+            assert_eq!(
+                depth,
+                Some(1),
+                "#{id} must be a direct child of <body>; got {depth:?}. A parent modal hides it."
+            );
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct SearchTestRequest {
     pub query: String,

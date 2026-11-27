@@ -11424,8 +11424,11 @@ function renderSidebarAutomations() {
                 if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
                 const data = await res.json();
                 showToast(`Started '${a.name}'.`, 'success');
-                if (data.session_id && typeof selectSession === 'function') {
-                    selectSession(data.session_id);
+                if (data.session_id) {
+                    if (typeof fetchSessions === 'function') await fetchSessions();
+                    if (typeof loadHistoricalSession === 'function') {
+                        await loadHistoricalSession(data.session_id, a.name);
+                    }
                 }
             } catch (e) {
                 showToast('Failed to run automation: ' + e.message, 'error', 7000);
@@ -11446,9 +11449,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const btn = document.getElementById('btn-sidebar-new-automation');
     if (btn) {
         btn.addEventListener('click', () => {
-            if (typeof openSettings === 'function') openSettings();
-            if (typeof switchSettingsTab === 'function') switchSettingsTab('skills');
-            showAutomationEditor();
+            // The settings hub owns the automation editor, so open it on the
+            // Skills & Automations page before revealing the form.
+            if (typeof openSettingsModal === 'function') openSettingsModal('skills');
+            if (typeof showAutomationEditor === 'function') showAutomationEditor();
         });
     }
 });
