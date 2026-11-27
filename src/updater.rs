@@ -4,8 +4,10 @@
 //! 1. [`check`] asks the GitHub Releases API for the latest release and compares
 //!    its tag with the running `CARGO_PKG_VERSION`.
 //! 2. [`download`] / [`download_with_progress`] fetch the platform binary asset
-//!    into a temp file and, when the release publishes `SHA256SUMS`, verify the
-//!    digest (streamed so the UI can show progress).
+//!    into a temp file and verify its digest against `SHA256SUMS` (streamed so
+//!    the UI can show progress). A release that does not publish checksums is
+//!    refused: the downloaded file is executed on the next step, so an unsigned
+//!    payload is never installed.
 //! 3. [`apply_and_restart`] swaps the running executable and relaunches it with
 //!    the *same* command-line arguments, so a port/db override survives updates.
 //!
@@ -399,8 +401,9 @@ fn digest_for(sums: &str, asset_name: &str) -> Option<String> {
     None
 }
 
-/// Download the release binary to `dest_dir`, verifying its checksum when the
-/// release publishes `SHA256SUMS`. Returns the written path.
+/// Download the release binary to `dest_dir`, verifying its checksum against the
+/// release's `SHA256SUMS`. A release without checksums is refused (fail closed).
+/// Returns the written path.
 pub async fn download(info: &UpdateInfo, dest_dir: &Path) -> Result<PathBuf, String> {
     download_with_progress(info, dest_dir, |_, _| {}).await
 }
@@ -470,28 +473,37 @@ where
         ));
     }
 
-    if let Some(sums_asset) = &info.checksums {
-        let sums = get_with_retry(&sums_asset.url, None)
-            .await
-            .map_err(|e| format!("Checksum download failed: {e}"))?
-            .text()
-            .await
-            .map_err(|e| format!("Checksum download failed: {e}"))?;
-        match digest_for(&sums, &asset.name) {
-            Some(expected) => {
-                let actual = hex::encode(hasher.finalize());
-                if actual != expected {
-                    let _ = tokio::fs::remove_file(&part).await;
-                    return Err(format!(
-                        "Checksum mismatch for {}: expected {expected}, got {actual}",
-                        asset.name
-                    ));
-                }
-            }
-            None => {
+    // Fail closed: a release with no `SHA256SUMS` (or an asset URL that redirects
+    // somewhere the checksums never mention) is an unsigned binary. There is no
+    // signature anywhere else in the chain, and the next step here executes the
+    // file, so it is never installed.
+    let Some(sums_asset) = &info.checksums else {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(format!(
+            "Release {} publishes no SHA256SUMS; refusing to install an unverified {}",
+            info.latest_version, asset.name
+        ));
+    };
+    let sums = get_with_retry(&sums_asset.url, None)
+        .await
+        .map_err(|e| format!("Checksum download failed: {e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("Checksum download failed: {e}"))?;
+    match digest_for(&sums, &asset.name) {
+        Some(expected) => {
+            let actual = hex::encode(hasher.finalize());
+            if actual != expected {
                 let _ = tokio::fs::remove_file(&part).await;
-                return Err(format!("{} missing from SHA256SUMS", asset.name));
+                return Err(format!(
+                    "Checksum mismatch for {}: expected {expected}, got {actual}",
+                    asset.name
+                ));
             }
+        }
+        None => {
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(format!("{} missing from SHA256SUMS", asset.name));
         }
     }
 

@@ -35,7 +35,16 @@ fn redact_value(value: &mut String) {
 fn restore_value(value: &mut String, existing: &str) {
     if value == SECRET_REDACTED {
         // A placeholder with no matching stored secret (e.g. a renamed provider)
-        // must never be persisted or sent upstream — clear it instead.
+        // must never be persisted or sent upstream - clear it instead.
+        *value = existing.to_string();
+        return;
+    }
+    // An EMPTY incoming value must not wipe a stored secret either. `POST
+    // /api/config` sends the whole config back, and any client that does not
+    // echo the redacted placeholder (curl, a script, a form that was never
+    // filled in) would otherwise silently delete the provider key and break
+    // every later turn with "No model provider configured".
+    if value.is_empty() && !existing.is_empty() {
         *value = existing.to_string();
     }
 }

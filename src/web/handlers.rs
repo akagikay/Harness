@@ -592,11 +592,29 @@ pub fn spawn_session_turn(
     });
 }
 
+/// Largest prompt we accept from the API.
+///
+/// The transport limit is 32 MB (attachment uploads). Without an application
+/// limit, a multi-megabyte `task` is stored, sent to the model, and fails with
+/// the provider's raw `400 context_length` - and the oversized prompt stays in
+/// the DB forever.
+pub const MAX_TASK_CHARS: usize = 100_000;
+
 pub async fn create_session(
     State(state): State<AppState>,
     Json(payload): Json<CreateTaskRequest>,
-) -> Json<CreateTaskResponse> {
+) -> Result<Json<CreateTaskResponse>, (StatusCode, Json<serde_json::Value>)> {
     let config = { state.config.read().await.clone() };
+    let task_len = payload.task.chars().count();
+    if task_len > MAX_TASK_CHARS {
+        return Err(json_api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Prompt is too large: {task_len} characters (limit {MAX_TASK_CHARS}). \
+                 Split it into smaller tasks or attach a file."
+            ),
+        ));
+    }
     let project_id = payload.project_id.unwrap_or_else(|| config.active_project_id.clone());
     let sandbox = config
         .projects
@@ -691,7 +709,7 @@ pub async fn create_session(
         use_mock,
     );
 
-    Json(CreateTaskResponse { session_id })
+    Ok(Json(CreateTaskResponse { session_id }))
 }
 
 pub async fn stream_session_events(
@@ -862,7 +880,9 @@ pub async fn get_config(State(state): State<AppState>) -> Json<HarnessConfig> {
 /// wholesale replacement silently wipes projects added through `/api/projects` and reverts
 /// `active_project_id` / `sandbox_root` (orphaning every session that points at them).
 /// Project ownership is server-side, so those three fields are always taken from `existing`
-/// while every other setting is taken from the incoming payload.
+/// (together with `onboarded`, the updater's install marker, the revision counter, the
+/// approved extra access roots and the updater repo) while every other setting is taken
+/// from the incoming payload.
 pub fn merge_config_update(existing: &HarnessConfig, incoming: HarnessConfig) -> HarnessConfig {
     let mut merged = incoming;
     merged.projects = existing.projects.clone();
@@ -874,6 +894,19 @@ pub fn merge_config_update(existing: &HarnessConfig, incoming: HarnessConfig) ->
     // The auto-updater writes this marker; a stale client snapshot must not
     // clear it and restart an install loop.
     merged.last_auto_update_target = existing.last_auto_update_target.clone();
+    // The revision is a server-owned monotonic counter (see
+    // `HarnessConfig::config_revision`): a client can never rewind it, and
+    // replayed snapshots keep their original (now stale) value.
+    merged.config_revision = existing.config_revision;
+    // The sandbox and the updater target are server-owned. `POST /api/config`
+    // accepts the whole config from any caller, so honouring these two fields
+    // would let a rebound page (or one stale snapshot) widen the sandbox for
+    // every future run *and* repoint the updater at an attacker's repo, which
+    // then exe-swaps to their binary - RCE by config. Approved roots are only
+    // granted through the explicit path-access flow, and `update_repo` only
+    // through the environment.
+    merged.extra_access_roots = existing.extra_access_roots.clone();
+    merged.update_repo = existing.update_repo.clone();
     merged
 }
 
@@ -947,7 +980,7 @@ pub fn validate_explicit_project_id(id: &str) -> Result<(), (StatusCode, String)
 pub async fn update_config(
     State(state): State<AppState>,
     Json(mut new_conf): Json<HarnessConfig>,
-) -> Json<HarnessConfig> {
+) -> Result<Json<HarnessConfig>, (StatusCode, String)> {
     new_conf.display_verbosity =
         crate::config::normalize_display_verbosity(&new_conf.display_verbosity);
     new_conf.send_mode = crate::config::normalize_send_mode(&new_conf.send_mode);
@@ -964,17 +997,36 @@ pub async fn update_config(
     let merged = {
         let mut conf = state.config.write().await;
         let existing = conf.clone();
+        // Reject a stale snapshot. `POST /api/config` carries the whole config,
+        // so without this a page that was open before an automation/provider/MCP
+        // change would silently revert it (see `config_revision`).
+        if new_conf.config_revision < existing.config_revision {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "Settings changed since this page loaded (config revision {} is older than the \
+                     current {}). Reload the settings and re-apply your change so nothing is \
+                     reverted.",
+                    new_conf.config_revision, existing.config_revision
+                ),
+            ));
+        }
         // Restore any secrets the client echoed back as redacted placeholders.
         new_conf.restore_secrets(&existing);
         let merged = merge_config_update(&existing, new_conf);
         *conf = merged.clone();
         merged
     };
+    // The save itself is a mutation: advance the counter so a *second* stale
+    // snapshot (a second tab, or a doubled submit) is caught too. The returned
+    // snapshot carries the new value so the client's next save is fresh.
+    let bumped = state.bump_config_revision().await;
     state.reload_plugins().await;
     state.persist_config().await;
     let mut out = merged;
+    out.config_revision = bumped;
     out.redact_secrets();
-    Json(out)
+    Ok(Json(out))
 }
 
 #[cfg(test)]
@@ -983,6 +1035,79 @@ mod handlers_config_merge_tests {
 
     fn base() -> crate::config::HarnessConfig {
         crate::config::HarnessConfig::default()
+    }
+
+    #[tokio::test]
+    async fn stale_config_snapshot_is_rejected_and_changes_nothing() {
+        // The whole point of `config_revision`: a second POST carrying a
+        // snapshot taken BEFORE a server-side mutation must be refused instead
+        // of silently reverting the active provider / server / MCP servers /
+        // automations / skills.
+        let state = AppState::new(base());
+
+        // Snapshot the config the way the UI does when it loads Settings.
+        let mut snapshot = state.config.read().await.clone();
+        assert_eq!(snapshot.config_revision, 0);
+
+        // A dedicated endpoint mutates the shared config row (activate_provider
+        // bumps the revision in production; here we bump it directly so the test
+        // exercises the merge + rejection contract rather than the provider
+        // lookup).
+        let bumped = state.bump_config_revision().await;
+        assert_eq!(bumped, 1);
+
+        // A "settings save" from a page that was open before the bump.
+        snapshot.display_verbosity = "verbose".to_string();
+        let res = update_config(State(state.clone()), Json(snapshot)).await;
+        let (status, message) = res.expect_err("a stale snapshot must be rejected");
+        assert_eq!(status, StatusCode::CONFLICT, "stale snapshot must return 409");
+        assert!(
+            message.contains("revision") || message.contains("changed"),
+            "the message must explain the conflict: {message}"
+        );
+
+        // Nothing was written: the revision still belongs to the server, and the
+        // rejected edit is not present in the stored config.
+        let stored = state.config.read().await.clone();
+        assert_eq!(stored.config_revision, 1, "a rejected write must not consume the revision");
+        assert_eq!(stored.display_verbosity, "compact", "the rejected edit must not land");
+
+        // A fresh snapshot (equal revision) is accepted.
+        let fresh = stored.clone();
+        let ok = update_config(State(state.clone()), Json(fresh)).await;
+        assert!(ok.is_ok(), "equal or newer revision must be accepted");
+        let saved = ok.expect("ok").0;
+        assert_eq!(saved.config_revision, 2, "an accepted save advances the revision");
+    }
+
+    #[tokio::test]
+    async fn equal_revision_is_accepted_and_higher_is_accepted() {
+        let state = AppState::new(base());
+        let mut cfg = base();
+        cfg.config_revision = 7;
+        // Server side is at 7; a client at 7 (same) and 9 (newer) both pass.
+        state.config.write().await.config_revision = 7;
+        let ok = update_config(State(state.clone()), Json(cfg.clone())).await;
+        assert!(ok.is_ok(), "the same revision must be accepted");
+
+        state.config.write().await.config_revision = 7;
+        let mut newer = cfg.clone();
+        newer.config_revision = 9;
+        let ok = update_config(State(state.clone()), Json(newer)).await;
+        assert!(ok.is_ok(), "a newer revision must be accepted");
+    }
+
+    #[test]
+    fn merge_config_update_preserves_the_revision() {
+        let mut existing = base();
+        existing.config_revision = 42;
+        let mut incoming = base();
+        incoming.config_revision = 0;
+        let merged = merge_config_update(&existing, incoming);
+        assert_eq!(
+            merged.config_revision, 42,
+            "the revision is server-owned: a stale snapshot cannot rewind it"
+        );
     }
 
     #[test]
@@ -1043,6 +1168,42 @@ mod handlers_config_merge_tests {
         );
     }
 
+    /// A rebound page (or one stale snapshot) must not widen the sandbox for
+    /// every future run, nor repoint the updater at an attacker's repo - that
+    /// would exe-swap to their binary on the next update.
+    #[test]
+    fn merge_ignores_client_supplied_access_roots_and_update_repo() {
+        let mut existing = base();
+        existing.extra_access_roots = vec![std::path::PathBuf::from("C:\\approved")];
+        existing.update_repo = "akagikay/Harness".into();
+
+        let mut incoming = base();
+        incoming.extra_access_roots = vec![
+            std::path::PathBuf::from("C:\\Windows"),
+            std::path::PathBuf::from("C:\\Users"),
+        ];
+        incoming.update_repo = "attacker/Harness".into();
+
+        let merged = merge_config_update(&existing, incoming);
+        assert_eq!(
+            merged.extra_access_roots,
+            vec![std::path::PathBuf::from("C:\\approved")],
+            "extra_access_roots is server-owned: a client cannot widen the sandbox"
+        );
+        assert_eq!(
+            merged.update_repo, "akagikay/Harness",
+            "update_repo is server-owned: the updater's target cannot be redirected"
+        );
+
+        // ...and an empty payload cannot *clear* them either.
+        let merged = merge_config_update(&existing, base());
+        assert_eq!(
+            merged.extra_access_roots,
+            vec![std::path::PathBuf::from("C:\\approved")]
+        );
+        assert_eq!(merged.update_repo, "akagikay/Harness");
+    }
+
     #[test]
     fn effective_sandbox_helper_encodes_project_rules() {
         let new_path = std::path::Path::new("C:\\tmp\\bar");
@@ -1062,8 +1223,84 @@ mod handlers_config_merge_tests {
 }
 
 #[cfg(test)]
+mod sensitive_entry_tests {
+    use super::is_sensitive_entry;
+
+    /// The AES master key, the encrypted credential DB and their renamed copies
+    /// must be invisible to every UI-facing filesystem surface. The folder picker
+    /// already did this; the workspace tree/file explorer did not, which meant
+    /// `GET /api/workspace/file?path=harness.key` handed the key (and therefore
+    /// every stored provider API key) to any caller.
+    #[test]
+    fn harness_key_and_its_renames_are_never_listed_or_readable() {
+        for blocked in [
+            "harness.key",
+            "HARNESS.KEY",
+            "harness.db",
+            "harness.db-wal",
+            "harness.db-shm",
+            "key-copy.key",
+            "my-secret.key",
+            "harness.key.bak",
+            "harness.db.old",
+            "harness-key.db",
+            "harness_key.db.copy",
+            "harness.db.tmp",
+            ".env",
+            ".env.production",
+        ] {
+            assert!(
+                is_sensitive_entry(blocked),
+                "{blocked} is a harness secret and must be filtered out"
+            );
+        }
+        for allowed in [
+            "notes.txt",
+            "harness-notes.txt",
+            "keyboard.rs",
+            "readme.md",
+            "keys.txt",
+            "harness.rs",
+            "harness.config.json",
+            "mykey.rs",
+            "src",
+            "harness.exe",
+        ] {
+            assert!(
+                !is_sensitive_entry(allowed),
+                "{allowed} is an ordinary user file and must stay visible"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod ui_structure_tests {
-    use super::INDEX_HTML;
+    use super::{APP_JS, INDEX_HTML};
+
+    /// The CSP serves `script-src 'self'` with no `'unsafe-inline'`, so no inline
+/// event handler may exist anywhere in the UI - the shipped HTML *or* the
+/// template strings app.js injects through `innerHTML`. They are all wired
+/// through the delegated `data-*` listener block at the bottom of app.js.
+    #[test]
+    fn ui_carries_no_inline_event_handlers() {
+        for handler in [
+            "onclick=", "onchange=", "oninput=", "onsubmit=", "onload=", "onerror=",
+            "onkeyup=", "onkeydown=", "onkeypress=", "onmouseover=", "onfocus=",
+            "onblur=", "onmouseenter=", "onmouseleave=", "javascript:",
+        ] {
+            assert!(
+                !INDEX_HTML.contains(handler),
+                "index.html must not contain an inline handler ({handler}) while the CSP \
+                 forbids 'unsafe-inline' script sources"
+            );
+            assert!(
+                !APP_JS.contains(handler),
+                "app.js must not render an inline handler ({handler}) while the CSP forbids \
+                 'unsafe-inline' script sources"
+            );
+        }
+    }
 
     /// Strip HTML comments so markup quoted inside them is not counted.
     fn strip_comments(html: &str) -> String {
@@ -1213,6 +1450,7 @@ pub async fn save_mcp_server(
             conf.mcp_servers.push(server.clone());
         }
     }
+    state.bump_config_revision().await;
     state.reload_plugins().await;
     state.persist_config().await;
     let mut out = server;
@@ -1232,6 +1470,7 @@ pub async fn delete_mcp_server(
             return Err(StatusCode::NOT_FOUND);
         }
     }
+    state.bump_config_revision().await;
     state.reload_plugins().await;
     state.persist_config().await;
     Ok(Json(serde_json::json!({ "status": "deleted", "id": id })))
@@ -1299,6 +1538,7 @@ pub async fn activate_provider(
         );
         let cloned = conf.clone();
         drop(conf);
+        state.bump_config_revision().await;
         state.persist_config().await;
         let mut out = cloned;
         out.redact_secrets();
@@ -3079,6 +3319,7 @@ pub async fn save_server(
             conf.servers.push(srv.clone());
         }
     }
+    state.bump_config_revision().await;
     state.persist_config().await;
     if let Some(ref db) = state.db {
         let _ = db.upsert_server(&srv);
@@ -3106,6 +3347,7 @@ pub async fn delete_server(
             conf.active_server_id = "local".to_string();
         }
     }
+    state.bump_config_revision().await;
     state.persist_config().await;
     if let Some(ref db) = state.db {
         let _ = db.delete_server(&id);
@@ -3131,6 +3373,7 @@ pub async fn set_active_server(
     if !found {
         return Err(StatusCode::NOT_FOUND);
     }
+    state.bump_config_revision().await;
     state.persist_config().await;
     Ok(Json(serde_json::json!({ "active_server_id": id })))
 }
@@ -3563,6 +3806,36 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
     (drives, favorites)
 }
 
+/// Names the harness's own database and master key, however they are named.
+///
+/// The SQLCipher DB (plus its `-wal`/`-shm` siblings) and the AES master key live
+/// inside `sandbox_root` on a default install, and `harness.key` is the
+/// credential that decrypts every stored provider API key - so the file browser
+/// must never surface it, under its own name or a renamed copy. Only the stem is
+/// matched (`harness-key.db`, `harness.key.old`), so an ordinary user file whose
+/// name merely *contains* "harness" (`harness-notes.txt`) still lists.
+fn is_harness_secret_name(name: &str) -> bool {
+    let (stem, rest) = match name.split_once('.') {
+        Some(parts) => parts,
+        None => return false,
+    };
+    if !stem.contains("harness") {
+        return false;
+    }
+    rest.replace(['-', '_', ' '], ".")
+        .split('.')
+        .any(|part| {
+            matches!(
+                part,
+                "db" | "key" | "wal" | "shm" | "env" | "sqlite" | "sqlite3" | "pem"
+            )
+        })
+}
+
+/// Backup/archive suffixes a renamed copy of a secret hides behind.
+const SENSITIVE_BACKUP_SUFFIXES: [&str; 7] =
+    [".bak", ".old", ".orig", ".save", ".tmp", ".backup", ".copy"];
+
 /// Names the folder picker must never list.
 ///
 /// The DB, its WAL/SHM siblings and the encryption key live next to the
@@ -3574,6 +3847,34 @@ fn is_sensitive_picker_entry(name: &str) -> bool {
         return true;
     }
     lower.ends_with(".key") || lower == ".env" || lower.starts_with(".env.")
+        || is_harness_secret_name(&lower)
+}
+
+/// Shared denylist for every UI-facing filesystem surface.
+///
+/// The folder picker, the workspace explorer's directory tree and the workspace
+/// file reader all expose the same secrets to the same caller, so all three must
+/// apply the same filter - and it must catch a *renamed* copy (`key-copy.key`,
+/// `harness.db.bak`), not only the shipped literals.
+fn is_sensitive_entry(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if is_sensitive_picker_entry(&lower) {
+        return true;
+    }
+    // Peel backup suffixes (`harness.key.old`, `harness.db.bak`) so a copy
+    // stashed under a familiar name is still blocked, then re-check.
+    let mut candidate: &str = &lower;
+    while let Some(stripped) = SENSITIVE_BACKUP_SUFFIXES
+        .iter()
+        .find_map(|suffix| candidate.strip_suffix(suffix))
+        .filter(|s| !s.is_empty())
+    {
+        if is_sensitive_picker_entry(stripped) {
+            return true;
+        }
+        candidate = stripped;
+    }
+    is_harness_secret_name(candidate)
 }
 
 pub async fn browse_filesystem(
@@ -3658,7 +3959,7 @@ pub async fn browse_filesystem(
             while let Ok(Some(entry)) = dir.next_entry().await {
                 let name = entry.file_name().to_string_lossy().to_string();
                 // Never surface the harness's own secrets to the folder picker.
-                if is_sensitive_picker_entry(&name) {
+                if is_sensitive_entry(&name) {
                     continue;
                 }
                 let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
@@ -4193,6 +4494,12 @@ async fn read_workspace_dir_recursive(
         }
         let name = entry.file_name().to_string_lossy().to_string();
         let is_dir = ft.is_dir();
+        // The harness's own DB/key must never be listed by the explorer: they
+        // live inside the sandbox on a default install and are the credential
+        // that decrypts every stored API key.
+        if is_sensitive_entry(&name) {
+            continue;
+        }
         if is_dir && should_skip_workspace_dir(&name) {
             continue;
         }
@@ -4330,6 +4637,20 @@ pub async fn get_workspace_file(
     let rel = normalize_relative_path(&query.path)?;
     let sandbox = resolve_sandbox(&state, query.session_id.as_deref()).await;
     let target = resolve_contained_path(&sandbox, &rel).await?;
+
+    // Never hand the AES master key (or the encrypted credential DB) to a client:
+    // anything that can read them can decrypt every stored provider key.
+    let requested_name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if is_sensitive_entry(&requested_name) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "This file is a harness secret and cannot be opened from the workspace explorer."
+                .to_string(),
+        ));
+    }
 
     let meta = tokio::fs::metadata(&target)
         .await
@@ -4475,6 +4796,7 @@ pub async fn save_skill(
     };
 
     // Persist `disabled_skills` changes; previously in-memory only.
+    state.bump_config_revision().await;
     state.persist_config().await;
 
     Ok(Json(SkillDefinition {
@@ -4510,6 +4832,7 @@ pub async fn delete_skill(
             .retain(|s| s.to_lowercase() != norm && s.to_lowercase() != slug);
     }
 
+    state.bump_config_revision().await;
     state.persist_config().await;
 
     Ok(Json(serde_json::json!({ "status": "deleted", "name": name })))
@@ -4627,6 +4950,16 @@ pub async fn security_status(State(state): State<AppState>) -> Json<serde_json::
 // ============================================================================
 
 /// `POST /api/automations` - create or update an automation.
+/// Lowercase alphanumeric slug used for automation ids.
+fn slugify_automation_name(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
 pub async fn save_automation(
     State(state): State<AppState>,
     Json(mut automation): Json<crate::automation::Automation>,
@@ -4649,6 +4982,41 @@ pub async fn save_automation(
             automation.id = format!("auto-{}", chrono::Utc::now().timestamp_millis());
         }
     }
+    if automation.id.trim().is_empty() {
+        // Derive a readable id from the name, then make it unique: two
+        // automations whose names slugify the same ("Dup"/"DUP") used to share
+        // an id and the second save silently replaced the first.
+        let slug = slugify_automation_name(&automation.name);
+        let base = if slug.is_empty() {
+            format!("auto-{}", chrono::Utc::now().timestamp_millis())
+        } else {
+            format!("auto-{slug}")
+        };
+        let taken = {
+            let conf = state.config.read().await;
+            conf.automations.iter().any(|a| a.id == base)
+        };
+        automation.id = if taken {
+            // Keep it readable AND unique.
+            let mut n = 2;
+            loop {
+                let candidate = format!("{base}-{n}");
+                let clash = {
+                    let conf = state.config.read().await;
+                    conf.automations.iter().any(|a| a.id == candidate)
+                };
+                if !clash {
+                    break candidate;
+                }
+                n += 1;
+                if n > 999 {
+                    break format!("{base}-{}", chrono::Utc::now().timestamp_millis());
+                }
+            }
+        } else {
+            base
+        };
+    }
     if automation.created_at.trim().is_empty() {
         automation.created_at = chrono::Local::now().to_rfc3339();
     }
@@ -4667,6 +5035,7 @@ pub async fn save_automation(
             conf.automations.push(automation.clone());
         }
     }
+    state.bump_config_revision().await;
     state.persist_config().await;
     Ok(Json(automation))
 }
@@ -4685,6 +5054,7 @@ pub async fn delete_automation(
     if !removed {
         return Err(StatusCode::NOT_FOUND);
     }
+    state.bump_config_revision().await;
     state.persist_config().await;
     Ok(Json(serde_json::json!({ "status": "deleted", "id": id })))
 }
@@ -4766,6 +5136,7 @@ pub async fn update_automation_handler(
     }
 
     state.reload_plugins().await;
+    state.bump_config_revision().await;
     state.persist_config().await;
     Ok(Json(serde_json::json!({ "status": "updated", "automation": updated })))
 }

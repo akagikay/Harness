@@ -61,6 +61,116 @@ fn decode_capped(bytes: &[u8], truncated: bool, cap: usize, label: &str) -> Stri
     text
 }
 
+/// Spawn the shell in `sandbox`, capture bounded stdout/stderr, and honour the
+/// timeout.
+///
+/// HONEST SANDBOX: `current_dir(sandbox)` only sets the *working directory*.
+/// The spawned shell inherits the harness process's privileges and is NOT
+/// contained: it can `cd` to and read/write any absolute path on the machine,
+/// and reach the network. That is why the tool is declared
+/// `ShellOrNetwork` and requires approval in Safe mode, and why every
+/// invocation is logged (see `BashPlugin::execute`).
+async fn execute_shell(
+    command_str: &str,
+    timeout_secs: u64,
+    sandbox: &Path,
+) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = Command::new("powershell");
+        c.arg("-NoProfile").arg("-NonInteractive").arg("-Command").arg(command_str);
+        c
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(command_str);
+        c
+    };
+
+    cmd.current_dir(sandbox)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Never leave an orphan/zombie shell behind if the future is dropped
+        // (cancellation, session teardown, or a timeout bail-out below).
+        .kill_on_drop(true);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return Err(format!("Failed to spawn process: {}", e)),
+    };
+
+    // Detach the pipes from the child so the reads do not borrow it: this
+    // keeps the child killable (and reapable) once the timeout expires.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    // Read both pipes concurrently under a hard byte budget; sequential
+    // reads could deadlock when the child fills the unread pipe.
+    let capture = async {
+        let stdout_fut = async {
+            let (bytes, truncated) = match stdout_pipe {
+                Some(pipe) => read_capped(pipe, MAX_STREAM_BYTES).await,
+                None => (Vec::new(), false),
+            };
+            decode_capped(&bytes, truncated, MAX_STREAM_BYTES, "stdout")
+        };
+        let stderr_fut = async {
+            let (bytes, truncated) = match stderr_pipe {
+                Some(pipe) => read_capped(pipe, MAX_STREAM_BYTES).await,
+                None => (Vec::new(), false),
+            };
+            decode_capped(&bytes, truncated, MAX_STREAM_BYTES, "stderr")
+        };
+        tokio::join!(stdout_fut, stderr_fut)
+    };
+
+    let (stdout, stderr) = match timeout(Duration::from_secs(timeout_secs), capture).await {
+        Ok(pair) => pair,
+        Err(_) => {
+            let _ = child.kill().await;
+            // Reap so the killed shell does not linger as a zombie.
+            let _ = child.wait().await;
+            return Err(format!("Command timed out after {} seconds.", timeout_secs));
+        }
+    };
+
+    // Bound the reap as well: a command that closed its pipes but never exits
+    // must not pin the tool (the outer harness timeout would only cancel us).
+    let status = match timeout(Duration::from_secs(5), child.wait()).await {
+        Ok(Ok(status)) => Some(status),
+        Ok(Err(_)) => None,
+        Err(_) => {
+            let _ = child.kill().await;
+            child.wait().await.ok()
+        }
+    };
+    let code = status.as_ref().and_then(|s| s.code()).unwrap_or(-1);
+    let success = status.as_ref().map(|s| s.success()).unwrap_or(false);
+
+    if success {
+        let mut res = String::new();
+        if !stdout.is_empty() {
+            res.push_str(&stdout);
+        }
+        if !stderr.is_empty() {
+            if !res.is_empty() { res.push_str("\n--- stderr ---\n"); }
+            res.push_str(&stderr);
+        }
+        if res.is_empty() {
+            res.push_str("(Command completed with exit code 0 and no output)");
+        }
+        Ok(res)
+    } else {
+        Err(format!(
+            "Command failed with exit code {}\nStdout:\n{}\nStderr:\n{}",
+            code, stdout, stderr
+        ))
+    }
+}
+
 #[async_trait]
 impl ToolPlugin for BashPlugin {
     fn name(&self) -> &'static str {
@@ -68,7 +178,34 @@ impl ToolPlugin for BashPlugin {
     }
 
     fn description(&self) -> &'static str {
-        "Execute a shell command (PowerShell on Windows, sh on Unix) inside the sandbox workspace."
+        "Execute a shell command (PowerShell on Windows, sh on Unix) with the harness process's \
+         full privileges. It starts in the sandbox workspace, but the command it runs is NOT \
+         contained: any command may `cd`, read and write absolute paths outside the workspace \
+         (e.g. `cd C:\\Users`), and reach the network. This tool is declared `ShellOrNetwork` and \
+         requires approval in Safe mode; treat every invocation as running code with the user's \
+         own rights. Use `read_file`, `list_dir` and `write_file` for anything that must stay \
+         inside the sandbox."
+    }
+
+    async fn execute(&self, args: Value, sandbox: &Path) -> Result<String, String> {
+        let command_str = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing required parameter 'command'".to_string())?;
+
+        let timeout_secs = clamp_timeout_secs(args.get("timeout_secs").and_then(|v| v.as_u64()));
+
+        // The shell runs privileged and uncontained. Never pretend otherwise:
+        // log every invocation so an operator can audit what ran with what
+        // rights, instead of relying on a sandbox that does not exist here.
+        eprintln!(
+            "[harness-bash] privileged shell (NOT sandboxed) cwd={} timeout={}s cmd={:?}",
+            sandbox.display(),
+            timeout_secs,
+            command_str
+        );
+
+        execute_shell(command_str, timeout_secs, sandbox).await
     }
 
     fn contract(&self) -> ToolContract {
@@ -77,10 +214,13 @@ impl ToolPlugin for BashPlugin {
             description: self.description().to_string(),
             category: "shell".to_string(),
             permission_level: ToolPermission::ShellOrNetwork,
+            // Advertise the boundary in the field help too: the agent reads this
+            // right next to `command` when it decides how to touch a file.
             fields: vec![
                 ToolFieldSpec::required_string(
                     "command",
-                    "The command line string to run.",
+                    "The command line string to run (runs with the harness process's full \
+                     privileges, NOT confined to the sandbox workspace).",
                     "Provide a non-empty shell command (PowerShell on Windows, sh on Unix).",
                 )
                 .non_empty(),
@@ -121,114 +261,71 @@ impl ToolPlugin for BashPlugin {
             is_custom: false,
         }
     }
-
-    async fn execute(&self, args: Value, sandbox: &Path) -> Result<String, String> {
-        let command_str = args.get("command")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "Missing required parameter 'command'".to_string())?;
-
-        let timeout_secs = clamp_timeout_secs(args.get("timeout_secs").and_then(|v| v.as_u64()));
-
-        #[cfg(target_os = "windows")]
-        let mut cmd = {
-            let mut c = Command::new("powershell");
-            c.arg("-NoProfile").arg("-NonInteractive").arg("-Command").arg(command_str);
-            c
-        };
-
-        #[cfg(not(target_os = "windows"))]
-        let mut cmd = {
-            let mut c = Command::new("sh");
-            c.arg("-c").arg(command_str);
-            c
-        };
-
-        cmd.current_dir(sandbox)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            // Never leave an orphan/zombie shell behind if the future is dropped
-            // (cancellation, session teardown, or a timeout bail-out below).
-            .kill_on_drop(true);
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => return Err(format!("Failed to spawn process: {}", e)),
-        };
-
-        // Detach the pipes from the child so the reads do not borrow it: this
-        // keeps the child killable (and reapable) once the timeout expires.
-        let stdout_pipe = child.stdout.take();
-        let stderr_pipe = child.stderr.take();
-
-        // Read both pipes concurrently under a hard byte budget; sequential
-        // reads could deadlock when the child fills the unread pipe.
-        let capture = async {
-            let stdout_fut = async {
-                let (bytes, truncated) = match stdout_pipe {
-                    Some(pipe) => read_capped(pipe, MAX_STREAM_BYTES).await,
-                    None => (Vec::new(), false),
-                };
-                decode_capped(&bytes, truncated, MAX_STREAM_BYTES, "stdout")
-            };
-            let stderr_fut = async {
-                let (bytes, truncated) = match stderr_pipe {
-                    Some(pipe) => read_capped(pipe, MAX_STREAM_BYTES).await,
-                    None => (Vec::new(), false),
-                };
-                decode_capped(&bytes, truncated, MAX_STREAM_BYTES, "stderr")
-            };
-            tokio::join!(stdout_fut, stderr_fut)
-        };
-
-        let (stdout, stderr) = match timeout(Duration::from_secs(timeout_secs), capture).await {
-            Ok(pair) => pair,
-            Err(_) => {
-                let _ = child.kill().await;
-                // Reap so the killed shell does not linger as a zombie.
-                let _ = child.wait().await;
-                return Err(format!("Command timed out after {} seconds.", timeout_secs));
-            }
-        };
-
-        // Bound the reap as well: a command that closed its pipes but never exits
-        // must not pin the tool (the outer harness timeout would only cancel us).
-        let status = match timeout(Duration::from_secs(5), child.wait()).await {
-            Ok(Ok(status)) => Some(status),
-            Ok(Err(_)) => None,
-            Err(_) => {
-                let _ = child.kill().await;
-                child.wait().await.ok()
-            }
-        };
-        let code = status.as_ref().and_then(|s| s.code()).unwrap_or(-1);
-        let success = status.as_ref().map(|s| s.success()).unwrap_or(false);
-
-        if success {
-            let mut res = String::new();
-            if !stdout.is_empty() {
-                res.push_str(&stdout);
-            }
-            if !stderr.is_empty() {
-                if !res.is_empty() { res.push_str("\n--- stderr ---\n"); }
-                res.push_str(&stderr);
-            }
-            if res.is_empty() {
-                res.push_str("(Command completed with exit code 0 and no output)");
-            }
-            Ok(res)
-        } else {
-            Err(format!(
-                "Command failed with exit code {}\nStdout:\n{}\nStderr:\n{}",
-                code, stdout, stderr
-            ))
-        }
-    }
 }
 
 #[cfg(test)]
 mod harness_tests {
     use super::*;
+
+    /// `bash` stays privileged, so its own contract must say so. The old
+    /// description claimed "inside the sandbox workspace" while `cd C:\Users`
+    /// worked — the tool must never promise containment it does not deliver.
+    #[test]
+    fn bash_contract_states_that_it_is_not_contained() {
+        let plugin = BashPlugin;
+        let desc = plugin.description();
+        assert!(
+            desc.contains("NOT contained") && desc.contains("full privileges"),
+            "the description must admit it is not sandboxed: {desc}"
+        );
+        let contract = plugin.contract();
+        assert_eq!(contract.permission_level, ToolPermission::ShellOrNetwork);
+        assert!(
+            contract.description.contains("NOT contained"),
+            "the contract must carry the honest description too"
+        );
+        let command_help = contract
+            .fields
+            .iter()
+            .find(|f| f.name == "command")
+            .expect("command field");
+        assert!(
+            command_help.description.contains("NOT confined"),
+            "the field help must warn the agent: {}",
+            command_help.description
+        );
+    }
+
+    /// The tool must not claim containment in the persisted contract JSON either.
+    #[test]
+    fn executed_shell_runs_outside_the_sandbox_when_told_to() {
+        #[cfg(target_os = "windows")]
+        let cmd = "cd C:\\; Get-Location | Select-Object -ExpandProperty Path";
+        #[cfg(not(target_os = "windows"))]
+        let cmd = "cd /etc; pwd";
+
+        let sandbox = std::env::temp_dir().join(format!(
+            "harness_bash_escape_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let plugin = BashPlugin;
+        let out = plugin
+            .execute(json!({ "command": cmd, "timeout_secs": 20 }), &sandbox)
+            .await
+            .expect("the command should succeed");
+        // The shell escaped the working directory: the tool is privileged, not
+        // sandboxed, and must never be documented as if it were.
+        let escaped = out.contains("C:\\") || out.contains("/etc");
+        assert!(
+            escaped,
+            "`bash` is privileged and uncontained (cwd={}); output was: {:?}",
+            sandbox.display(),
+            out
+        );
+        let _ = std::fs::remove_dir_all(&sandbox);
+    }
 
     #[test]
     fn timeout_is_clamped_to_supported_range() {
@@ -298,7 +395,7 @@ mod harness_tests {
             .expect_err("command exceeding the clamped timeout must fail");
         assert_eq!(err, "Command timed out after 1 seconds.");
 
-        let _ = tokio::fs::remove_dir_all(&sandbox).await;
+        let _ = tokio::fs::remove_dir_all(&sandbox);
     }
 
     #[tokio::test]
@@ -336,6 +433,6 @@ mod harness_tests {
         assert!(err.contains("Stdout:"), "stdout must be surfaced: {}", err);
         assert!(err.contains("Stderr:"), "stderr must be surfaced: {}", err);
 
-        let _ = tokio::fs::remove_dir_all(&sandbox).await;
+        let _ = tokio::fs::remove_dir_all(&sandbox);
     }
 }

@@ -9,6 +9,8 @@ use axum::{
 };
 use tower_http::compression::CompressionLayer;
 
+use std::sync::Arc;
+
 use crate::state::AppState;
 use security::HttpSecurity;
 
@@ -140,13 +142,37 @@ pub fn build_server_router(state: AppState) -> Router {
 }
 
 /// Derive HTTP security settings from the live config + bind host.
+///
+/// The auth token is re-read **per request** (see
+/// [`security::HttpSecurity::with_live_token`]): a rotation through
+/// `POST /api/config` must take effect at once, otherwise a leaked token stays
+/// valid until the next restart and `/api/security/status` reports a rotation
+/// that never happened.
 fn security_for(state: &AppState) -> HttpSecurity {
-    let (token, host) = {
-        // `try_read` avoids blocking router construction; fall back to env-only.
-        match state.config.try_read() {
-            Ok(conf) => (conf.auth_token.clone(), conf.host.clone()),
-            Err(_) => (String::new(), "127.0.0.1".to_string()),
-        }
+    let snapshot = match state.config.try_read() {
+        Ok(conf) => HttpSecurity::from_config(&conf.auth_token, &conf.host),
+        // Router construction can race a write; the live source below re-reads.
+        Err(_) => HttpSecurity::from_config("", "127.0.0.1"),
     };
-    HttpSecurity::from_config(&token, &host)
+    let config = Arc::clone(&state.config);
+    snapshot.with_live_token(Arc::new(move || live_auth_token(&config)))
+}
+
+/// Token currently in force, read live from the config row.
+///
+/// Config wins over `HARNESS_AUTH_TOKEN` exactly as at startup. `None` means the
+/// value could not be read (a writer holds the lock); the middleware then falls
+/// back to the snapshot token rather than silently dropping auth.
+fn live_auth_token(config: &tokio::sync::RwLock<crate::config::HarnessConfig>) -> Option<String> {
+    let conf = config.try_read().ok()?;
+    let token = conf.auth_token.trim().to_string();
+    if !token.is_empty() {
+        return Some(token);
+    }
+    Some(
+        std::env::var("HARNESS_AUTH_TOKEN")
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+    )
 }

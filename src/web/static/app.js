@@ -1913,6 +1913,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (pGit) pGit.addEventListener('click', () => applyMcpPreset('git'));
     const pFetch = document.getElementById('preset-mcp-fetch');
     if (pFetch) pFetch.addEventListener('click', () => applyMcpPreset('fetch'));
+    // Provider template chips carry `data-preset`; the delegated click handler
+    // at the bottom of this file wires them (no inline handler attributes, so
+    // the page ships with a `script-src 'self'` CSP).
 
     if (editMcpTransport) {
         editMcpTransport.addEventListener('change', () => {
@@ -5323,11 +5326,7 @@ function setDisplayVerbosity(level, persist = false) {
 async function persistDisplayVerbosityConfig() {
     if (!currentConfig) return;
     try {
-        await fetch('/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(currentConfig)
-        });
+        await saveCurrentConfig();
     } catch (_) {}
 }
 
@@ -7249,9 +7248,9 @@ function renderPermissionPrompt(permId, tool, description, args) {
         </div>
         <div class="permission-card-desc">${escapeHtml(description)}</div>
         <div class="permission-card-actions">
-            <button class="perm-btn deny" onclick="decidePermission('${permId}', false)">Deny</button>
-            <button class="perm-btn approve" onclick="decidePermission('${permId}', true)">Approve</button>
-            <button class="perm-btn always" onclick="decidePermission('${permId}', true, true)">Approve & always allow</button>
+            <button class="perm-btn deny" data-perm-id="${permId}" data-perm-approved="0">Deny</button>
+            <button class="perm-btn approve" data-perm-id="${permId}" data-perm-approved="1">Approve</button>
+            <button class="perm-btn always" data-perm-id="${permId}" data-perm-approved="1" data-perm-always="1">Approve & always allow</button>
         </div>
     `;
     streamContainer.appendChild(card);
@@ -7823,11 +7822,7 @@ async function refreshReasoningControlsForModel(modelId, persistIfAdjusted = fal
     if (currentConfig && spec.support === 'configurable' && currentEffort !== resolvedEffort) {
         currentConfig.reasoning_effort = resolvedEffort;
         if (persistIfAdjusted) {
-            fetch('/api/config', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(currentConfig)
-            });
+            persistCurrentConfigInBackground();
         }
     }
 }
@@ -7997,11 +7992,7 @@ async function selectModel(modelId, effortOverride = null, providerIdOverride = 
             currentConfig.memory.max_context_tokens = nextCtx;
             applyResolvedContextWindow(nextCtx);
         }
-        fetch('/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(currentConfig)
-        });
+        persistCurrentConfigInBackground();
     } else {
         await syncModelContextWindowIfAuto(modelId);
     }
@@ -8155,11 +8146,7 @@ function renderFilteredModels(preserveScroll = true) {
             if (currentConfig) {
                 if (!currentConfig.orchestrator) currentConfig.orchestrator = {};
                 currentConfig.orchestrator.enabled = !Boolean(currentConfig.orchestrator.enabled);
-                fetch('/api/config', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(currentConfig)
-                });
+                persistCurrentConfigInBackground();
                 updateModelPillDisplay();
                 renderFilteredModels(true);
                 syncOrchestratorControls();
@@ -8646,16 +8633,14 @@ async function saveCustomProvider() {
     const originalLabel = btnSaveCustomProvider.textContent;
     btnSaveCustomProvider.textContent = 'Saving...';
     try {
-        const res = await fetch('/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(currentConfig)
-        });
-        if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
-        currentConfig = await res.json();
-        renderConfiguredProviders();
-        await switchProvider(id);
-        showToast(`Provider '${name}' saved.`, 'success');
+        const result = await saveCurrentConfig();
+        if (result.ok) {
+            renderConfiguredProviders();
+            await switchProvider(id);
+            showToast(`Provider '${name}' saved.`, 'success');
+        } else if (result.status !== 409) {
+            throw new Error('HTTP ' + result.status);
+        }
     } catch (e) {
         showToast('Failed to save provider: ' + e.message, 'error', 7000);
     } finally {
@@ -8672,11 +8657,7 @@ function setReasoningEffort(effort, shouldClosePopovers = true, persist = true, 
 
     if (persist && currentConfig) {
         currentConfig.reasoning_effort = effective;
-        fetch('/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(currentConfig)
-        });
+        persistCurrentConfigInBackground();
     }
     if (shouldClosePopovers) closeAllPopovers();
 }
@@ -8699,11 +8680,7 @@ function setPermissionMode(mode, persist = true) {
 
     if (persist && currentConfig && currentConfig.permissions) {
         currentConfig.permissions.mode = mode;
-        fetch('/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(currentConfig)
-        });
+        persistCurrentConfigInBackground();
     }
     closeAllPopovers();
 }
@@ -9025,15 +9002,15 @@ function renderMcpServers(servers) {
             <div class="mcp-server-actions">
                 <label class="mcp-toggle-label ui-switch-row">
                     <span class="ui-switch compact">
-                        <input type="checkbox" ${s.enabled ? 'checked' : ''} onchange="toggleMcpServer('${s.id}', this.checked)">
+                        <input type="checkbox" ${s.enabled ? 'checked' : ''} data-mcp-toggle="${s.id}">
                         <span class="ui-switch-track"><span class="ui-switch-thumb"></span></span>
                     </span>
                     <span>Active in Toolset</span>
                 </label>
                 <div class="mcp-btns-group">
-                    <button class="btn-card-action primary" onclick="testMcpServer('${s.id}')">⚡ Test Handshake</button>
-                    <button class="btn-card-action" onclick="editMcpServer('${s.id}')">Edit</button>
-                    <button class="btn-card-action danger" onclick="deleteMcpServer('${s.id}')">Remove</button>
+                    <button class="btn-card-action primary" data-mcp-action="test" data-mcp-id="${s.id}">⚡ Test Handshake</button>
+                    <button class="btn-card-action" data-mcp-action="edit" data-mcp-id="${s.id}">Edit</button>
+                    <button class="btn-card-action danger" data-mcp-action="delete" data-mcp-id="${s.id}">Remove</button>
                 </div>
             </div>
         `;
@@ -9355,12 +9332,8 @@ async function saveSearchConfig() {
     }
 
     try {
-        const res = await fetch('/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(currentConfig)
-        });
-        if (res.ok) {
+        const result = await saveCurrentConfig();
+        if (result.ok) {
             showSettingsFeedback(`✓ Search provider '${activeProvider}' saved`);
         }
     } catch (e) {
@@ -9503,6 +9476,58 @@ async function loadConfig() {
 // ==========================================================================
 // Orchestrator Mode, Multi-Profile Subagents & Server Node Management
 // ==========================================================================
+
+/// Shared `POST /api/config` path.
+///
+/// The server owns a monotonic `config_revision` that every mutating endpoint
+/// bumps (activate provider, save MCP server, save server, save automation,
+/// save skill, ...). A snapshot taken before one of those ran is rejected with
+/// **409** so it cannot silently revert it. Without this helper the 409 fell
+/// into a generic "HTTP 409" line and the user's edit vanished with no
+/// explanation; now the live config is reloaded into the forms and the reason
+/// is spelled out.
+async function saveCurrentConfig() {
+    if (!currentConfig) throw new Error('Configuration is still loading.');
+    let res;
+    try {
+        res = await fetch('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(currentConfig)
+        });
+    } catch (e) {
+        showToast('Could not save settings: ' + e.message, 'error', 7000);
+        return { ok: false, status: 0, stale: false };
+    }
+
+    if (res.ok) {
+        const fresh = await res.json().catch(() => null);
+        // The response carries the new revision, so the next save is not stale.
+        if (fresh) currentConfig = fresh;
+        return { ok: true, status: res.status, stale: false };
+    }
+
+    const bodyText = await res.text().catch(() => '');
+    if (res.status === 409) {
+        showToast(
+            'Settings changed in another tab or view since this one loaded, so this save was refused ' +
+            'to avoid reverting them. The live settings are reloaded — re-apply your change and save again.',
+            'warning', 10000
+        );
+        // Drop the stale snapshot and re-render every settings form from the
+        // server's current config.
+        await loadConfig();
+        return { ok: false, status: 409, stale: true };
+    }
+    showToast('Could not save settings (HTTP ' + res.status + '): ' + (bodyText || 'no details'), 'error', 7000);
+    return { ok: false, status: res.status, stale: false };
+}
+
+// Persist the config without blocking the caller; a 409 is still surfaced.
+function persistCurrentConfigInBackground() {
+    Promise.resolve().then(saveCurrentConfig).catch(() => {});
+}
+
 const DEFAULT_ORCHESTRATOR_PROMPT = 'You are operating in Orchestrator Mode.\n- Decompose complex requests into clear, independent workstreams and delegate execution cleanly using `invoke_subagent` (and `swarm_board` for coordination).\n- Choose specialized subagent types when configured, pass `read_only: true` for verification/review agents, and assign remote `server_id` nodes when offloading onto worker servers.\n- Synthesize verified results cleanly for the user without repeating redundant raw logs.';
 
 function getServerSelectOptionsHtml(selectedId = 'local') {
@@ -9707,17 +9732,11 @@ async function saveOrchestratorConfig() {
         system_prompt: orchSystemPrompt ? orchSystemPrompt.value : DEFAULT_ORCHESTRATOR_PROMPT
     };
     try {
-        const res = await fetch('/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(currentConfig)
-        });
-        if (res.ok) {
+        const result = await saveCurrentConfig();
+        if (result.ok) {
             updateModelPillDisplay();
             renderFilteredModels(true);
             showSettingsFeedback('✓ Orchestrator & subagent settings saved');
-        } else {
-            showSettingsFeedback(`✕ Failed to save orchestrator config (HTTP ${res.status})`, true);
         }
     } catch (e) {
         showSettingsFeedback(`✕ Save failed: ${e.message}`, true);
@@ -9780,11 +9799,7 @@ async function applyConversationConfig(sess) {
     renderFilteredModels(true);
     renderConfiguredProviders();
     if (changed) {
-        fetch('/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(currentConfig)
-        });
+        persistCurrentConfigInBackground();
     }
 }
 
@@ -9856,11 +9871,7 @@ async function applyProjectDefaults(project) {
         syncOrchestratorControls();
         renderFilteredModels(true);
         renderConfiguredProviders();
-        await fetch('/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(currentConfig)
-        });
+        persistCurrentConfigInBackground();
     }
 }
 
@@ -10216,12 +10227,8 @@ async function saveConfig() {
     };
 
     try {
-        const res = await fetch('/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(currentConfig)
-        });
-        if (res.ok) {
+        const result = await saveCurrentConfig();
+        if (result.ok) {
             if (labelActiveModel && currentConfig.model) {
                 labelActiveModel.textContent = currentConfig.model.split('/').pop();
             }
@@ -10230,8 +10237,6 @@ async function saveConfig() {
             syncModelContextWindowIfAuto(currentConfig.model || '');
             renderFilteredModels();
             showSettingsFeedback('✓ Memory & runtime settings saved');
-        } else {
-            showSettingsFeedback(`✕ Save failed (HTTP ${res.status})`, true);
         }
     } catch (e) {
         showSettingsFeedback(`✕ Failed to save config: ${e.message}`, true);
@@ -10283,16 +10288,10 @@ async function savePermissions() {
     };
 
     try {
-        const res = await fetch('/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(currentConfig)
-        });
-        if (res.ok) {
+        const result = await saveCurrentConfig();
+        if (result.ok) {
             setPermissionMode(globalMode);
             showSettingsFeedback('✓ Tool permissions saved');
-        } else {
-            showSettingsFeedback(`✕ Failed to save permissions (HTTP ${res.status})`, true);
         }
     } catch (e) {
         showSettingsFeedback(`✕ Failed to save permissions: ${e.message}`, true);
@@ -11336,7 +11335,7 @@ function renderMarkdown(md) {
                     <div class="code-block-card">
                         <div class="code-block-header">
                             <span class="code-lang">${langLabel}</span>
-                            <button type="button" class="code-btn-action" onclick="copyCodeBlock(this)">Copy</button>
+                            <button type="button" class="code-btn-action" data-copy-code="1">Copy</button>
                         </div>
                         <pre class="code-block-body" style="margin: 0;"><code class="code-inner">${codeEscaped}</code></pre>
                     </div>
@@ -11449,7 +11448,7 @@ function renderMarkdown(md) {
             <div class="code-block-card">
                 <div class="code-block-header">
                     <span class="code-lang">${langLabel}</span>
-                    <button type="button" class="code-btn-action" onclick="copyCodeBlock(this)">Copy</button>
+                    <button type="button" class="code-btn-action" data-copy-code="1">Copy</button>
                 </div>
                 <pre class="code-block-body" style="margin: 0;"><code class="code-inner">${codeEscaped}</code></pre>
             </div>
@@ -11482,7 +11481,7 @@ function formatInline(text) {
     res = res.replace(/`([^`]+)`/g, (match, p1) => {
         const clean = p1.trim();
         if (/^(?:[\w.-]+[\\/])+[\w.-]+\.\w+$|^[\w-]+\.(?:rs|toml|lock|json|md|html|css|js|ts|py|sh|yaml|yml)$/.test(clean)) {
-            return hold(`<span class="md-path-link" title="Click to copy path" data-copy-path="${clean}" onclick="copyPath(this)">${fileIconSvg}<span>${clean}</span></span>`);
+            return hold(`<span class="md-path-link" title="Click to copy path" data-copy-path="${clean}">${fileIconSvg}<span>${clean}</span></span>`);
         }
         return hold(`<code>${p1}</code>`);
     });
@@ -11497,7 +11496,7 @@ function formatInline(text) {
 
     res = res.replace(/(^|[\s(])((?:[a-zA-Z0-9_\-.]+[\\/])+[a-zA-Z0-9_\-.]+\.[a-zA-Z0-9_]+|[a-zA-Z0-9_\-.]+\.(?:rs|toml|lock|json|md|html|css|js|ts|py|sh|yaml|yml))(?=[.,;:)]?(?:\s|$))/g,
         (match, pre, pathStr) => {
-            return `${pre}${hold(`<span class="md-path-link" title="Click to copy path" data-copy-path="${pathStr}" onclick="copyPath(this)">${fileIconSvg}<span>${pathStr}</span></span>`)}`;
+            return `${pre}${hold(`<span class="md-path-link" title="Click to copy path" data-copy-path="${pathStr}">${fileIconSvg}<span>${pathStr}</span></span>`)}`;
         });
 
     res = res.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
@@ -12108,14 +12107,10 @@ async function onboardingNext() {
             currentConfig.api_key = key;
             if (model) currentConfig.model = model;
             try {
-                const res = await fetch('/api/config', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(currentConfig)
-                });
-                if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
-                currentConfig = await res.json();
-                if (status) { status.textContent = 'Provider saved.'; status.style.color = '#3fb950'; }
+                const result = await saveCurrentConfig();
+                if (result.ok) {
+                    if (status) { status.textContent = 'Provider saved.'; status.style.color = '#3fb950'; }
+                }
             } catch (e) {
                 if (status) { status.textContent = 'Could not save provider: ' + e.message; status.style.color = '#f85149'; }
                 return; // stay on this step so the user can fix it
@@ -12324,6 +12319,58 @@ function createFolderIn(parentPath) {
 document.addEventListener('click', closeBrowserContextMenu);
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeBrowserContextMenu(); });
 window.addEventListener('blur', closeBrowserContextMenu);
+
+// ==========================================================================
+// Delegated handlers for dynamically rendered markup
+//
+// Every button the app renders through `innerHTML` is wired here with data
+// attributes instead of inline event-handler attributes. That is what lets the
+// page ship with a `script-src 'self'` CSP (no 'unsafe-inline'): an injected
+// inline script or handler attribute no longer executes. The attributes are
+// per-element and cannot carry markup, so this is not a weaker wiring - it is
+// the same call with the payload out of the HTML.
+// ==========================================================================
+document.addEventListener('click', (ev) => {
+    const permBtn = ev.target.closest?.('[data-perm-id]');
+    if (permBtn) {
+        const permId = permBtn.getAttribute('data-perm-id');
+        const approved = permBtn.getAttribute('data-perm-approved') === '1';
+        const always = permBtn.getAttribute('data-perm-always') === '1';
+        decidePermission(permId, approved, always);
+        return;
+    }
+    const mcpBtn = ev.target.closest?.('[data-mcp-action]');
+    if (mcpBtn) {
+        const action = mcpBtn.getAttribute('data-mcp-action');
+        const id = mcpBtn.getAttribute('data-mcp-id');
+        if (action === 'test') testMcpServer(id);
+        else if (action === 'edit') editMcpServer(id);
+        else if (action === 'delete') deleteMcpServer(id);
+        return;
+    }
+    const copyBtn = ev.target.closest?.('[data-copy-code]');
+    if (copyBtn) {
+        copyCodeBlock(copyBtn);
+        return;
+    }
+    const pathLink = ev.target.closest?.('[data-copy-path]');
+    if (pathLink) {
+        copyPath(pathLink);
+        return;
+    }
+    const presetBtn = ev.target.closest?.('button[data-preset]');
+    if (presetBtn && typeof applyProviderPreset === 'function') {
+        const preset = presetBtn.getAttribute('data-preset');
+        if (preset) applyProviderPreset(preset);
+    }
+});
+
+document.addEventListener('change', (ev) => {
+    const toggle = ev.target.closest?.('[data-mcp-toggle]');
+    if (toggle) {
+        toggleMcpServer(toggle.getAttribute('data-mcp-toggle'), toggle.checked);
+    }
+});
 // ==========================================================================
 // Project context menu (right-click a project in the sidebar)
 // ==========================================================================

@@ -40,27 +40,68 @@ pub struct QueuedPrompt {
 /// Allocate a conversation id that cannot collide with one already in use.
 ///
 /// `ses_{unix_ms}` is not unique: two browser tabs (or a double-clicked
-/// "New Conversation") can mint the same millisecond, and the second writer
-/// silently overwrote the first conversation. Retry with a suffix instead.
+/// "New Conversation") can mint the same millisecond. The id must therefore be
+/// **reserved** while the `sessions` write lock is held - a check-then-return
+/// leaves the insert (`create_session_with_options`) unguarded, and two creators
+/// that passed the check in the same millisecond would both insert, the second
+/// destroying the first conversation (the persist path DELETEs and re-inserts
+/// the id's rows). Returning an already-reserved id is impossible.
 pub async fn unique_session_id(state: &AppState) -> String {
     let base = format!("ses_{}", chrono::Utc::now().timestamp_millis());
     let mut candidate = base.clone();
-    let mut attempt = 0;
+    let mut attempt = 0u32;
     loop {
+        // Take the write lock for the whole check-and-reserve so no other
+        // creator can observe (or claim) the same id between the two steps.
+        let mut sessions = state.sessions.write().await;
         let recently_deleted = {
             let deleted = state.recently_deleted_sessions.lock().await;
             should_skip_resurrect(&deleted, &candidate)
         };
-        let taken = state.sessions.read().await.contains_key(&candidate) || recently_deleted;
-        if !taken {
+        if !sessions.contains_key(&candidate) && !recently_deleted {
+            // Reserve it with a placeholder so the next caller cannot take it.
+            sessions.insert(candidate.clone(), reserved_session_placeholder(&candidate));
+            drop(sessions);
             return candidate;
         }
+        drop(sessions);
         attempt += 1;
         if attempt > 64 {
-            // Paranoia fallback: a monotonic counter can always make progress.
-            return format!("{base}-{attempt}");
+            // Paranoia fallback: a random tail always makes progress.
+            return format!("{base}-{:x}", rand::random::<u32>());
         }
         candidate = format!("{base}-{attempt}");
+    }
+}
+
+/// Stand-in row for an id that has been allocated but not yet built.
+///
+/// `create_session_with_options` overwrites the placeholder with the real
+/// session; it is only ever visible to a concurrent `unique_session_id` call,
+/// which treats any existing key as "taken".
+fn reserved_session_placeholder(id: &str) -> crate::state::SessionState {
+    let (tx, _rx) = tokio::sync::broadcast::channel(1);
+    crate::state::SessionState {
+        id: id.to_string(),
+        project_id: String::new(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        task: String::new(),
+        status: "reserved".to_string(),
+        model: String::new(),
+        provider_id: String::new(),
+        reasoning_effort: String::new(),
+        server_id: String::new(),
+        orchestrator_mode: false,
+        event_tx: tx,
+        history: Vec::new(),
+        cancel_notify: Arc::new(tokio::sync::Notify::new()),
+        swarm: crate::engine::swarm::SwarmBoard::new(),
+        llm_messages: Vec::new(),
+        checkpoints: Vec::new(),
+        next_turn_id: 0,
+        queued_prompts: VecDeque::new(),
+        steer_inbox: Arc::new(Mutex::new(VecDeque::<String>::new())),
     }
 }
 
@@ -618,6 +659,25 @@ if !saved_conf.onboarded {
         }
     }
 
+    /// Bump the server-owned config revision and return the new value.
+    ///
+    /// EVERY handler that mutates the config row calls this, so a stale
+    /// `POST /api/config` snapshot can be detected and rejected instead of
+    /// silently reverting the change (the active provider, MCP servers,
+    /// automations, skills, the active server, ...).
+    ///
+    /// Must not be called while already holding the config write lock.
+    pub async fn bump_config_revision(&self) -> u64 {
+        let mut conf = self.config.write().await;
+        conf.config_revision = conf.config_revision.saturating_add(1);
+        conf.config_revision
+    }
+
+    /// Current value of the config revision.
+    pub async fn config_revision(&self) -> u64 {
+        self.config.read().await.config_revision
+    }
+
     pub async fn persist_config(&self) {
         let Some(ref db) = self.db else { return };
         // Hold the config write lock across snapshot + write so two concurrent persists cannot
@@ -961,8 +1021,16 @@ if !saved_conf.onboarded {
                     lock.remove(&victim);
                     let mut boards = self.swarm_boards.write().await;
                     boards.remove(&victim);
+                    // The eviction maps are per-session: drop them too, or the
+                    // 100-session cap would leak them forever.
+                    drop(boards);
+                    self.forget_session_scoped_state(&victim).await;
                 }
             }
+            // `insert` (not `entry().or_insert()`): the id may be the placeholder
+            // reserved by `unique_session_id`, which this call now replaces. A
+            // second creator holding the same id must not be able to overwrite a
+            // live session, which is why the reservation exists.
             lock.insert(id.clone(), state);
         }
         self.persist_session_record(&id).await;
@@ -1276,6 +1344,16 @@ if !saved_conf.onboarded {
             .get(session_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Drop every per-session map entry for `session_id`.
+    ///
+    /// Called on delete AND on LRU eviction: without the eviction call, the
+    /// allowlist/grant/notice maps grow one entry per session forever and the
+    /// 100-session memory cap buys nothing.
+    pub async fn forget_session_scoped_state(&self, session_id: &str) {
+        self.clear_tool_allowlist(session_id).await;
+        self.clear_session_path_grants(session_id).await;
     }
 
     /// Drop a session's granted folders (e.g. on delete).

@@ -819,6 +819,18 @@ pub struct HarnessConfig {
     /// auto-install the same release twice in a row).
     #[serde(default)]
     pub last_auto_update_target: String,
+    /// Monotonic revision of the config row, bumped by every endpoint that
+    /// mutates it (`activate_provider`, `save_mcp_server`, `save_server`,
+    /// `set_active_server`, `save_automation`, `save_skill`, the path-access
+    /// grant, ...). `POST /api/config` submits the *whole* config as a snapshot,
+    /// so without this counter a stale snapshot silently reverted whatever those
+    /// endpoints had just changed. A payload carrying an older revision than the
+    /// stored one is rejected with `409 Conflict` instead.
+    ///
+    /// Server-owned: `merge_config_update` always keeps the stored value, so a
+    /// client can never rewind it.
+    #[serde(default)]
+    pub config_revision: u64,
 }
 
 
@@ -912,6 +924,7 @@ impl Default for HarnessConfig {
             extra_access_roots: Vec::new(),
             last_auto_update_target: String::new(),
             onboarded: false,
+            config_revision: 0,
         }
     }
 }

@@ -211,3 +211,185 @@ with a literal pattern check, then `cargo test`, then a live browser/API check.
 4. First-run wizard: a "test key" step, focus management, and Escape.
 5. Stop-failure feedback (the pill stays green when the stop 404s).
 6. Red-team and functional-QA reports are still outstanding.
+---
+
+## Round 5 red-team report (applied next round - CRITICAL first)
+
+Red-team pass on v1.1.4 found 7 issues, 2 of them severe. **All are still OPEN.**
+
+### CRITICAL 1 - the AES master key is readable over the API
+`GET /api/workspace/file?path=harness.key` returns **200** with the 32 raw key bytes
+in `content`, and `/api/workspace/tree` lists `harness.key` and `harness.db`.
+On a default install the DB and its key live INSIDE `sandbox_root`, so key +
+ciphertext are both reachable by anything that can call the API: an agent turn, a
+local process, or a rebound page. The folder *picker* filters these names
+(`is_sensitive_picker_entry`) but the workspace explorer never applies it.
+Cause: `src/web/handlers.rs` `get_workspace_tree` / `get_workspace_file`.
+Fix: apply the same filter (and don't rely on the exact name).
+
+### HIGH 2 - the DNS-rebinding guard is defeated by a prefix match
+`Host: 127.0.0.1.evil.com` and `Host: 127.evil.com` are both **accepted**; only
+`evil.example.com` and `0.0.0.0` are rejected. Cause: `src/web/security.rs`
+`h.starts_with("127.")`. An attacker publishes `127.0.0.1.rb.attacker.com` ->
+127.0.0.1, the browser treats the harness as same-origin, and every JSON endpoint
+becomes readable/writable with no CORS in play. The identical bug is in
+`src/remote.rs` `ensure_secure_transport`, where it additionally means the full
+config **including provider API keys** would be POSTed in plaintext to an
+attacker host.
+Fix: parse the host and require an exact loopback IP / `localhost` / `[::1]`.
+
+### HIGH 3 - a no-token install gives full control via one rebinding POST
+`POST /api/config` with `permissions.mode: yolo` +
+`extra_access_roots: ["C:\\Windows","C:\\Users"]` + an attacker `update_repo` is
+accepted and persisted, and the updater then exe-swaps to the attacker's binary
+(updater.rs `apply_and_restart`). That is RCE-by-config.
+Fix: treat `extra_access_roots` and `update_repo` as server-owned, like
+`projects` / `sandbox_root` / `onboarded`.
+
+### HIGH 4 - rotating the auth token has no effect until restart
+`POST /api/config` with a new `auth_token` returns 200, but the old token keeps
+working and `/api/security/status` still reports `auth_enabled: true`. A leaked
+token is valid forever. Cause: `src/web/mod.rs` builds `HttpSecurity` once.
+
+### MEDIUM 5 - `?token=` is accepted on every endpoint, not only SSE
+`GET`/`POST /api/config?token=...` returns 200, so the token lands in URLs.
+
+### MEDIUM 6 - the updater installs **unsigned** binaries when `SHA256SUMS` is absent
+The digest check is inside `if let Some(sums_asset)`, so a release without
+checksums (or a redirect on the asset URL) is installed and executed with no
+signature check anywhere. `POST /api/update/apply` needs no second approval.
+
+### LOW 7 - CSP has `script-src 'unsafe-inline'`, no `Permissions-Policy`, and a
+renamed copy of `harness.key` is still listed by the picker.
+
+### Held up (verified rejected)
+Path traversal in `read_file`/`write_file` (`..`, `..\..`, `....//`, absolute,
+`C:x`, UNC, `\\?\`, `CON`, ADS, trailing dot) -> "Path traversal is not allowed";
+`/api/artifacts/*` traversal; markdown/`innerHTML` escaping; `javascript:` links;
+`manage_tools` cannot overwrite builtins; a custom tool declaring `read_only`
+with a shell runner is rejected; single-quoted shell templates; permission `Ask`
+fails closed after 3 denials; intervals under 60s and bad cron rejected;
+`Authorization` without `Bearer` -> 401.
+**Not attempted**: prompt injection through the real model (no turn executed).
+---
+
+## Round 5 read-only code review - some SHIPPED FIXES ARE WRONG. Top priority.
+
+No deadlocks found. But three of the round-4/5 fixes do not work as claimed, and
+there are two unbounded leaks. **All OPEN, ordered by severity.**
+
+### WRONG-1 (CRITICAL, data loss) - `unique_session_id` is still check-then-act
+`state.rs` checks `sessions.contains_key` (line ~54) with awaits between the check
+and the insert (`create_session_with_options` ~966), and **`create` has no
+`contains_key` guard while `fork` does (~1735)**. Two creators in the same
+millisecond both pass the check; the second insert REPLACES the first
+`SessionState`, and `persist_session_record` DELETEs + reinserts the id's rows
+(`db.rs:707`), destroying the first conversation. **The exact bug it claims to
+close is still live.** Fix: reserve the id INSIDE the `sessions.write()` guard.
+
+### WRONG-2 (HIGH) - `session_path_grants` is recorded and never honoured
+The only reader `session_path_grants()` (`state.rs:1272`) is called by NOTHING.
+Tool roots come from `loop_runner.rs:593-608` = `resolve_session_roots` +
+`config.extra_access_roots` only. So `request_path_access` returns
+`{"status":"granted"}` (`path_access_tool.rs:167`) and the very next `read_file`
+still fails with "absolute path outside project folders" (`file_ops.rs:112`).
+The security claim is untestable as written. Fix: fold `session_path_grants` into
+the roots the runner computes.
+
+### WRONG-3 (HIGH, security) - the `extra_access_roots` forwarding re-opens the hole
+The server overrides only `sandbox_root` (`handlers.rs:3244`) while
+`run_conf = payload.config.clone()` (`3242`) still carries the client's
+`extra_access_roots`, which `loop_runner.rs:602` folds into `sandbox_roots` -
+the very list `file_ops.rs:80-90` enforces. A client sending
+`extra_access_roots: ["C:\\"]` gets full server filesystem access.
+Fix: rebuild the roots server-side from the server's own projects/sandbox.
+
+### WRONG-4 (MEDIUM) - always-allow is one-shot on remote sessions
+`permission_tool_for` (`handlers.rs:737`) returns `None` for a remote perm id
+(the waiter lives on the server), so the client records no allowlist entry; the
+forward happens once and the next identical call prompts again - the original
+bug, still live on multi-server setups.
+
+### WRONG-5 (MEDIUM) - the permission counter is per model round-trip, not per turn
+Initialised at `loop_runner.rs:912` INSIDE the outer loop (line 628). 4+ denials
+in one batch aborts, but 3 denials in each of 40 rounds never aborts and burns 40
+model calls. Fix: hoist it to the turn scope.
+
+### WRONG-6 (MEDIUM) - a load failure permanently destroys history
+`state.rs:726` `db.load_events(id).unwrap_or_default()` turns a read failure into
+an empty history, and because `persist_session_record` DELETEs + reinserts
+(`db.rs:707`), that empty history is written back on the next persist.
+Fix: fail closed - if the load fails, do not persist over it.
+
+### LEAK-1 (HIGH) - `server_runs` is never cleaned up
+Inserted at `handlers.rs:3218`, **no removal path exists anywhere**. Each finished
+run keeps `history` up to 2000 events plus a 256-slot broadcast sender:
+~2-4 MB per run, ~100-150 MB/day on a cluster that dispatches subagents remotely.
+
+### LEAK-2 (HIGH) - `swarm_boards` leaks one board per automation/server run id
+`get_or_create_swarm` is called with the RUN id for every automation run
+(`loop_runner.rs:577`) and every server run (`handlers.rs:3237`); only
+session-keyed boards are removed. An AlwaysOn automation on the 30s tick
+(`automation_runner.rs:585`) creates up to 2880 orphan boards/day.
+
+### LEAK-3 (MEDIUM) - the new session maps are unbounded
+`session_tool_allowlist` / `session_tool_allow_noted` / `session_path_grants` are
+cleared only in `delete_session`, never on LRU eviction (`state.rs:951-965`) and
+never for automation run ids (which use the run id as `session_id`).
+Also: `remote_perm_routes` leaks when a run is stopped before its decision
+arrives, and SwarmBoard `subagents` (`swarm.rs:511`) has no remove path anywhere.
+
+### Swallowed errors that matter
+- `handlers.rs:2175/2387/2443/3084/3111` `let _ = db.upsert_project/delete_project/...`:
+  create/update/delete answer 200 while the DB write failed, so the project
+  resurrects or vanishes on restart, silently.
+- `handlers.rs:709` `to_string(&event).unwrap_or_default()` - an unserializable
+  event ships as an empty SSE frame; the browser's `JSON.parse("")` throws.
+- `handlers.rs:2788/2816` `let _ = state.ensure_session_loaded(..)` - undo answers
+  a misleading 404 and fork forks an empty conversation.
+- `state.rs:578` `Ok(Err(_))` discards the model error, so a failed turn persists
+  no cause.
+
+### Tests that must exist (none do yet)
+1. `path_grants_are_honoured_by_file_tools` - Safe mode, approved temp dir outside
+   the project, then `read_file` on it. **Currently fails** (see WRONG-2).
+2. `concurrent_creates_in_one_millisecond_keep_both_sessions` - two tasks, both
+   call `unique_session_id` then create without yielding the id. **Currently
+   fails** (see WRONG-1).
+3. `evicting_a_session_drops_allowlist_and_grants` - force eviction past 100.
+4. `stop_during_permission_wait_clears_the_waiter`.
+5. `completed_server_runs_are_dropped_from_server_runs`.
+6. The HTTP permission-decision path (`POST /api/permissions/{id}/decision`) is
+   untested - `test_permission_always_allow_is_honored_and_cleared` never calls it.
+
+### Verified correct
+No deadlock anywhere (lock ordering is consistent; the only nested acquisition is
+`ensure_session_loaded`, one line away from an inversion). `persist_session_record`
+and `persist_config` hold their guards over *blocking* SQLite I/O with
+`busy_timeout=5000`, which is a latency problem, not a deadlock. Cron DOW fix is
+correct. Mock-mode follow is correct.
+---
+
+## Round 6 in-flight status (2026-11-28, agents still running)
+
+### config_revision - IMPLEMENTED, 4 integration tests now failing (expected mid-work)
+`bump_config_revision()` added to `AppState`; `update_config` rejects a snapshot
+older than the stored revision with 409 (`handlers.rs:974`); `merge_config_update`
+takes the revision from `existing` so a client cannot rewind it. Unit tests for it
+pass (`config_revision` tests around handlers.rs:1013-1079).
+**Four integration tests fail with `reqwest::Error { kind: Decode, "expected value" }`**
+because they POST a config snapshot and `.json()` the response, and now get a
+409 with a non-JSON body:
+- `test_display_verbosity_default_and_config_normalization`
+- `test_send_mode_default_and_config_normalization`
+- `test_auto_context_window_detection_and_smart_compaction`
+- `test_unlimited_autonomous_turns_and_max_tool_retries_default`
+**Required to land with it** (whoever finishes this): make `update_config` answer a
+409 with a JSON error body, and update those four tests to either read the current
+revision first or assert the 409. Until then the suite is NOT green.
+
+### Coordination note
+Follow-up messages to running subagents are being truncated by the harness
+(`sessionID` arrives as `ses`), so running agents cannot be redirected. Protocol
+records this as a known limitation: do not start two source-editing agents in the
+same round, because they cannot be told to change scope.

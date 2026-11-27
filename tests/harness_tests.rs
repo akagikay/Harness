@@ -2256,6 +2256,8 @@ async fn test_display_verbosity_default_and_config_normalization() {
     assert_eq!(updated_verbose["display_verbosity"], "verbose");
 
     // POST /api/config normalizes invalid verbosity back to "compact"
+    // (refresh the snapshot first: an accepted save advances `config_revision`)
+    cfg_json = updated_verbose;
     cfg_json["display_verbosity"] = json!("noisy_invalid");
     let updated_invalid: Value = client
         .post(format!("{}/api/config", base))
@@ -2333,6 +2335,7 @@ async fn test_send_mode_default_and_config_normalization() {
     assert_eq!(updated_steer["send_mode"], "steer");
     assert_eq!(updated_steer["voice_activity_detection"], true);
 
+    cfg_json = updated_steer;
     cfg_json["send_mode"] = json!("invalid_mode");
     let updated_invalid: Value = client
         .post(format!("{}/api/config", base))
@@ -2979,6 +2982,7 @@ async fn test_unlimited_autonomous_turns_and_max_tool_retries_default() {
         .unwrap();
     assert_eq!(updated_7["memory"]["max_tool_retries"], 7);
 
+    cfg_json = updated_7;
     cfg_json["memory"]["max_tool_retries"] = json!(99);
     let updated_clamped: Value = client
         .post(format!("{}/api/config", base))
@@ -3068,6 +3072,7 @@ async fn test_auto_context_window_detection_and_smart_compaction() {
     assert_eq!(after_claude["memory"]["max_context_tokens"], 200_000);
 
     // Disabling auto_detect_context preserves manual max_context_tokens
+    cfg_json = after_claude;
     cfg_json["memory"]["auto_detect_context"] = json!(false);
     cfg_json["memory"]["max_context_tokens"] = json!(65_536);
     let after_manual: Value = client
@@ -5697,6 +5702,99 @@ async fn test_config_secrets_are_redacted_and_preserved_on_repost() {
 }
 
 #[tokio::test]
+async fn test_stale_config_snapshot_returns_409_and_changes_nothing() {
+    // The single highest-protection test in the project: a stale
+    // `POST /api/config` must be REFUSED, not silently revert what another
+    // endpoint just wrote (active server, provider, MCP servers, automations,
+    // skills).
+    let temp_dir = std::env::temp_dir().join(format!("harness-rev-409-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let mut config = HarnessConfig::default();
+    config.sandbox_root = temp_dir.clone();
+    config.auth_token = String::new();
+    let state = AppState::new(config);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", addr);
+
+    // 1. Snapshot the config the way the Settings page does when it opens.
+    let snapshot: Value = client
+        .get(format!("{}/api/config", base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(snapshot["config_revision"], 0);
+
+    // 2. Another client bumps the revision through a config-mutating endpoint
+    //    (a second server is saved and made active -> the exact revert class).
+    let save_srv = client
+        .post(format!("{}/api/servers", base))
+        .json(&json!({
+            "id": "srv-rev",
+            "name": "Revision Server",
+            "url": "http://127.0.0.1:9",
+            "is_default": true,
+            "enabled": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(save_srv.status(), 200, "{:?}", save_srv.text().await);
+    assert_eq!(state.config.read().await.config_revision, 1);
+
+    // 3. The stale Settings snapshot now tries to save: must be 409.
+    let mut stale = snapshot.clone();
+    stale["display_verbosity"] = json!("verbose");
+    let resp = client
+        .post(format!("{}/api/config", base))
+        .json(&stale)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.to_lowercase().contains("revision") || body.to_lowercase().contains("changed"),
+        "the 409 must explain itself: {body}"
+    );
+
+    // 4. Nothing was reverted: the new server is still the active one, the
+    //    revision did not move, and the rejected edit is not in the config.
+    let after: Value = client
+        .get(format!("{}/api/config", base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["config_revision"], 1, "a rejected write must not consume the revision");
+    assert_eq!(after["active_server_id"], "srv-rev", "the stale write must not revert the active server");
+    assert_eq!(after["display_verbosity"], "compact", "the rejected edit must not land");
+
+    // 5. A fresh snapshot (the revision the server just handed out) is accepted.
+    let accept = client
+        .post(format!("{}/api/config", base))
+        .json(&after)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accept.status(), 200);
+    let saved: Value = accept.json().await.unwrap();
+    assert_eq!(saved["config_revision"], 2, "an accepted save advances the revision");
+
+    srv.abort();
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
 async fn test_auth_token_required_when_configured() {
     let temp_dir = std::env::temp_dir().join(format!("harness-sec-auth-{}", std::process::id()));
     std::fs::create_dir_all(&temp_dir).unwrap();
@@ -6938,3 +7036,449 @@ async fn test_many_approved_permissions_do_not_abort_the_turn() {
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
+// ============================================================================
+// Round 5 red-team regressions (security fixes)
+// ============================================================================
+
+/// The AES master key, the encrypted credential DB and a *renamed* copy all
+/// live inside `sandbox_root` on a default install, so the workspace explorer
+/// must apply the same denylist the folder picker uses. It never did: reading
+/// `harness.key` over the API handed out the key that decrypts every stored
+/// provider API key.
+#[tokio::test]
+async fn test_workspace_explorer_never_serves_the_master_key() {
+    let temp_dir = std::env::temp_dir().join(format!("harness-ws-key-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    std::fs::write(temp_dir.join("harness.key"), [0x5au8; 32]).unwrap();
+    std::fs::write(temp_dir.join("key-copy.key"), [0x11u8; 32]).unwrap();
+    std::fs::write(temp_dir.join("harness.db"), b"SQLite format 3\0").unwrap();
+    std::fs::write(temp_dir.join("notes.txt"), "hello workspace").unwrap();
+
+    let mut config = HarnessConfig::default();
+    config.sandbox_root = temp_dir.clone();
+    config.host = "127.0.0.1".to_string();
+    config.auth_token = String::new();
+    let state = AppState::new(config);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", addr);
+
+    // 1) The tree lists the ordinary file and NONE of the secrets.
+    let tree: Value = client
+        .get(format!("{base}/api/workspace/tree"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: Vec<String> = tree["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "notes.txt"),
+        "an ordinary file must stay listed: {names:?}"
+    );
+    for secret in ["harness.key", "key-copy.key", "harness.db"] {
+        assert!(
+            !names.iter().any(|n| n == secret),
+            "the workspace tree must not list {secret}: {names:?}"
+        );
+    }
+
+    // 2) Reading any of them is refused (not just hidden from the listing).
+    for secret in ["harness.key", "key-copy.key", "harness.db"] {
+        let resp = client
+            .get(format!("{base}/api/workspace/file"))
+            .query(&[("path", secret)])
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            200,
+            "{secret} must not be readable through the workspace explorer"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(
+            !body.contains("SQLite format"),
+            "no file content may come back for {secret}: {body}"
+        );
+    }
+
+    // 3) An ordinary file is still readable.
+    let ok = client
+        .get(format!("{base}/api/workspace/file?path=notes.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200, "an ordinary workspace file must still open");
+    let file: Value = ok.json().await.unwrap();
+    assert_eq!(file["content"], "hello workspace");
+
+    srv.abort();
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// The DNS-rebinding guard must parse the `Host` header, not match a string
+/// prefix: `127.0.0.1.evil.com` starts with `127.` and is exactly the shape of
+/// a rebinding attack.
+#[tokio::test]
+async fn test_dns_rebinding_prefix_lookalike_hosts_are_rejected() {
+    let temp_dir = std::env::temp_dir().join(format!("harness-sec-host2-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let mut config = HarnessConfig::default();
+    config.sandbox_root = temp_dir.clone();
+    config.host = "127.0.0.1".to_string();
+    config.auth_token = String::new();
+    let state = AppState::new(config);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+
+    // Real loopback names are accepted.
+    for host in ["127.0.0.1", "localhost", "[::1]", "127.0.0.1:8080"] {
+        let resp = client
+            .get(format!("http://{}/api/config", addr))
+            .header("Host", host)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{host} is loopback and must be accepted");
+    }
+    // Lookalike prefixes are refused.
+    for host in [
+        "127.0.0.1.evil.com",
+        "127.evil.com",
+        "0.0.0.1.evil.com",
+        "localhost.evil.com",
+        "0.0.0.0",
+    ] {
+        let resp = client
+            .get(format!("http://{}/api/config", addr))
+            .header("Host", host)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{host} must be rejected as a rebinding attempt");
+    }
+
+    srv.abort();
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// The same prefix bug in `ensure_secure_transport` would POST the whole config
+/// (provider API keys included) in plaintext to an attacker host.
+#[tokio::test]
+async fn test_remote_dispatch_rejects_plaintext_prefix_lookalikes() {
+    use deepseek_harness_rs::config::ServerNodeConfig;
+    use deepseek_harness_rs::remote::ensure_secure_transport;
+
+    let node = |url: &str| ServerNodeConfig {
+        id: "srv".into(),
+        name: "Srv".into(),
+        url: url.into(),
+        api_token: String::new(),
+        is_default: false,
+        enabled: true,
+    };
+
+    for ok_url in [
+        "https://example.com:8443",
+        "local://alpha",
+        "http://127.0.0.1:8080",
+        "http://localhost",
+        "http://[::1]:9000",
+    ] {
+        assert!(
+            ensure_secure_transport(&node(ok_url)).is_ok(),
+            "{ok_url} must be allowed"
+        );
+    }
+    for bad_url in [
+        "http://127.0.0.1.evil.com",
+        "http://127.evil.com",
+        "http://0.0.0.1.evil.com",
+        "http://example.com",
+        "http://localhost.evil.com",
+    ] {
+        assert!(
+            ensure_secure_transport(&node(bad_url)).is_err(),
+            "{bad_url} must be refused over plaintext"
+        );
+    }
+}
+
+/// A no-token install gives full control to anything that can reach it, and a
+/// rebound page can widen the sandbox for every future run and repoint the
+/// updater at an attacker repo (which exe-swaps to their binary). Both fields
+/// are server-owned, like `projects` / `sandbox_root` / `onboarded`.
+#[tokio::test]
+async fn test_config_post_cannot_widen_the_sandbox_or_the_update_repo() {
+    let temp_dir = std::env::temp_dir().join(format!("harness-sec-cfg-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let mut config = HarnessConfig::default();
+    config.sandbox_root = temp_dir.clone();
+    config.auth_token = String::new();
+    config.update_repo = "akagikay/Harness".to_string();
+    config.extra_access_roots = vec![std::path::PathBuf::from("C:\\approved-root")];
+    let state = AppState::new(config);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", addr);
+
+    let snapshot: Value = client
+        .get(format!("{base}/api/config"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // A rebound page (or a hostile client) tries to escalate.
+    let mut attack = snapshot.clone();
+    attack["extra_access_roots"] = json!(["C:\\Windows", "C:\\Users"]);
+    attack["update_repo"] = json!("attacker/EvilRepo");
+    attack["display_verbosity"] = json!("verbose");
+    let resp = client
+        .post(format!("{base}/api/config"))
+        .json(&attack)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    {
+        let stored = state.config.read().await;
+        assert_eq!(
+            stored.extra_access_roots,
+            vec![std::path::PathBuf::from("C:\\approved-root")],
+            "a config POST must not widen the sandbox"
+        );
+        assert_eq!(
+            stored.update_repo, "akagikay/Harness",
+            "a config POST must not repoint the updater"
+        );
+        // An unrelated, user-owned setting still lands.
+        assert_eq!(stored.display_verbosity, "verbose");
+    }
+
+    srv.abort();
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// A rotated token must take effect immediately: `HttpSecurity` used to be built
+/// once at router construction, so a leaked (now rotated) token stayed valid
+/// until restart and `/api/security/status` reported a rotation that had not
+/// happened.
+#[tokio::test]
+async fn test_auth_token_rotation_takes_effect_immediately() {
+    let temp_dir = std::env::temp_dir().join(format!("harness-sec-rotate-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let mut config = HarnessConfig::default();
+    config.sandbox_root = temp_dir.clone();
+    config.host = "127.0.0.1".to_string();
+    config.auth_token = "leaked-token".to_string();
+    let state = AppState::new(config);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", addr);
+    let authed = |tok: &str| {
+        client
+            .get(format!("{base}/api/config"))
+            .header("Authorization", format!("Bearer {tok}"))
+    };
+
+    // Before: the leaked token works.
+    assert_eq!(authed("leaked-token").send().await.unwrap().status(), 200);
+
+    // Rotate through the API itself.
+    let snapshot: Value = authed("leaked-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut rotated = snapshot.clone();
+    rotated["auth_token"] = json!("fresh-token");
+    let resp = client
+        .post(format!("{base}/api/config"))
+        .header("Authorization", "Bearer leaked-token")
+        .json(&rotated)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+
+    // Immediately after: the old token is DEAD and the new one is required.
+    assert_eq!(
+        authed("leaked-token").send().await.unwrap().status(),
+        401,
+        "a rotated token must stop working at once"
+    );
+    assert_eq!(
+        authed("fresh-token").send().await.unwrap().status(),
+        200,
+        "the new token must work with no restart"
+    );
+    let status: Value = client
+        .get(format!("{base}/api/security/status"))
+        .header("Authorization", "Bearer fresh-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["auth_enabled"], json!(true));
+
+    srv.abort();
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// `?token=` is only for `EventSource` (which cannot set headers), so it must be
+/// honoured on the SSE routes and rejected everywhere else - otherwise the
+/// secret lands in URLs, history and proxy logs.
+#[tokio::test]
+async fn test_query_token_is_only_accepted_on_the_event_stream() {
+    let temp_dir = std::env::temp_dir().join(format!("harness-sec-qtok-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let mut config = HarnessConfig::default();
+    config.sandbox_root = temp_dir.clone();
+    config.host = "127.0.0.1".to_string();
+    config.auth_token = "qtok-123".to_string();
+    let state = AppState::new(config);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", addr);
+
+    // A JSON endpoint must not accept the token from the query string.
+    let resp = client
+        .get(format!("{base}/api/config?token=qtok-123"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "a query token must not authenticate /api/config");
+
+    // The SSE route must (EventSource cannot send headers).
+    let resp = client
+        .get(format!("{base}/api/sessions/nonexistent-session/events?token=qtok-123"))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        401,
+        "the event stream must accept a query token, got {}",
+        resp.status()
+    );
+
+    srv.abort();
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// The updater installs and executes whatever it downloads, so a release with
+/// no `SHA256SUMS` is an unsigned binary: refuse it instead of installing it.
+#[tokio::test]
+async fn test_updater_refuses_a_release_without_checksums() {
+    use deepseek_harness_rs::updater::{download_with_progress, ReleaseAsset, UpdateInfo};
+
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let digest = deepseek_harness_rs::crypto::sha256_hex(&payload);
+    let good_sums = format!("{digest}  harness.exe\n");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{}", addr);
+    let router = axum::Router::new()
+        .route(
+            "/release/harness.exe",
+            axum::routing::get({
+                let body = payload.clone();
+                move || async move { body }
+            }),
+        )
+        .route(
+            "/release/SHA256SUMS",
+            axum::routing::get({
+                let body = good_sums.clone();
+                move || async move { body }
+            }),
+        );
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let mk_info = |sums: Option<ReleaseAsset>| UpdateInfo {
+        current_version: "1.0.0".into(),
+        latest_version: "9.9.9".into(),
+        available: true,
+        html_url: String::new(),
+        notes: String::new(),
+        published_at: String::new(),
+        asset: Some(ReleaseAsset {
+            name: "harness.exe".into(),
+            url: format!("{base}/release/harness.exe"),
+            size: payload.len() as u64,
+        }),
+        checksums: sums,
+    };
+
+    let dest = std::env::temp_dir().join(format!("harness-upd-nosums-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dest);
+    std::fs::create_dir_all(&dest).unwrap();
+
+    // 1) No checksums asset at all -> refuse, and stage nothing.
+    let err = download_with_progress(&mk_info(None), &dest, |_, _| {})
+        .await
+        .expect_err("a release without SHA256SUMS must be refused")
+        .to_string();
+    assert!(
+        err.contains("SHA256SUMS") || err.contains("unverified"),
+        "the error must explain the refusal: {err}"
+    );
+    assert!(
+        !dest.join("harness.exe").exists(),
+        "an unverified binary must never be staged under its final name"
+    );
+    assert!(!dest.join("harness.exe.part").exists());
+
+    // 2) A matching digest still installs.
+    let sums = ReleaseAsset {
+        name: "SHA256SUMS".into(),
+        url: format!("{base}/release/SHA256SUMS"),
+        size: 0,
+    };
+    let path = download_with_progress(&mk_info(Some(sums)), &dest, |_, _| {})
+        .await
+        .expect("a verified download must succeed");
+    assert_eq!(std::fs::read(&path).unwrap(), payload);
+
+    srv.abort();
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+

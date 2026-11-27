@@ -82,13 +82,11 @@ pub fn ensure_secure_transport(server: &ServerNodeConfig) -> Result<(), String> 
         .split('/')
         .next()
         .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("");
-    let loopback = host == "localhost"
-        || host == "::1"
-        || host.starts_with("127.")
-        || host.starts_with("[::1]");
+        .to_string();
+    // Same parser as the web layer's rebinding guard: a host that merely starts
+    // with `127.` (`127.evil.com`) is not loopback, and this call carries the
+    // whole config - provider API keys included - in plaintext.
+    let loopback = crate::web::security::is_loopback_host(&host);
     if loopback {
         Ok(())
     } else {

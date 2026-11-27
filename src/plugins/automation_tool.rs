@@ -291,6 +291,7 @@ impl ToolPlugin for ManageAutomationsPlugin {
                         false
                     }
                 };
+                state.bump_config_revision().await;
                 state.persist_config().await;
                 Ok(serde_json::to_string_pretty(&json!({
                     "status": if replaced { "updated" } else { "created" },
@@ -328,6 +329,7 @@ impl ToolPlugin for ManageAutomationsPlugin {
                 if !found {
                     return Err(format!("Automation '{id}' not found."));
                 }
+                state.bump_config_revision().await;
                 state.persist_config().await;
                 Ok(json!({ "status": if want { "enabled" } else { "disabled" }, "id": id }).to_string())
             }
@@ -342,6 +344,7 @@ impl ToolPlugin for ManageAutomationsPlugin {
                 if !removed {
                     return Err(format!("Automation '{id}' not found."));
                 }
+                state.bump_config_revision().await;
                 state.persist_config().await;
                 Ok(json!({ "status": "removed", "id": id }).to_string())
             }
@@ -359,6 +362,7 @@ impl ToolPlugin for ManageAutomationsPlugin {
                     existing.clone()
                 };
                 crate::automation::validate(&updated)?;
+                state.bump_config_revision().await;
                 state.persist_config().await;
                 Ok(json!({
                     "status": "updated",
