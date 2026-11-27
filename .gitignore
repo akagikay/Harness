@@ -1,0 +1,16 @@
+/target
+/dist
+*.db
+*.db-wal
+*.db-shm
+harness.json
+.harness/
+.harness_artifacts/
+projects/
+*.log
+
+# Credential encryption key + update artifacts (never commit these)
+harness.key
+*.key
+*.old-*
+.env

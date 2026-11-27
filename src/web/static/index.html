@@ -1,0 +1,1906 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Harness — Agentic Workspace</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><polygon points='50,14 90,86 10,86' fill='%23ffffff'/></svg>">
+</head>
+<body class="dark-theme">
+    <div class="app-layout" id="app-layout">
+        <!-- 1. LEFT SIDEBAR -->
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <div class="sidebar-brand">
+                    <div class="brand-mark" title="Harness Agentic IDE">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                            <polygon points="12,3 22,20 2,20"></polygon>
+                        </svg>
+                        <span class="brand-wordmark">Harness</span>
+                    </div>
+                    <div class="sidebar-header-actions">
+                        <button class="sidebar-icon-btn" id="btn-search-sessions" title="Command Palette (Ctrl+K)">
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                        </button>
+                        <button class="sidebar-icon-btn" id="btn-sidebar-toggle" title="Collapse Sidebar">
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="sidebar-actions">
+                <button class="btn-new-chat" id="btn-new-chat">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                    <span>New Conversation</span>
+                    <span class="kbd-hint">⌃N</span>
+                </button>
+            </div>
+
+            <div class="sidebar-projects-section">
+                <div class="projects-header">
+                    <span>Projects</span>
+                    <div class="projects-actions">
+                        <button class="icon-subtle" id="btn-toggle-projects-sort" title="Sort Projects">≡</button>
+                        <button class="icon-subtle" id="btn-new-project-folder" title="New Project Workspace">+</button>
+                    </div>
+                </div>
+
+                <!-- In-Browser Inline Project Creator & File Browser -->
+                <div class="sidebar-inline-project-form hidden" id="sidebar-inline-project-form">
+                    <div class="inline-form-header">
+                        <span>New Project</span>
+                        <button type="button" class="btn-inline-close" id="btn-close-inline-project">✕</button>
+                    </div>
+                    <div class="inline-form-body">
+                        <input type="text" id="inline-project-name" class="inline-form-input" placeholder="Project Name (e.g. API Service)...">
+                        
+                        <div class="inline-path-row">
+                            <span class="inline-path-icon">📁</span>
+                            <input type="text" id="inline-project-path" class="inline-form-input path-input" placeholder="Workspace directory path...">
+                            <button type="button" class="btn-inline-tree-toggle" id="btn-browse-inline-project" title="Open Folder Browser">📂</button>
+                            <button type="button" class="btn-inline-tree-toggle" id="btn-toggle-inline-tree" title="Browse folders inline">▾</button>
+                        </div>
+
+                        <div class="inline-browser-drawer hidden" id="inline-browser-drawer">
+                            <div class="inline-browser-shortcuts" id="inline-browser-shortcuts"></div>
+                            <div class="inline-browser-header">
+                                <span class="inline-browser-current" id="inline-browser-current-label">Workspace</span>
+                                <div class="inline-browser-actions">
+                                    <button type="button" class="btn-mini-action" id="btn-inline-browser-up" title="Parent folder">↑ Up</button>
+                                    <button type="button" class="btn-mini-action" id="btn-inline-browser-mkdir" title="New folder">+ Folder</button>
+                                    <button type="button" class="btn-mini-action btn-mini-use" id="btn-inline-browser-use" title="Use current folder">✓ Use</button>
+                                </div>
+                            </div>
+                            <div class="inline-browser-tree" id="inline-browser-tree-list"></div>
+                        </div>
+
+                        <div class="inline-icon-picker" id="inline-icon-picker">
+                            <button type="button" class="inline-icon-choice active" data-icon="📁">📁</button>
+                            <button type="button" class="inline-icon-choice" data-icon="🚀">🚀</button>
+                            <button type="button" class="inline-icon-choice" data-icon="🦀">🦀</button>
+                            <button type="button" class="inline-icon-choice" data-icon="⚡">⚡</button>
+                            <button type="button" class="inline-icon-choice" data-icon="🧠">🧠</button>
+                        </div>
+                    </div>
+                    <div class="inline-form-actions">
+                        <button type="button" class="btn-inline-cancel" id="btn-cancel-inline-project">Cancel</button>
+                        <button type="button" class="btn-inline-submit" id="btn-submit-inline-project">Create Project</button>
+                    </div>
+                </div>
+
+                <div class="projects-list-container" id="sidebar-projects-list"></div>
+
+                <div class="conversations-header">
+                    <span>Conversations</span>
+                    <div class="conversations-actions">
+                        <span class="knowledge-chip-mini" title="Standalone conversations have read/write/shell disabled (knowledge work only)">Knowledge</span>
+                        <button type="button" class="icon-subtle" id="btn-add-conversation" title="New Knowledge-Work Conversation (no read/write/shell)">+</button>
+                    </div>
+                </div>
+                <div class="conversations-list-container" id="sidebar-conversations-list"></div>
+
+                <div class="conversations-header" id="automations-header">
+                    <span>Automations</span>
+                    <div class="conversations-actions">
+                        <button type="button" class="icon-subtle" id="btn-sidebar-new-automation" title="New Automation">+</button>
+                    </div>
+                </div>
+                <div class="conversations-list-container" id="sidebar-automations-list"></div>
+            </div>
+
+            <div class="sidebar-footer">
+                <button class="nav-item-link footer-settings-btn" id="btn-open-settings">
+                    <span class="nav-icon">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                    </span>
+                    <span>Settings</span>
+                </button>
+            </div>
+        </aside>
+
+        <!-- 2. WORKSPACE SHELL (Top Bar + Split Canvas/Inspector) -->
+        <div class="workspace-shell">
+            <!-- TOP BAR -->
+            <header class="top-nav">
+                <div class="top-nav-left">
+                    <button class="top-icon-btn sidebar-expand-btn" id="btn-expand-sidebar" title="Show Sidebar">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
+                    </button>
+                    <button class="mobile-sidebar-toggle" id="btn-mobile-sidebar" title="Menu">☰</button>
+                    <div class="breadcrumb">
+                        <span class="bc-active" id="current-task-breadcrumb" title="Double-click to rename conversation">New Conversation</span>
+                        <button type="button" class="bc-rename-btn hidden" id="btn-rename-session" title="Rename conversation">✎</button>
+                    </div>
+                </div>
+
+                <div class="top-nav-right">
+                    <!-- Active Task / Swarm Pill -->
+                    <div class="task-running-indicator hidden" id="task-running-strip" title="Active session and swarm agents">
+                        <span class="pulse-amber-dot"></span>
+                        <span id="task-running-label">1 task running</span>
+                        <button type="button" class="btn-top-stop" id="btn-top-stop-session" title="Stop current task and subagents">⏹ Stop</button>
+                    </div>
+
+                    <!-- Active Server Node Pill -->
+                    <div class="telemetry-pill server-picker-pill" id="btn-server-dropdown" title="Select Primary Execution Server">
+                        <span class="dot-live" id="server-status-dot"></span>
+                        <span id="label-active-server">Local Server</span>
+                        <span class="arrow-down">⌵</span>
+                    </div>
+
+                    <!-- Live Resource Telemetry Pill (Compact) -->
+                    <div class="telemetry-pill" id="telemetry-pill" title="Process RSS (see Settings → Memory & Runtime for CPU & Host RAM)">
+                        <span class="dot-live"></span>
+                        <span id="stat-rss">-- MB</span>
+                    </div>
+
+                    <!-- Context Utilization & Token Analytics Pill (Compact) -->
+                    <div class="telemetry-pill ctx-token-pill" id="btn-token-analytics" title="Token Breakdown, Cache Hit Rate & Context Compaction">
+                        <span class="token-glyph">◈</span>
+                        <span id="stat-ctx-tokens">0 / 128k</span>
+                        <span class="telemetry-sep">·</span>
+                        <span class="token-pct-badge" id="stat-ctx-pct">0%</span>
+                    </div>
+
+                    <button class="top-icon-btn" id="btn-open-tools-nav" title="Registered Plugin Tools">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+                    </button>
+                    <button class="top-icon-btn" id="btn-more-options" title="More Options">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></svg>
+                    </button>
+
+                    <!-- Inspector Panel Toggle -->
+                    <button class="top-icon-btn inspector-toggle-btn" id="btn-toggle-drawer" title="Toggle Inspector Panel (Swarm, Browser & Files)">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="15" y1="3" x2="15" y2="21"/></svg>
+                        <span class="inspector-activity-dot hidden" id="inspector-activity-dot"></span>
+                    </button>
+                </div>
+            </header>
+
+            <!-- WORKSPACE SPLIT: CENTRAL STREAM + RIGHT INSPECTOR -->
+            <div class="workspace-split">
+                <!-- CENTRAL STREAM CANVAS -->
+                <main class="main-workspace">
+                    <div class="stream-scroll-area" id="stream-scroll-area">
+                        <div class="stream-content" id="stream-container">
+                            <div class="welcome-box" id="welcome-canvas">
+                                <div class="welcome-badge">
+                                    <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+                                        <polygon points="12,3 22,20 2,20"></polygon>
+                                    </svg>
+                                </div>
+                                <h2 id="welcome-project-title">What would you like to build?</h2>
+
+                                <div class="starter-prompts">
+                                    <button class="starter-chip" data-prompt="Check host telemetry, memory usage, and inspect the workspace structure.">
+                                        <span class="starter-icon">💻</span>
+                                        <span class="starter-text">Workspace &amp; System Audit</span>
+                                    </button>
+                                    <button class="starter-chip" data-prompt="Spawn parallel subagents to review the codebase architecture and create a summary artifact.">
+                                        <span class="starter-icon">🕸️</span>
+                                        <span class="starter-text">Multi-Agent Swarm Review</span>
+                                    </button>
+                                    <button class="starter-chip" data-prompt="Use browser_ui to open http://localhost:3000, take a screenshot, and check for console errors or DOM issues.">
+                                        <span class="starter-icon">🌐</span>
+                                        <span class="starter-text">Browser UI Inspection</span>
+                                    </button>
+                                    <button class="starter-chip" data-prompt="Search the web for the latest Rust engineering updates and summarize key highlights.">
+                                        <span class="starter-icon">🔍</span>
+                                        <span class="starter-text">Live Web Research</span>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <button type="button" id="btn-scroll-bottom" class="btn-scroll-bottom hidden" title="Jump to latest output">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>
+                        <span>Latest</span>
+                    </button>
+
+                    <!-- FLOATING PROMPT DOCK -->
+                    <div class="prompt-dock-container">
+                        <div id="queued-prompts-tray" class="queued-prompts-tray hidden" aria-label="Queued Prompts"></div>
+                        <div class="prompt-card" id="prompt-card">
+                            <div id="composer-slash-row" class="composer-slash-row hidden">
+                                <div id="composer-slash-chip" class="composer-slash-chip">
+                                    <span id="composer-slash-icon" class="composer-slash-icon"></span>
+                                    <span id="composer-slash-cmd" class="composer-slash-cmd"></span>
+                                    <span id="composer-slash-label" class="composer-slash-label"></span>
+                                    <button type="button" id="btn-clear-slash-chip" class="composer-slash-clear" title="Clear slash directive">✕</button>
+                                </div>
+                            </div>
+                            <div id="composer-attachments-row" class="composer-attachments-row hidden" aria-label="Staged Attachments"></div>
+                            <input type="file" id="prompt-file-input" class="hidden" multiple accept="image/*,video/*,audio/*,.pdf,.txt,.md,.json,.csv,.rs,.js,.ts,.tsx,.jsx,.py,.html,.css,.toml,.yaml,.yml,.xml,.sql,.sh,.ps1,.log">
+                            <textarea 
+                                id="task-input" 
+                                class="prompt-textarea" 
+                                rows="1" 
+                                placeholder="Ask anything, @ to mention tools, / for skills &amp; commands (drop/paste images or files)"
+                            ></textarea>
+
+                            <div class="prompt-toolbar">
+                                <div class="toolbar-left">
+                                    <button class="tool-btn icon-plus" id="btn-prompt-attach" title="Attach images, video, audio, files, or browse workspace">+</button>
+                                    
+                                    <!-- Unified Model & Thinking Effort Picker Pill -->
+                                    <div class="model-picker-pill" id="btn-model-dropdown" title="Select Model &amp; Thinking Effort">
+                                        <span class="model-name" id="label-active-model">Nemotron-3-Nano Reasoning</span>
+                                        <span class="model-effort-inline" id="label-reasoning-effort">High</span>
+                                        <span class="arrow-down">⌵</span>
+                                    </div>
+                                </div>
+
+                                <div class="toolbar-right">
+                                    <!-- Interactive Permission Mode Pill -->
+                                    <div class="permission-mode-pill" id="btn-perm-mode-dropdown" title="Adjust Permission &amp; Security Mode">
+                                        <span class="perm-mode-icon">🛡</span>
+                                        <span id="label-perm-mode">Safe (Ask)</span>
+                                        <span class="arrow-down">⌵</span>
+                                    </div>
+
+                                    <button type="button" class="tool-btn icon-mic" id="btn-mic" title="Voice Input">🎙</button>
+                                    <button class="btn-send-circle" id="btn-submit" title="Send (Enter)">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                                            <line x1="12" y1="19" x2="12" y2="5"></line>
+                                            <polyline points="5 12 12 5 19 12"></polyline>
+                                        </svg>
+                                    </button>
+                                    <button class="btn-stop-circle hidden" id="btn-stop-prompt" title="Stop Generation">
+                                        <span class="stop-sq">■</span>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </main>
+
+                <!-- 3. RIGHT COLLAPSIBLE INSPECTOR PANE -->
+                <aside class="inspector-pane collapsed" id="inspector-pane" aria-label="Workspace Inspector">
+                    <div class="inspector-header">
+                        <div class="inspector-tabs" role="tablist">
+                            <button type="button" class="inspector-tab active" data-inspector-tab="swarm" role="tab">
+                                <span>Swarm</span>
+                                <span class="tab-count-badge hidden" id="inspector-swarm-badge">0</span>
+                            </button>
+                            <button type="button" class="inspector-tab" data-inspector-tab="browser" role="tab">
+                                <span>Browser</span>
+                                <span class="tab-count-badge hidden" id="inspector-browser-badge">0</span>
+                            </button>
+                            <button type="button" class="inspector-tab" data-inspector-tab="workspace" role="tab">
+                                <span>Files</span>
+                                <span class="tab-count-badge hidden" id="inspector-files-badge">0</span>
+                            </button>
+                        </div>
+                        <button type="button" class="top-icon-btn" id="btn-close-inspector" title="Close Inspector">✕</button>
+                    </div>
+
+                    <div class="inspector-body">
+                        <!-- TAB 1: SWARM & AGENTS -->
+                        <section class="inspector-tab-panel active swarm-panel" id="inspector-tab-swarm">
+                            <div class="swarm-topbar">
+                                <div class="swarm-topbar-left">
+                                    <span class="swarm-brand-pill">
+                                        <svg class="swarm-hub-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <circle cx="12" cy="12" r="3"></circle>
+                                            <circle cx="4" cy="6" r="2"></circle>
+                                            <circle cx="20" cy="6" r="2"></circle>
+                                            <circle cx="4" cy="18" r="2"></circle>
+                                            <circle cx="20" cy="18" r="2"></circle>
+                                            <line x1="9.5" y1="10.2" x2="5.7" y2="7.2"></line>
+                                            <line x1="14.5" y1="10.2" x2="18.3" y2="7.2"></line>
+                                            <line x1="9.5" y1="13.8" x2="5.7" y2="16.8"></line>
+                                            <line x1="14.5" y1="13.8" x2="18.3" y2="16.8"></line>
+                                        </svg>
+                                        <span>Swarm</span>
+                                    </span>
+                                    <button type="button" class="swarm-icon-btn" id="btn-swarm-quick-post" title="Post message to Swarm Board">+</button>
+                                </div>
+                                <div class="swarm-topbar-right">
+                                    <button type="button" class="swarm-icon-btn" id="btn-refresh-swarm" title="Sync Swarm State">
+                                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <polyline points="23 4 23 10 17 10"></polyline>
+                                            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+                                        </svg>
+                                    </button>
+                                    <button type="button" class="swarm-icon-btn" id="btn-swarm-expand" title="Expand / Dock Swarm View">
+                                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <polyline points="15 3 21 3 21 9"></polyline>
+                                            <polyline points="9 21 3 21 3 15"></polyline>
+                                            <line x1="21" y1="3" x2="14" y2="10"></line>
+                                            <line x1="3" y1="21" x2="10" y2="14"></line>
+                                        </svg>
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div class="swarm-title-bar">
+                                <div class="swarm-title-text" id="swarm-title-label">Background Swarm</div>
+                                <div class="swarm-live-pill idle" id="swarm-live-indicator">
+                                    <span class="swarm-live-dot"></span>
+                                    <span class="swarm-live-text">Idle</span>
+                                </div>
+                            </div>
+
+                            <div class="swarm-subtabs" role="tablist">
+                                <button type="button" class="swarm-subtab active" data-swarm-subtab="board" role="tab">
+                                    <span>Board</span>
+                                    <span class="swarm-subtab-count" id="swarm-board-count">0</span>
+                                </button>
+                                <button type="button" class="swarm-subtab" data-swarm-subtab="members" role="tab">
+                                    <span>Members</span>
+                                    <span class="swarm-subtab-count" id="swarm-members-active-count">1</span>
+                                </button>
+                                <button type="button" class="swarm-subtab" data-swarm-subtab="graph" role="tab">
+                                    <span>Graph</span>
+                                </button>
+                            </div>
+
+                            <div class="inspector-tags-section hidden" id="inspector-swarm-tags-section">
+                                <div class="inspector-tags-group">
+                                    <span class="inspector-tags-label">Jobs</span>
+                                    <div class="inspector-tags-strip" id="inspector-swarm-jobs">
+                                        <span class="inspector-tags-empty">None</span>
+                                    </div>
+                                </div>
+                                <div class="inspector-tags-group">
+                                    <span class="inspector-tags-label">Specialists</span>
+                                    <div class="inspector-tags-strip" id="inspector-swarm-specialists">
+                                        <span class="inspector-tags-empty">None</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Subview 1: BOARD -->
+                            <div class="swarm-subview active" id="swarm-subview-board">
+                                <div class="swarm-search-row">
+                                    <div class="swarm-search-wrap">
+                                        <svg class="swarm-search-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <circle cx="11" cy="11" r="8"></circle>
+                                            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                                        </svg>
+                                        <input type="text" id="swarm-board-search" class="swarm-search-input" placeholder="Search" autocomplete="off">
+                                    </div>
+                                    <button type="button" class="swarm-filter-btn" id="btn-swarm-board-filter" title="Filter messages (All / Mentions / Tagged)">
+                                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <line x1="4" y1="6" x2="20" y2="6"></line>
+                                            <line x1="7" y1="12" x2="17" y2="12"></line>
+                                            <line x1="10" y1="18" x2="14" y2="18"></line>
+                                        </svg>
+                                        <span class="swarm-filter-badge hidden" id="swarm-board-filter-label"></span>
+                                    </button>
+                                </div>
+
+                                <div class="inspector-board-feed" id="inspector-board-messages">
+                                    <div class="inspector-empty">Shared board messages will stream here in real time.</div>
+                                </div>
+
+                                <div class="swarm-composer">
+                                    <div class="swarm-composer-row">
+                                        <input type="text" id="swarm-post-target" class="swarm-target-input" placeholder="@target">
+                                        <input type="text" id="swarm-post-input" class="swarm-msg-input" placeholder="Send guidance to swarm...">
+                                        <button type="button" class="btn-swarm-send" id="btn-swarm-post-send">Post</button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Subview 2: MEMBERS -->
+                            <div class="swarm-subview hidden" id="swarm-subview-members">
+                                <div class="swarm-search-row">
+                                    <div class="swarm-search-wrap">
+                                        <svg class="swarm-search-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <circle cx="11" cy="11" r="8"></circle>
+                                            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                                        </svg>
+                                        <input type="text" id="swarm-members-search" class="swarm-search-input" placeholder="Search members" autocomplete="off">
+                                    </div>
+                                </div>
+
+                                <div class="swarm-members-scroll">
+                                    <div class="swarm-members-active" id="swarm-members-active"></div>
+                                    <div class="swarm-retired-section hidden" id="swarm-members-retired-section">
+                                        <button type="button" class="swarm-retired-header" id="btn-toggle-retired" aria-expanded="true">
+                                            <span>RETIRED</span>
+                                            <span class="swarm-retired-count" id="swarm-retired-count">0</span>
+                                            <span class="swarm-retired-chevron">⌃</span>
+                                        </button>
+                                        <div class="swarm-members-retired" id="swarm-members-retired"></div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Subview 3: GRAPH -->
+                            <div class="swarm-subview hidden" id="swarm-subview-graph">
+                                <div class="swarm-graph-wrap" id="swarm-graph-canvas">
+                                    <div class="inspector-empty">Spawn swarm workers to visualize agent topology.</div>
+                                </div>
+                            </div>
+                        </section>
+
+                        <!-- TAB 2: BROWSER & UI -->
+                        <section class="inspector-tab-panel hidden" id="inspector-tab-browser">
+                            <div class="inspector-section">
+                                <div class="inspector-section-head">
+                                    <span>Quick Localhost Tester</span>
+                                    <button type="button" class="btn-mini-ghost" id="btn-browser-iframe-toggle" title="Toggle live embedded iframe preview">Live Frame</button>
+                                </div>
+                                <div class="browser-tester-bar">
+                                    <input type="text" id="browser-test-url" class="browser-url-input" value="http://localhost:3000" placeholder="http://localhost:3000">
+                                    <button type="button" class="btn-browser-audit" id="btn-browser-audit" title="Ask agent to audit this URL with browser_ui">Audit</button>
+                                </div>
+                                <div class="browser-iframe-wrap hidden" id="browser-iframe-wrap">
+                                    <iframe id="browser-live-iframe" title="Localhost Preview" sandbox="allow-scripts allow-same-origin allow-forms"></iframe>
+                                </div>
+                            </div>
+
+                            <div class="inspector-section browser-snapshot-section">
+                                <div class="inspector-section-head">
+                                    <span>Latest Snapshot</span>
+                                    <span class="console-badge ok hidden" id="browser-console-badge">0 errors</span>
+                                </div>
+                                <div id="browser-snapshot-viewer" class="browser-snapshot-viewer">
+                                    <div class="inspector-empty">Run <code>browser_ui</code> or click Audit to capture a live screenshot, console logs, and DOM summary.</div>
+                                </div>
+                                <div id="browser-snapshot-gallery" class="browser-snapshot-gallery hidden"></div>
+                            </div>
+                        </section>
+
+                        <!-- TAB 3: WORKSPACE & ARTIFACTS -->
+                        <section class="inspector-tab-panel hidden" id="inspector-tab-workspace">
+                            <div class="inspector-section" id="inspector-artifacts-section">
+                                <div class="inspector-section-head">
+                                    <span>Session Artifacts</span>
+                                    <span class="inspector-sub-pill" id="inspector-artifacts-count">0</span>
+                                </div>
+                                <div class="inspector-artifacts-list" id="inspector-artifacts-list">
+                                    <div class="inspector-empty">Artifacts created via <code>create_artifact</code> appear here.</div>
+                                </div>
+                            </div>
+
+                            <div class="inspector-section inspector-tree-section">
+                                <div class="inspector-section-head">
+                                    <span>Workspace Tree</span>
+                                    <div class="inspector-head-actions">
+                                        <span class="workspace-root-chip" id="workspace-root-label">.</span>
+                                        <button type="button" class="btn-mini-ghost" id="btn-workspace-refresh" title="Refresh Workspace Tree">↻</button>
+                                    </div>
+                                </div>
+                                <div class="workspace-tree-list" id="workspace-tree-list">
+                                    <div class="inspector-empty">Loading workspace tree...</div>
+                                </div>
+                            </div>
+
+                            <div class="workspace-file-viewer hidden" id="workspace-file-viewer">
+                                <div class="file-viewer-head">
+                                    <div class="file-viewer-meta">
+                                        <span class="file-viewer-path" id="file-viewer-path">--</span>
+                                        <span class="file-viewer-lang" id="file-viewer-lang">text</span>
+                                    </div>
+                                    <div class="file-viewer-actions">
+                                        <button type="button" class="btn-mini-ghost hidden" id="btn-toggle-md-preview">Preview</button>
+                                        <button type="button" class="btn-mini-ghost" id="btn-copy-viewer-file">Copy</button>
+                                        <button type="button" class="btn-mini-ghost" id="btn-close-file-viewer">✕</button>
+                                    </div>
+                                </div>
+                                <div class="file-viewer-body" id="file-viewer-body"></div>
+                            </div>
+                        </section>
+                    </div>
+                </aside>
+            </div>
+        </div>
+    </div>
+
+    <!-- ATTACH MENU POPOVER -->
+    <div id="attach-menu-popover" class="popover-menu attach-menu-popover hidden">
+        <div class="popover-header">
+            <span>Attach or Reference</span>
+        </div>
+        <div class="popover-list">
+            <button type="button" class="popover-item" id="btn-attach-local-files">
+                <span class="popover-item-title">Attach Image, Video, Audio or File...</span>
+                <span class="popover-item-sub">Send PNG/JPG/WebP, MP4/WebM, MP3/WAV, PDF, or code/text files</span>
+            </button>
+            <button type="button" class="popover-item" id="btn-attach-workspace-files">
+                <span class="popover-item-title">Browse Workspace Files</span>
+                <span class="popover-item-sub">Open the Files inspector to view or inspect repository files</span>
+            </button>
+        </div>
+    </div>
+
+    <!-- MODEL SELECTOR POPOVER (Provider-Grouped + Context/Cap Filters + Hover Details + Cascading Thinking Effort) -->
+    <div id="model-popover" class="popover-menu model-picker-popover hidden">
+        <div class="model-popover-head">
+            <span class="model-popover-title">Model</span>
+            <div class="model-popover-head-actions">
+                <button type="button" class="model-head-filter-btn" id="btn-toggle-model-filters" title="Filter by context length or capabilities">Filter</button>
+                <button type="button" class="model-head-icon-btn" id="btn-quick-fetch-models" title="Fetch live models across all enabled providers">↻</button>
+                <button type="button" class="model-head-icon-btn" id="btn-open-add-provider-pill" title="Add custom provider">+</button>
+            </div>
+        </div>
+
+        <div class="model-search-row">
+            <div class="search-input-wrap">
+                <svg class="search-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                <input type="text" id="model-search-input" placeholder="Search models..." autocomplete="off">
+                <button type="button" class="clear-btn hidden" id="btn-clear-model-search" title="Clear search">✕</button>
+            </div>
+        </div>
+
+        <div id="model-filters-drawer" class="model-filters-drawer hidden">
+            <div class="model-filter-row" id="model-ctx-filter-row">
+                <span class="model-filter-label">Ctx</span>
+                <button type="button" class="filter-chip active" data-ctx-min="0">Any</button>
+                <button type="button" class="filter-chip" data-ctx-min="32000">32k+</button>
+                <button type="button" class="filter-chip" data-ctx-min="128000">128k+</button>
+                <button type="button" class="filter-chip" data-ctx-min="256000">256k+</button>
+                <button type="button" class="filter-chip" data-ctx-min="1000000">1M+</button>
+            </div>
+            <div class="model-filter-row" id="model-cap-filter-row">
+                <span class="model-filter-label">Caps</span>
+                <button type="button" class="filter-chip" data-cap="vision">Vision</button>
+                <button type="button" class="filter-chip" data-cap="reasoning">Reasoning</button>
+                <button type="button" class="filter-chip" data-cap="tools">Tools</button>
+                <button type="button" class="filter-chip" data-cap="audio">Audio</button>
+                <button type="button" class="filter-chip" data-cap="video">Video</button>
+                <button type="button" class="filter-chip" data-cap="pdf">PDF</button>
+            </div>
+        </div>
+
+        <div class="popover-list model-items-scroll" id="quick-models-list"></div>
+
+        <div id="model-hover-detail" class="model-hover-detail">
+            <div class="model-hover-detail-meta">Hover a model to view context length &amp; capabilities</div>
+        </div>
+
+        <div class="model-picker-footer">
+            <button type="button" class="model-footer-action" id="btn-open-providers-modal" title="Manage AI Providers &amp; Multi-Provider Keys">
+                <span class="model-footer-left">
+                    <span class="dot-live"></span>
+                    <span id="label-active-provider-name">NVIDIA NIM</span>
+                    <span class="model-footer-sep">·</span>
+                    <span id="label-model-ctx-summary" class="footer-dim">128k ctx</span>
+                </span>
+                <span class="model-row-chevron">›</span>
+            </button>
+        </div>
+    </div>
+
+    <!-- Cascading Thinking Effort Submenu -->
+    <div id="thinking-effort-submenu" class="popover-menu thinking-effort-submenu hidden" role="menu" aria-label="Thinking effort">
+        <div class="submenu-header">
+            <span>Thinking effort</span>
+            <span class="submenu-info-icon" id="thinking-submenu-model-hint" title="Adjust thinking effort for this model">ⓘ</span>
+        </div>
+        <div class="popover-list" id="thinking-effort-list"></div>
+    </div>
+
+    <!-- Execution Server Picker Popover -->
+    <div id="server-popover" class="popover-menu hidden">
+        <div class="popover-header">
+            <span>Execution Server</span>
+            <button type="button" class="btn-text-link" id="btn-manage-servers-from-pop">Manage ⚙</button>
+        </div>
+        <div class="popover-list" id="server-popover-list"></div>
+    </div>
+
+    <!-- Move Conversation to Project Popover -->
+    <div id="move-conv-popover" class="popover-menu hidden">
+        <div class="popover-header">
+            <span>Move Conversation to Project</span>
+        </div>
+        <div class="popover-list" id="move-conv-list"></div>
+    </div>
+
+    <!-- Quick Permission Mode Popover -->
+    <div id="perm-mode-popover" class="popover-menu hidden">
+        <div class="popover-header">
+            <span>Security &amp; Permission Mode</span>
+        </div>
+        <div class="popover-list">
+            <button class="popover-item active" data-perm-mode="safe">
+                <span class="popover-item-title">🛡 Safe (Interactive)</span>
+                <span class="popover-item-sub">Ask for confirmation before executing bash commands or modifying files</span>
+            </button>
+            <button class="popover-item" data-perm-mode="autonomous">
+                <span class="popover-item-title">⚡ Autonomous (Full Access)</span>
+                <span class="popover-item-sub">Hands-free continuous tool execution and self-correction within sandbox</span>
+            </button>
+            <button class="popover-item" data-perm-mode="read_only">
+                <span class="popover-item-title">🔒 Read Only (Strict)</span>
+                <span class="popover-item-sub">Blocks all bash execution and file writes; permits inspection only</span>
+            </button>
+        </div>
+    </div>
+
+    <!-- More Options Popover -->
+    <div id="more-popover" class="popover-menu hidden">
+        <div class="popover-list">
+            <button class="popover-item" id="opt-fork-session">
+                <span class="popover-item-title">⑂ Fork Conversation</span>
+            </button>
+            <button class="popover-item" id="opt-rename-session">
+                <span class="popover-item-title">✎ Rename Conversation</span>
+            </button>
+            <button class="popover-item" id="opt-export-md">
+                <span class="popover-item-title">📝 Export Markdown</span>
+            </button>
+            <button class="popover-item" id="opt-export-json">
+                <span class="popover-item-title">📤 Export Session JSON</span>
+            </button>
+            <button class="popover-item" id="opt-clear-chat">
+                <span class="popover-item-title">🗑 Clear Conversation</span>
+            </button>
+            <button class="popover-item" id="opt-toggle-mock">
+                <span class="popover-item-title">🧪 Offline Demo Mode</span>
+                <span class="popover-item-sub" id="opt-mock-status">Off</span>
+            </button>
+        </div>
+    </div>
+
+    <!-- 4. MODALS -->
+
+    <!-- UNIFIED TABBED SETTINGS HUB MODAL -->
+    <div id="config-modal" class="modal-backdrop hidden">
+        <div class="modal-card modal-large settings-hub-card">
+            <div class="modal-header">
+                <div class="modal-title">
+                    <span class="modal-icon">⚙</span>
+                    <h3>Settings</h3>
+                </div>
+                <button class="close-btn" id="btn-close-config">✕</button>
+            </div>
+
+            <div class="settings-hub-body">
+                <aside class="settings-nav-rail" role="tablist" aria-label="Settings Pages">
+                    <button type="button" class="settings-nav-item active" data-settings-tab="memory" role="tab">
+                        <span class="settings-nav-icon">🧠</span>
+                        <span>Memory &amp; Runtime</span>
+                    </button>
+                    <button type="button" class="settings-nav-item" data-settings-tab="providers" role="tab">
+                        <span class="settings-nav-icon">🌐</span>
+                        <span>AI Providers</span>
+                    </button>
+                    <button type="button" class="settings-nav-item" data-settings-tab="orchestrator" role="tab">
+                        <span class="settings-nav-icon">🕸</span>
+                        <span>Orchestrator</span>
+                    </button>
+                    <button type="button" class="settings-nav-item" data-settings-tab="servers" role="tab">
+                        <span class="settings-nav-icon">🖥</span>
+                        <span>Servers</span>
+                    </button>
+                    <button type="button" class="settings-nav-item" data-settings-tab="mcp" role="tab">
+                        <span class="settings-nav-icon">🔌</span>
+                        <span>MCP Servers</span>
+                    </button>
+                    <button type="button" class="settings-nav-item" data-settings-tab="search" role="tab">
+                        <span class="settings-nav-icon">🔍</span>
+                        <span>Search Engines</span>
+                    </button>
+                    <button type="button" class="settings-nav-item" data-settings-tab="tools" role="tab">
+                        <span class="settings-nav-icon">🛡</span>
+                        <span>Tools &amp; Permissions</span>
+                    </button>
+                    <button type="button" class="settings-nav-item" data-settings-tab="skills" role="tab">
+                        <span class="settings-nav-icon">✨</span>
+                        <span>Skills &amp; Automations</span>
+                    </button>
+                </aside>
+
+                <div class="settings-pages-pane">
+                    <!-- PAGE 1: MEMORY & RUNTIME -->
+                    <section class="settings-page active" id="settings-page-memory">
+                        <div class="settings-page-header">
+                            <h4>Memory &amp; Runtime</h4>
+                            <button type="button" class="btn-action-pill primary" id="btn-compact-active-session">🗜 Compact Active Session Now</button>
+                        </div>
+                        <div id="settings-compact-status" class="provider-test-status hidden"></div>
+
+                        <div class="runtime-telemetry-strip">
+                            <div class="runtime-stat-chip">
+                                <span class="runtime-stat-label">Process CPU</span>
+                                <strong id="stat-cpu">0.0% CPU</strong>
+                            </div>
+                            <div class="runtime-stat-chip">
+                                <span class="runtime-stat-label">Process RSS</span>
+                                <strong id="settings-stat-rss">-- MB</strong>
+                            </div>
+                            <div class="runtime-stat-chip">
+                                <span class="runtime-stat-label">Host RAM</span>
+                                <strong id="stat-host-ram">-- / -- GB</strong>
+                            </div>
+                        </div>
+
+                        <div class="settings-pref-card">
+                            <div class="settings-pref-meta">
+                                <span class="settings-pref-title">Display Verbosity</span>
+                                <span class="settings-pref-desc">Controls reasoning drawers and tool execution card density</span>
+                            </div>
+                            <div class="segmented-control verbosity-segmented" id="settings-display-verbosity" role="group" aria-label="Display Verbosity">
+                                <button type="button" class="seg-btn active" data-verbosity="compact">Compact</button>
+                                <button type="button" class="seg-btn" data-verbosity="balanced">Balanced</button>
+                                <button type="button" class="seg-btn" data-verbosity="verbose">Verbose</button>
+                            </div>
+                        </div>
+
+                        <div class="settings-pref-card">
+                            <div class="settings-pref-meta">
+                                <span class="settings-pref-title">Prompt Send Mode</span>
+                                <span class="settings-pref-desc">When the agent is running, Queue waits for the next turn or Steer injects mid-run</span>
+                            </div>
+                            <div class="segmented-control send-mode-segmented" id="settings-send-mode" role="group" aria-label="Prompt Send Mode">
+                                <button type="button" class="seg-btn active" data-send-mode="queue" title="Queue prompt to run after current turn finishes">Queue</button>
+                                <button type="button" class="seg-btn" data-send-mode="steer" title="Steer the currently running agent immediately">Steer</button>
+                            </div>
+                        </div>
+
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="cfg-max-context-tokens">Max Context Tokens <span id="cfg-max-context-auto-hint" class="badge-auto-ctx">Auto</span></label>
+                                <input type="number" id="cfg-max-context-tokens" class="form-input" min="4096" max="2000000" step="1024" value="128000">
+                            </div>
+                            <div class="form-group">
+                                <label for="cfg-auto-compact-pct">Auto-Compact Threshold (%)</label>
+                                <input type="number" id="cfg-auto-compact-pct" class="form-input" min="30" max="98" value="78">
+                            </div>
+                        </div>
+
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="cfg-preserve-recent">Preserve Recent Messages</label>
+                                <input type="number" id="cfg-preserve-recent" class="form-input" min="2" max="64" value="8">
+                            </div>
+                            <div class="form-group">
+                                <label for="cfg-prune-tool-bytes">Prune Tool Output Over (Bytes)</label>
+                                <input type="number" id="cfg-prune-tool-bytes" class="form-input" min="256" max="65536" step="256" value="2048">
+                            </div>
+                        </div>
+
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="cfg-max-tool-retries">Max Tool Retries</label>
+                                <input type="number" id="cfg-max-tool-retries" class="form-input" min="0" max="10" value="3">
+                            </div>
+                            <div class="form-group">
+                                <label for="cfg-max-output-bytes">Max Tool Output Limit (Bytes)</label>
+                                <input type="number" id="cfg-max-output-bytes" class="form-input" min="1024" max="262144" value="16384">
+                            </div>
+                        </div>
+
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="cfg-sandbox">Workspace Root</label>
+                                <input type="text" id="cfg-sandbox" class="form-input" placeholder="C:\Users\Akagikay\Downloads\Harness">
+                            </div>
+                        </div>
+
+                        <div class="settings-toggles-row">
+                            <label class="settings-toggle-card ui-switch-row">
+                                <span class="ui-switch">
+                                    <input type="checkbox" id="cfg-auto-detect-context" checked>
+                                    <span class="ui-switch-track"><span class="ui-switch-thumb"></span></span>
+                                </span>
+                                <span>Auto-Detect Context Window from Model</span>
+                            </label>
+                            <label class="settings-toggle-card ui-switch-row">
+                                <span class="ui-switch">
+                                    <input type="checkbox" id="cfg-enable-working-memory" checked>
+                                    <span class="ui-switch-track"><span class="ui-switch-thumb"></span></span>
+                                </span>
+                                <span>Working Memory Summary</span>
+                            </label>
+                            <label class="settings-toggle-card ui-switch-row">
+                                <span class="ui-switch">
+                                    <input type="checkbox" id="cfg-summarize-compacted-turns" checked>
+                                    <span class="ui-switch-track"><span class="ui-switch-thumb"></span></span>
+                                </span>
+                                <span>Summarize Folded Turns</span>
+                            </label>
+                            <label class="settings-toggle-card ui-switch-row" title="Automatically detect microphone speech onset and silence during Voice Input">
+                                <span class="ui-switch">
+                                    <input type="checkbox" id="cfg-voice-activity-detection">
+                                    <span class="ui-switch-track"><span class="ui-switch-thumb"></span></span>
+                                </span>
+                                <span>Voice Activity Detection (VAD)</span>
+                            </label>
+                        </div>
+                    </section>
+
+                    <!-- PAGE 2: AI PROVIDERS -->
+                    <section class="settings-page hidden" id="settings-page-providers">
+                        <div class="settings-page-header">
+                            <h4>AI Providers &amp; Models</h4>
+                            <button type="button" class="btn-primary" id="btn-show-add-provider-form">+ Add Provider</button>
+                        </div>
+
+                        <div class="provider-presets">
+                            <span class="preset-label">Quick Switch:</span>
+                            <button type="button" class="preset-btn active" id="preset-nvidia">NVIDIA NIM</button>
+                            <button type="button" class="preset-btn" id="preset-deepseek">DeepSeek</button>
+                            <button type="button" class="preset-btn" id="preset-openrouter">OpenRouter</button>
+                            <button type="button" class="preset-btn" id="preset-groq">Groq</button>
+                            <button type="button" class="preset-btn" id="preset-ollama">Ollama</button>
+                        </div>
+
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="cfg-api-base">API Base URL</label>
+                                <input type="text" id="cfg-api-base" class="form-input" placeholder="https://integrate.api.nvidia.com/v1">
+                            </div>
+                            <div class="form-group">
+                                <label for="cfg-api-key">LLM API Key</label>
+                                <input type="password" id="cfg-api-key" class="form-input" placeholder="nvapi-...">
+                            </div>
+                        </div>
+
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <div class="label-with-action">
+                                    <label for="cfg-model">Active Model</label>
+                                    <button type="button" class="btn-text-action" id="btn-fetch-models">⚡ Fetch API Models</button>
+                                </div>
+                                <div class="ui-combobox" id="cfg-model-combobox">
+                                    <input type="text" id="cfg-model" class="form-input ui-combobox-input" autocomplete="off" placeholder="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning">
+                                    <button type="button" class="ui-combobox-chevron" id="btn-cfg-model-dropdown" title="Show available models" aria-label="Show available models">▾</button>
+                                    <div class="ui-combobox-menu hidden" id="cfg-model-menu"></div>
+                                </div>
+                            </div>
+
+                            <div class="form-group">
+                                <div class="label-with-action">
+                                    <label for="cfg-reasoning-effort-trigger">Reasoning Effort</label>
+                                    <span id="cfg-reasoning-capability-badge" class="reasoning-mode-badge"></span>
+                                </div>
+                                <div class="ui-select" id="cfg-reasoning-select" data-value="high">
+                                    <input type="hidden" id="cfg-reasoning-effort" value="high">
+                                    <button type="button" class="ui-select-trigger" id="cfg-reasoning-effort-trigger" aria-haspopup="listbox" aria-expanded="false">
+                                        <span class="ui-select-label">High</span>
+                                        <span class="ui-select-chevron">▾</span>
+                                    </button>
+                                    <div class="ui-select-menu hidden" role="listbox"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div id="provider-editor-card" class="provider-editor-card hidden">
+                            <div class="editor-header">
+                                <strong id="provider-editor-title">Add Custom AI Provider</strong>
+                                <button type="button" class="close-icon-small" id="btn-cancel-provider-editor">✕</button>
+                            </div>
+                            <div class="mcp-quick-presets">
+                                <span class="preset-label">Template:</span>
+                                <button type="button" class="preset-chip-btn" onclick="applyProviderPreset('nvidia')">NVIDIA NIM</button>
+                                <button type="button" class="preset-chip-btn" onclick="applyProviderPreset('deepseek')">DeepSeek</button>
+                                <button type="button" class="preset-chip-btn" onclick="applyProviderPreset('openrouter')">OpenRouter</button>
+                                <button type="button" class="preset-chip-btn" onclick="applyProviderPreset('groq')">Groq</button>
+                                <button type="button" class="preset-chip-btn" onclick="applyProviderPreset('ollama')">Ollama</button>
+                                <button type="button" class="preset-chip-btn" onclick="applyProviderPreset('vllm')">vLLM</button>
+                            </div>
+                            <div class="form-grid">
+                                <div class="form-group">
+                                    <label for="edit-provider-name">Display Name</label>
+                                    <input type="text" id="edit-provider-name" class="form-input" placeholder="e.g. OpenRouter, Groq, My vLLM">
+                                </div>
+                                <div class="form-group">
+                                    <label for="edit-provider-id">Provider ID</label>
+                                    <input type="text" id="edit-provider-id" class="form-input" placeholder="e.g. openrouter, groq, my-vllm">
+                                </div>
+                            </div>
+                            <div class="form-grid">
+                                <div class="form-group">
+                                    <label for="edit-provider-base">API Base URL</label>
+                                    <input type="text" id="edit-provider-base" class="form-input" placeholder="https://api.groq.com/openai/v1">
+                                </div>
+                                <div class="form-group">
+                                    <label for="edit-provider-key">API Key (optional for local)</label>
+                                    <input type="password" id="edit-provider-key" class="form-input" placeholder="sk-...">
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label for="edit-provider-model">Default Model</label>
+                                <input type="text" id="edit-provider-model" class="form-input" placeholder="e.g. deepseek/deepseek-r1">
+                            </div>
+                            <div class="editor-actions">
+                                <button type="button" class="btn-secondary" id="btn-test-provider-connection">⚡ Test Connection</button>
+                                <div class="editor-save-group">
+                                    <button type="button" class="btn-secondary" id="btn-dismiss-provider-editor">Cancel</button>
+                                    <button type="button" class="btn-primary" id="btn-save-custom-provider">Save &amp; Set Active</button>
+                                </div>
+                            </div>
+                            <div id="provider-test-status" class="provider-test-status hidden"></div>
+                        </div>
+
+                        <div class="configured-providers-list" id="configured-providers-container"></div>
+                    </section>
+
+                    <!-- PAGE 2B: ORCHESTRATOR MODE & SUBAGENT ROUTING -->
+                    <section class="settings-page hidden" id="settings-page-orchestrator">
+                        <div class="settings-page-header">
+                            <h4>Orchestrator &amp; Subagent Configuration</h4>
+                            <label class="mcp-toggle-label ui-switch-row">
+                                <span class="ui-switch">
+                                    <input type="checkbox" id="orch-enabled">
+                                    <span class="ui-switch-track"><span class="ui-switch-thumb"></span></span>
+                                </span>
+                                <span>Enable Orchestrator Mode</span>
+                            </label>
+                        </div>
+
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label>Orchestrator Model &amp; Thinking</label>
+                                <button type="button" class="model-picker-pill orch-model-picker-pill" id="btn-orch-model-picker" title="Select Orchestrator Model &amp; Thinking Level">
+                                    <span class="model-name" id="label-orch-model">Follow Active Model</span>
+                                    <span class="model-effort-inline" id="label-orch-effort">High</span>
+                                    <span class="arrow-down">⌵</span>
+                                </button>
+                                <span class="settings-sub-caption" id="label-orch-provider-hint">Provider resolved from selected model</span>
+                            </div>
+                            <div class="form-group">
+                                <label for="orch-subagent-mode-ctrl">Subagent Strategy</label>
+                                <div class="segmented-control" id="orch-subagent-mode-ctrl">
+                                    <button type="button" class="seg-btn active" data-subagent-mode="single">Single Model</button>
+                                    <button type="button" class="seg-btn" data-subagent-mode="multi">Multiple Types</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div id="orch-single-subagent-panel" class="orch-subagent-panel">
+                            <div class="form-grid">
+                                <div class="form-group">
+                                    <label>Subagent Model &amp; Thinking</label>
+                                    <button type="button" class="model-picker-pill orch-model-picker-pill" id="btn-subagent-model-picker" title="Select Subagent Model &amp; Thinking Level">
+                                        <span class="model-name" id="label-subagent-model">Inherit Orchestrator</span>
+                                        <span class="model-effort-inline" id="label-subagent-effort">Medium</span>
+                                        <span class="arrow-down">⌵</span>
+                                    </button>
+                                    <span class="settings-sub-caption" id="label-subagent-provider-hint">Provider resolved from selected model</span>
+                                </div>
+                                <div class="form-group">
+                                    <label for="orch-subagent-server">Default Subagent Server</label>
+                                    <select id="orch-subagent-server" class="form-input"></select>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div id="orch-multi-subagent-panel" class="orch-subagent-panel hidden">
+                            <div class="settings-page-header" style="margin-bottom: 8px;">
+                                <span class="settings-hint" style="margin: 0;">Define specialized subagent types (e.g. Research, Coding, Reviewer) with their own model, thinking effort &amp; server.</span>
+                                <button type="button" class="btn-secondary" id="btn-add-subagent-profile">+ Add Subagent Type</button>
+                            </div>
+                            <div id="subagent-profiles-container" class="subagent-profiles-container"></div>
+                        </div>
+
+                        <div class="form-group">
+                            <div class="label-with-action">
+                                <label for="orch-system-prompt">Orchestrator System Prompt</label>
+                                <button type="button" class="btn-text-action" id="btn-reset-orch-prompt">Reset Default</button>
+                            </div>
+                            <textarea id="orch-system-prompt" class="form-input" rows="5" placeholder="Instructions for orchestrator decomposition, subagent delegation, and verification..."></textarea>
+                        </div>
+
+                        <div class="search-save-actions">
+                            <button type="button" class="btn-primary" id="btn-save-orchestrator">Save Orchestrator Settings</button>
+                        </div>
+                    </section>
+
+                    <!-- PAGE 2C: EXECUTION SERVERS -->
+                    <section class="settings-page hidden" id="settings-page-servers">
+                        <div class="settings-page-header">
+                            <h4>Execution Servers (Client / Multi-Server)</h4>
+                            <button type="button" class="btn-primary" id="btn-show-add-server-form">+ Add Server</button>
+                        </div>
+                        <p class="settings-hint">
+                            Client stores your SQLite conversation history &amp; projects; Servers execute tools &amp; agent turns. Start a conversation on Server 1 and spawn subagents on Server 2 or 3.
+                        </p>
+
+                        <div id="server-editor-card" class="provider-editor-card hidden">
+                            <div class="editor-header">
+                                <strong id="server-editor-title">Add Execution Server</strong>
+                                <button type="button" class="close-icon-small" id="btn-cancel-server-editor">✕</button>
+                            </div>
+                            <div class="form-grid">
+                                <div class="form-group">
+                                    <label for="edit-server-name">Server Name</label>
+                                    <input type="text" id="edit-server-name" class="form-input" placeholder="e.g. Server 2 (Worker)">
+                                </div>
+                                <div class="form-group">
+                                    <label for="edit-server-id">Server ID</label>
+                                    <input type="text" id="edit-server-id" class="form-input" placeholder="e.g. server-2">
+                                </div>
+                            </div>
+                            <div class="form-grid">
+                                <div class="form-group">
+                                    <label for="edit-server-url">Server Base URL</label>
+                                    <input type="text" id="edit-server-url" class="form-input" placeholder="http://127.0.0.1:8082">
+                                </div>
+                                <div class="form-group">
+                                    <label for="edit-server-token">API Token (optional)</label>
+                                    <input type="password" id="edit-server-token" class="form-input" placeholder="Bearer token...">
+                                </div>
+                            </div>
+                            <div class="editor-actions">
+                                <label class="ui-switch-row">
+                                    <input type="checkbox" id="edit-server-default">
+                                    <span>Set as Default Server</span>
+                                </label>
+                                <div class="editor-save-group">
+                                    <button type="button" class="btn-secondary" id="btn-dismiss-server-editor">Cancel</button>
+                                    <button type="button" class="btn-primary" id="btn-save-server">Save Server</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="configured-providers-list" id="configured-servers-container"></div>
+                    </section>
+
+                    <!-- PAGE 3: MCP SERVERS -->
+                    <section class="settings-page hidden" id="settings-page-mcp">
+                        <div class="settings-page-header">
+                            <h4>MCP Servers</h4>
+                            <button type="button" class="btn-primary" id="btn-show-add-mcp-form">+ Add Custom MCP</button>
+                        </div>
+
+                        <!-- Built-in Google AI Search (MCP) Card -->
+                        <div class="google-mcp-card" id="google-mcp-card">
+                            <div class="google-mcp-head">
+                                <div class="mcp-server-title-wrap">
+                                    <span class="mcp-server-name">Google AI Search (MCP)</span>
+                                    <span class="mcp-transport-badge">builtin</span>
+                                    <span class="mcp-tool-chip">mcp_google_ai_search_search</span>
+                                </div>
+                                <label class="mcp-toggle-label ui-switch-row">
+                                    <span class="ui-switch">
+                                        <input type="checkbox" id="google-mcp-enabled" checked>
+                                        <span class="ui-switch-track"><span class="ui-switch-thumb"></span></span>
+                                    </span>
+                                    <span>Enabled</span>
+                                </label>
+                            </div>
+                            <div class="form-grid">
+                                <div class="form-group">
+                                    <label for="google-mcp-api-key">GEMINI_API_KEY (optional — falls back to web)</label>
+                                    <input type="password" id="google-mcp-api-key" class="form-input" placeholder="AIza...">
+                                </div>
+                                <div class="form-group">
+                                    <label for="google-mcp-model-trigger">GOOGLE_AI_MODEL</label>
+                                    <div class="ui-select" id="google-mcp-model-select" data-value="gemini-2.5-flash">
+                                        <input type="hidden" id="google-mcp-model" value="gemini-2.5-flash">
+                                        <button type="button" class="ui-select-trigger" id="google-mcp-model-trigger" aria-haspopup="listbox" aria-expanded="false">
+                                            <span class="ui-select-label">gemini-2.5-flash</span>
+                                            <span class="ui-select-chevron">▾</span>
+                                        </button>
+                                        <div class="ui-select-menu hidden" role="listbox">
+                                            <button type="button" class="ui-select-option active" data-value="gemini-2.5-flash">gemini-2.5-flash</button>
+                                            <button type="button" class="ui-select-option" data-value="gemini-2.5-pro">gemini-2.5-pro</button>
+                                            <button type="button" class="ui-select-option" data-value="gemini-2.0-flash">gemini-2.0-flash</button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="google-mcp-actions">
+                                <button type="button" class="btn-secondary" id="btn-save-google-mcp">Save Google MCP</button>
+                                <button type="button" class="btn-action-pill primary" id="btn-test-google-mcp">⚡ Test Google Search MCP</button>
+                            </div>
+                            <div id="google-mcp-status" class="provider-test-status hidden"></div>
+                        </div>
+
+                        <div class="mcp-quick-presets">
+                            <span class="preset-label">Presets:</span>
+                            <button type="button" class="preset-chip-btn" id="preset-mcp-memory">+ Memory</button>
+                            <button type="button" class="preset-chip-btn" id="preset-mcp-fs">+ Filesystem</button>
+                            <button type="button" class="preset-chip-btn" id="preset-mcp-sqlite">+ SQLite</button>
+                            <button type="button" class="preset-chip-btn" id="preset-mcp-git">+ Git</button>
+                            <button type="button" class="preset-chip-btn" id="preset-mcp-fetch">+ Fetch</button>
+                        </div>
+
+                        <div id="mcp-editor-card" class="provider-editor-card hidden">
+                            <div class="editor-header">
+                                <strong id="mcp-editor-title">Configure MCP Server</strong>
+                                <button type="button" class="close-icon-small" id="btn-cancel-mcp-editor">✕</button>
+                            </div>
+                            <div class="form-grid">
+                                <div class="form-group">
+                                    <label for="edit-mcp-name">Server Display Name</label>
+                                    <input type="text" id="edit-mcp-name" class="form-input" placeholder="e.g. Memory Graph, SQLite Store">
+                                </div>
+                                <div class="form-group">
+                                    <label for="edit-mcp-id">Server ID</label>
+                                    <input type="text" id="edit-mcp-id" class="form-input" placeholder="e.g. memory, sqlite, git">
+                                </div>
+                            </div>
+                            <div class="form-grid">
+                                <div class="form-group">
+                                    <label for="edit-mcp-transport-trigger">Transport</label>
+                                    <div class="ui-select" id="edit-mcp-transport-select" data-value="stdio">
+                                        <input type="hidden" id="edit-mcp-transport" value="stdio">
+                                        <button type="button" class="ui-select-trigger" id="edit-mcp-transport-trigger" aria-haspopup="listbox" aria-expanded="false">
+                                            <span class="ui-select-label">stdio (Local Subprocess)</span>
+                                            <span class="ui-select-chevron">▾</span>
+                                        </button>
+                                        <div class="ui-select-menu hidden" role="listbox">
+                                            <button type="button" class="ui-select-option active" data-value="stdio">stdio (Local Subprocess)</button>
+                                            <button type="button" class="ui-select-option" data-value="sse">sse / HTTP (Remote Endpoint)</button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="form-group" id="mcp-command-wrap">
+                                    <label for="edit-mcp-command">Command</label>
+                                    <input type="text" id="edit-mcp-command" class="form-input" placeholder="npx, uvx, node, python">
+                                </div>
+                            </div>
+                            <div class="form-group" id="mcp-args-wrap">
+                                <label for="edit-mcp-args">Arguments</label>
+                                <input type="text" id="edit-mcp-args" class="form-input" placeholder="-y @modelcontextprotocol/server-memory">
+                            </div>
+                            <div class="form-group hidden" id="mcp-url-wrap">
+                                <label for="edit-mcp-url">Server SSE / HTTP URL</label>
+                                <input type="text" id="edit-mcp-url" class="form-input" placeholder="http://localhost:3000/sse">
+                            </div>
+                            <div class="form-group">
+                                <label for="edit-mcp-env">Environment Variables (KEY=VALUE, comma separated)</label>
+                                <input type="text" id="edit-mcp-env" class="form-input" placeholder="DEBUG=true, DB_PATH=./data.db">
+                            </div>
+                            <div class="editor-actions">
+                                <button type="button" class="btn-secondary" id="btn-test-mcp-server">⚡ Test Handshake</button>
+                                <div class="editor-save-group">
+                                    <button type="button" class="btn-secondary" id="btn-dismiss-mcp-editor">Cancel</button>
+                                    <button type="button" class="btn-primary" id="btn-save-mcp-server">Save MCP Server</button>
+                                </div>
+                            </div>
+                            <div id="mcp-test-status" class="provider-test-status hidden"></div>
+                        </div>
+
+                        <div class="mcp-servers-list" id="configured-mcp-container"></div>
+                    </section>
+
+                    <!-- PAGE 4: SEARCH ENGINES -->
+                    <section class="settings-page hidden" id="settings-page-search">
+                        <div class="settings-page-header">
+                            <h4>Search Engines</h4>
+                        </div>
+
+                        <div class="search-providers-grid" id="search-providers-grid">
+                            <div class="search-provider-card active" data-search-provider="tinyfish">
+                                <div class="sp-card-header">
+                                    <span class="sp-card-icon">🐟</span>
+                                    <strong>TinyFish</strong>
+                                    <span class="badge-active">AI</span>
+                                </div>
+                            </div>
+                            <div class="search-provider-card" data-search-provider="duckduckgo">
+                                <div class="sp-card-header">
+                                    <span class="sp-card-icon">🦆</span>
+                                    <strong>DuckDuckGo</strong>
+                                    <span class="badge-free">No Key</span>
+                                </div>
+                            </div>
+                            <div class="search-provider-card" data-search-provider="tavily">
+                                <div class="sp-card-header">
+                                    <span class="sp-card-icon">🎯</span>
+                                    <strong>Tavily</strong>
+                                    <span class="badge-pro">Agent</span>
+                                </div>
+                            </div>
+                            <div class="search-provider-card" data-search-provider="brave">
+                                <div class="sp-card-header">
+                                    <span class="sp-card-icon">🦁</span>
+                                    <strong>Brave</strong>
+                                    <span class="badge-privacy">Private</span>
+                                </div>
+                            </div>
+                            <div class="search-provider-card" data-search-provider="searxng">
+                                <div class="sp-card-header">
+                                    <span class="sp-card-icon">🔎</span>
+                                    <strong>SearXNG</strong>
+                                    <span class="badge-idle">Self-Host</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="search-settings-card">
+                            <h4 id="search-settings-title">Configure TinyFish Search</h4>
+                            <div class="form-grid">
+                                <div class="form-group" id="search-key-wrap">
+                                    <label for="cfg-search-api-key">Provider API Key</label>
+                                    <input type="password" id="cfg-search-api-key" class="form-input" placeholder="sk-tinyfish-...">
+                                </div>
+                                <div class="form-group">
+                                    <label for="cfg-search-max-results">Max Results per Query</label>
+                                    <input type="number" id="cfg-search-max-results" class="form-input" min="1" max="20" value="5">
+                                </div>
+                            </div>
+                            <div class="form-group hidden" id="search-searxng-url-wrap">
+                                <label for="cfg-searxng-url">SearXNG Instance URL</label>
+                                <input type="text" id="cfg-searxng-url" class="form-input" placeholder="https://searx.be">
+                            </div>
+                            <div class="search-save-actions">
+                                <button type="button" class="btn-primary" id="btn-save-search-config">Save Search Configuration</button>
+                            </div>
+                        </div>
+
+                        <div class="search-tester-card">
+                            <h4>⚡ Test Live Search</h4>
+                            <div class="tester-input-row">
+                                <input type="text" id="search-test-query" class="form-input" placeholder="Enter search query...">
+                                <button type="button" class="btn-primary" id="btn-run-search-test">Test Search</button>
+                            </div>
+                            <div id="search-test-output-box" class="search-test-output-box hidden">
+                                <div class="test-output-meta">
+                                    <span id="test-output-provider-badge">Provider: TinyFish</span>
+                                    <span id="test-output-latency">-- ms</span>
+                                </div>
+                                <div id="test-output-rendered" class="test-output-content markdown-body"></div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- PAGE 5: TOOLS & PERMISSIONS -->
+                    <section class="settings-page hidden" id="settings-page-tools">
+                        <div class="settings-page-header">
+                            <h4>Tools &amp; Permissions</h4>
+                            <button type="button" class="btn-action-pill primary" id="btn-open-tools-from-settings">🧩 Registered Tools &amp; Contracts <span id="settings-tools-count-badge"></span></button>
+                        </div>
+
+                        <div class="permission-matrix">
+                            <div class="permission-row">
+                                <div class="perm-info">
+                                    <strong>Global Permission Mode</strong>
+                                    <span>Safe (interactive), Autonomous, or Read Only</span>
+                                </div>
+                                <div class="segmented-control" id="perm-global-mode" data-policy="global_mode">
+                                    <button type="button" class="seg-btn active" data-val="safe">Safe</button>
+                                    <button type="button" class="seg-btn" data-val="autonomous">Autonomous</button>
+                                    <button type="button" class="seg-btn" data-val="read_only">Read Only</button>
+                                </div>
+                            </div>
+
+                            <div class="permission-row">
+                                <div class="perm-info">
+                                    <strong>Shell Execution (bash / powershell)</strong>
+                                    <span>CLI commands &amp; build scripts</span>
+                                </div>
+                                <div class="segmented-control" data-policy="bash">
+                                    <button type="button" class="seg-btn" data-val="allow">Allow</button>
+                                    <button type="button" class="seg-btn active" data-val="ask">Ask</button>
+                                    <button type="button" class="seg-btn" data-val="deny">Deny</button>
+                                </div>
+                            </div>
+
+                            <div class="permission-row">
+                                <div class="perm-info">
+                                    <strong>File Write &amp; Edit</strong>
+                                    <span>write_file, edit_file</span>
+                                </div>
+                                <div class="segmented-control" data-policy="file_write">
+                                    <button type="button" class="seg-btn active" data-val="allow">Allow</button>
+                                    <button type="button" class="seg-btn" data-val="ask">Ask</button>
+                                    <button type="button" class="seg-btn" data-val="deny">Deny</button>
+                                </div>
+                            </div>
+
+                            <div class="permission-row">
+                                <div class="perm-info">
+                                    <strong>Live Web (web_search, web_fetch)</strong>
+                                    <span>Web search &amp; page scraping</span>
+                                </div>
+                                <div class="segmented-control" data-policy="web">
+                                    <button type="button" class="seg-btn active" data-val="allow">Allow</button>
+                                    <button type="button" class="seg-btn" data-val="ask">Ask</button>
+                                    <button type="button" class="seg-btn" data-val="deny">Deny</button>
+                                </div>
+                            </div>
+
+                            <div class="permission-row">
+                                <div class="perm-info">
+                                    <strong>File Read &amp; Search</strong>
+                                    <span>read_file, grep_search</span>
+                                </div>
+                                <div class="segmented-control" data-policy="file_read">
+                                    <button type="button" class="seg-btn active" data-val="allow">Allow</button>
+                                    <button type="button" class="seg-btn" data-val="deny">Deny</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="search-save-actions">
+                            <button type="button" class="btn-primary" id="btn-save-permissions">Save Policies</button>
+                        </div>
+                    </section>
+
+                    <!-- PAGE 6: SKILLS & AUTOMATIONS -->
+                    <section class="settings-page hidden" id="settings-page-skills">
+                        <div class="settings-page-header">
+                            <h4>Skills &amp; Automations</h4>
+                            <div class="editor-save-group">
+                                <button type="button" class="btn-secondary" id="btn-refresh-skills">↻ Refresh</button>
+                                <button type="button" class="btn-primary" id="btn-new-skill">+ New Skill</button>
+                            </div>
+                        </div>
+
+                        <div id="skill-editor-card" class="provider-editor-card hidden">
+                            <div class="editor-header">
+                                <strong id="skill-editor-title">Create Skill</strong>
+                                <button type="button" class="close-icon-small" id="btn-cancel-skill">✕</button>
+                            </div>
+                            <div class="form-grid">
+                                <div class="form-group">
+                                    <label for="edit-skill-name">Skill Name (/command)</label>
+                                    <input type="text" id="edit-skill-name" class="form-input" placeholder="e.g. code-review, ui-audit">
+                                </div>
+                                <div class="form-group">
+                                    <label for="edit-skill-desc">Short Description</label>
+                                    <input type="text" id="edit-skill-desc" class="form-input" placeholder="e.g. Deep security & performance review">
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label for="edit-skill-content">Skill Instructions (Markdown)</label>
+                                <textarea id="edit-skill-content" class="form-input skill-textarea" rows="5" placeholder="# Instructions&#10;Describe steps, constraints, and verification expectations..."></textarea>
+                            </div>
+                            <div class="editor-actions">
+                                <label class="checkbox-label ui-switch-row">
+                                    <span class="ui-switch">
+                                        <input type="checkbox" id="edit-skill-enabled" checked>
+                                        <span class="ui-switch-track"><span class="ui-switch-thumb"></span></span>
+                                    </span>
+                                    <span>Enabled in active workspace</span>
+                                </label>
+                                <div class="editor-save-group">
+                                    <button type="button" class="btn-secondary" id="btn-dismiss-skill-editor">Cancel</button>
+                                    <button type="button" class="btn-primary" id="btn-save-skill">Save Skill</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="skills-list-container" id="skills-list-container">
+                            <div class="loading-state">Loading workspace skills...</div>
+                        </div>
+
+                        <div class="settings-subsection">
+                            <div class="settings-subsection-title">Automations</div>
+                            <p style="font-size:0.76rem;color:var(--text-dim);margin:0 0 8px;">
+                                Scheduled agent runs. Each automation runs as its own session and can be
+                                standalone or bound to a project.
+                            </p>
+                            <div class="automations-list" id="automations-list"></div>
+                            <div id="automation-editor" class="hidden" style="margin-top:10px;display:flex;flex-direction:column;gap:8px;">
+                                <input type="text" id="automation-name" class="form-input" placeholder="Name (e.g. GitHub Repo Watcher)">
+                                <input type="text" id="automation-description" class="form-input" placeholder="Description (optional)">
+                                <textarea id="automation-prompt" class="form-input" rows="3" placeholder="What should the agent do on each run?"></textarea>
+                                <select id="automation-trigger" class="form-input">
+                                    <option value="manual">Manual only</option>
+                                    <option value="interval">Every interval</option>
+                                    <option value="cron">Cron schedule</option>
+                                    <option value="always_on">Always on</option>
+                                </select>
+                                <input type="text" id="automation-every" class="form-input" placeholder="Interval, e.g. 30m or 2h">
+                                <input type="text" id="automation-cron" class="form-input" placeholder="Cron, e.g. */10 * * * *">
+                                <select id="automation-project" class="form-input">
+                                    <option value="">Standalone (no project)</option>
+                                </select>
+                                <div style="display:flex;gap:8px;justify-content:flex-end;">
+                                    <button type="button" class="btn-inline-cancel" id="btn-cancel-automation">Cancel</button>
+                                    <button type="button" class="btn-inline-submit" id="btn-save-automation">Save Automation</button>
+                                </div>
+                            </div>
+                            <button type="button" class="btn-card-action primary" id="btn-new-automation" style="margin-top:10px;">+ New Automation</button>
+                        </div>
+                    </section>
+                </div>
+            </div>
+
+            <div class="modal-footer">
+                <span class="settings-save-feedback hidden" id="settings-save-feedback"></span>
+                <button type="button" class="btn-secondary" id="btn-cancel-config">Close</button>
+                <button type="button" class="btn-primary" id="btn-save-config">Save Changes</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Registered Tools & Contracts Modal -->
+    <div id="tools-modal" class="modal-backdrop hidden">
+        <div class="modal-card modal-large tools-modal-card">
+            <div class="modal-header">
+                <div class="modal-title">
+                    <span class="modal-icon">🧩</span>
+                    <h3 id="tools-modal-title">Tools &amp; Contracts Registry</h3>
+                </div>
+                <div class="tools-header-actions">
+                    <button type="button" class="btn-action-pill primary" id="btn-toggle-add-tool">+ Add Extra Tool</button>
+                    <button class="close-btn" id="btn-close-tools">✕</button>
+                </div>
+            </div>
+            <div class="modal-body tools-modal-body">
+                <div class="tools-banner-row">
+                    <div class="tools-summary-strip" id="tools-summary-strip"></div>
+                </div>
+
+                <!-- Collapsible "+ Add Extra Tool" Builder -->
+                <div id="custom-tool-builder-card" class="provider-editor-card custom-tool-builder hidden">
+                    <div class="editor-header">
+                        <strong>Create Custom Extra Tool</strong>
+                        <button type="button" class="close-icon-small" id="btn-cancel-custom-tool" title="Collapse builder">✕</button>
+                    </div>
+
+                    <div class="form-grid tools-builder-meta-grid">
+                        <div class="form-group">
+                            <label for="ct-name">Tool Name (snake_case)</label>
+                            <input type="text" id="ct-name" class="form-input mono-input" placeholder="e.g. run_clippy_check">
+                        </div>
+                        <div class="form-group">
+                            <label for="ct-category">Category</label>
+                            <div class="ui-combobox" id="ct-category-combobox">
+                                <input type="text" id="ct-category" class="form-input ui-combobox-input" value="custom" autocomplete="off" placeholder="custom">
+                                <button type="button" class="ui-combobox-chevron" id="btn-ct-category-dropdown" title="Show categories" aria-label="Show categories">▾</button>
+                                <div class="ui-combobox-menu hidden" id="ct-category-menu">
+                                    <button type="button" class="ui-select-option" data-value="custom">custom</button>
+                                    <button type="button" class="ui-select-option" data-value="shell">shell</button>
+                                    <button type="button" class="ui-select-option" data-value="web">web</button>
+                                    <button type="button" class="ui-select-option" data-value="files">files</button>
+                                    <button type="button" class="ui-select-option" data-value="devops">devops</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="ct-permission-trigger">Permission Level</label>
+                            <div class="ui-select" id="ct-permission-select" data-value="shell_or_network">
+                                <input type="hidden" id="ct-permission" value="shell_or_network">
+                                <button type="button" class="ui-select-trigger" id="ct-permission-trigger" aria-haspopup="listbox" aria-expanded="false">
+                                    <span class="ui-select-label">ShellOrNetwork</span>
+                                    <span class="ui-select-chevron">▾</span>
+                                </button>
+                                <div class="ui-select-menu hidden" role="listbox">
+                                    <button type="button" class="ui-select-option" data-value="read_only">ReadOnly</button>
+                                    <button type="button" class="ui-select-option" data-value="workspace_write">WorkspaceWrite</button>
+                                    <button type="button" class="ui-select-option active" data-value="shell_or_network">ShellOrNetwork</button>
+                                    <button type="button" class="ui-select-option" data-value="high_risk">HighRisk</button>
+                                    <button type="button" class="ui-select-option" data-value="meta">Meta</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="ct-timeout">Timeout (secs)</label>
+                            <input type="number" id="ct-timeout" class="form-input" min="1" max="600" value="30">
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="ct-description">Description (shown to model &amp; contract inspector)</label>
+                        <input type="text" id="ct-description" class="form-input" placeholder="What this tool does and when the agent should call it">
+                    </div>
+
+                    <!-- Dynamic Expected Fields Builder -->
+                    <div class="ct-section-box">
+                        <div class="label-with-action">
+                            <label class="ct-section-label">Expected Input Fields</label>
+                            <button type="button" class="btn-text-action" id="btn-add-ct-field">+ Add Field</button>
+                        </div>
+                        <div id="ct-fields-list" class="ct-fields-list"></div>
+                    </div>
+
+                    <!-- Expected Output & Failure Modes -->
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label for="ct-out-format">Expected Output Format &amp; Description</label>
+                            <div class="ct-output-row">
+                                <div class="ui-select ct-format-select" id="ct-out-format-select" data-value="text">
+                                    <input type="hidden" id="ct-out-format" value="text">
+                                    <button type="button" class="ui-select-trigger" id="ct-out-format-trigger" aria-haspopup="listbox" aria-expanded="false">
+                                        <span class="ui-select-label">text</span>
+                                        <span class="ui-select-chevron">▾</span>
+                                    </button>
+                                    <div class="ui-select-menu hidden" role="listbox">
+                                        <button type="button" class="ui-select-option active" data-value="text">text</button>
+                                        <button type="button" class="ui-select-option" data-value="json">json</button>
+                                        <button type="button" class="ui-select-option" data-value="markdown">markdown</button>
+                                    </div>
+                                </div>
+                                <input type="text" id="ct-out-desc" class="form-input" placeholder="e.g. Command stdout/stderr or parsed JSON result">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="ct-failure-hint">Failure Mode / Recovery Hint (optional)</label>
+                            <input type="text" id="ct-failure-hint" class="form-input" placeholder="e.g. Non-zero exit or timeout -> verify target path or arguments">
+                        </div>
+                    </div>
+
+                    <!-- Runner Selector -->
+                    <div class="ct-section-box">
+                        <div class="ct-runner-header">
+                            <label class="ct-section-label">Execution Runner</label>
+                            <div class="segmented-control" id="ct-runner-type-ctrl">
+                                <button type="button" class="seg-btn active" data-runner-type="shell">Shell Command Template</button>
+                                <button type="button" class="seg-btn" data-runner-type="http">HTTP Request</button>
+                            </div>
+                        </div>
+
+                        <div id="ct-runner-shell" class="ct-runner-panel">
+                            <div class="form-group">
+                                <label for="ct-shell-cmd">Command Template</label>
+                                <input type="text" id="ct-shell-cmd" class="form-input mono-input" placeholder="e.g. cargo clippy --package {{crate}} -- -D warnings">
+                                <span class="form-hint">Use <code>{{field}}</code> placeholders (auto-substituted) or read <code>HARNESS_ARG_&lt;UPPER_FIELD&gt;</code> env vars inside the sandbox.</span>
+                            </div>
+                        </div>
+
+                        <div id="ct-runner-http" class="ct-runner-panel hidden">
+                            <div class="form-grid ct-http-grid">
+                                <div class="form-group">
+                                    <label for="ct-http-method-trigger">Method</label>
+                                    <div class="ui-select" id="ct-http-method-select" data-value="GET">
+                                        <input type="hidden" id="ct-http-method" value="GET">
+                                        <button type="button" class="ui-select-trigger" id="ct-http-method-trigger" aria-haspopup="listbox" aria-expanded="false">
+                                            <span class="ui-select-label">GET</span>
+                                            <span class="ui-select-chevron">▾</span>
+                                        </button>
+                                        <div class="ui-select-menu hidden" role="listbox">
+                                            <button type="button" class="ui-select-option active" data-value="GET">GET</button>
+                                            <button type="button" class="ui-select-option" data-value="POST">POST</button>
+                                            <button type="button" class="ui-select-option" data-value="PUT">PUT</button>
+                                            <button type="button" class="ui-select-option" data-value="PATCH">PATCH</button>
+                                            <button type="button" class="ui-select-option" data-value="DELETE">DELETE</button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <label for="ct-http-url">URL Template</label>
+                                    <input type="text" id="ct-http-url" class="form-input mono-input" placeholder="https://api.example.com/v1/items/{{id}}">
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label for="ct-http-body">Request Body Template (optional JSON/text)</label>
+                                <textarea id="ct-http-body" class="form-input skill-textarea" rows="2" placeholder='{"query": "{{query}}"}'></textarea>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="ct-status-msg" class="provider-test-status hidden"></div>
+
+                    <div class="editor-actions">
+                        <button type="button" class="btn-secondary" id="btn-reset-custom-tool">Reset</button>
+                        <button type="button" class="btn-primary" id="btn-save-custom-tool">Create &amp; Register Tool</button>
+                    </div>
+                </div>
+
+                <!-- Filter Pills & Search Bar -->
+                <div class="tools-filter-toolbar">
+                    <div class="tools-filter-pills" id="tools-filter-pills">
+                        <button type="button" class="tool-filter-pill active" data-filter="all">All</button>
+                        <button type="button" class="tool-filter-pill" data-filter="builtin">Built-in</button>
+                        <button type="button" class="tool-filter-pill" data-filter="custom">Custom</button>
+                    </div>
+                    <div class="tools-search-wrap">
+                        <input type="text" id="tools-search-input" class="form-input tools-search-input" placeholder="Search tools, fields, permissions...">
+                    </div>
+                </div>
+
+                <div id="tools-action-feedback" class="provider-test-status hidden"></div>
+
+                <div class="tools-grid" id="tools-container">
+                    <div class="loading-state">Loading plugin registry...</div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn-secondary" id="btn-refresh-tools">↻ Refresh</button>
+                <button type="button" class="btn-primary" id="btn-close-tools-foot">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- NEW PROJECT WORKSPACE MODAL -->
+    <div id="project-modal" class="modal-backdrop hidden">
+        <div class="modal-card">
+            <div class="modal-header">
+                <div class="modal-title">
+                    <span class="modal-icon">📁</span>
+                    <h3 id="project-modal-title">New Project Workspace</h3>
+                </div>
+                <button class="close-btn" id="btn-close-project">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="project-name-input">Project Name</label>
+                    <input type="text" id="project-name-input" class="form-input" placeholder="e.g. Backend API, Web Scraper, Data Pipeline">
+                </div>
+
+                <div class="form-group">
+                    <label for="project-path-input">Local Workspace Path</label>
+                    <div class="input-with-action-row">
+                        <input type="text" id="project-path-input" class="form-input" placeholder="C:\Users\Akagikay\Downloads\Harness\projects\backend">
+                        <button type="button" class="btn-action-inline" id="btn-browse-project-path" title="Open In-Browser Folder Browser">📁 Browse...</button>
+                    </div>
+                    <span class="form-hint">Select any folder on disk or create a new one using the in-browser file manager.</span>
+                <div class="form-group">
+                    <label for="project-extra-paths">Additional Folders <span style="color:var(--text-dim);font-weight:400;">(optional)</span></label>
+                    <textarea id="project-extra-paths" class="form-input" rows="2" placeholder="One folder per line, e.g. C:\data\reference"></textarea>
+                    <span class="form-hint">A project can span several folders. The agent can read and write in all of them.</span>
+                </div>
+
+                <div class="form-group">
+                    <label>Project Icon</label>
+                    <div class="icon-picker-row" id="project-icon-picker">
+                        <button type="button" class="icon-choice active" data-icon="📁">📁</button>
+                        <button type="button" class="icon-choice" data-icon="🚀">🚀</button>
+                        <button type="button" class="icon-choice" data-icon="🦀">🦀</button>
+                        <button type="button" class="icon-choice" data-icon="⚡">⚡</button>
+                        <button type="button" class="icon-choice" data-icon="🧠">🧠</button>
+                        <button type="button" class="icon-choice" data-icon="💻">💻</button>
+                        <button type="button" class="icon-choice" data-icon="🌐">🌐</button>
+                        <button type="button" class="icon-choice" data-icon="📦">📦</button>
+                    </div>
+                </div>
+
+                <div class="form-group checkbox-row">
+                    <label class="checkbox-label ui-switch-row">
+                        <span class="ui-switch">
+                            <input type="checkbox" id="project-set-active-check" checked>
+                            <span class="ui-switch-track"><span class="ui-switch-thumb"></span></span>
+                        </span>
+                        <span>Switch to this project immediately upon creation</span>
+                    </label>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn-secondary" id="btn-cancel-project">Cancel</button>
+                <button type="button" class="btn-primary" id="btn-submit-project">Create Project</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- PROJECT DEFAULT SETTINGS MODAL -->
+    <div id="project-settings-modal" class="modal-backdrop hidden">
+        <div class="modal-card">
+            <div class="modal-header">
+                <div class="modal-title">
+                    <span class="modal-icon" id="proj-settings-icon">⚙</span>
+                    <h3 id="proj-settings-title">Project Default Settings</h3>
+                </div>
+                <button class="close-btn" id="btn-close-proj-settings">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="proj-def-name">Project Name</label>
+                        <input type="text" id="proj-def-name" class="form-input" placeholder="Project Name">
+                    </div>
+                    <div class="form-group">
+                        <label for="proj-def-icon">Icon</label>
+                        <input type="text" id="proj-def-icon" class="form-input" value="📁" style="width:80px;">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="proj-def-path">Workspace Directory</label>
+                    <div class="input-with-action-row">
+                        <input type="text" id="proj-def-path" class="form-input" placeholder="Workspace directory path...">
+                        <button type="button" class="btn-action-inline" id="btn-browse-proj-def-path" title="Browse Directory">📁 Browse...</button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Default Model &amp; Thinking Level</label>
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <button type="button" class="model-picker-pill orch-model-picker-pill" id="btn-proj-def-model-picker" style="flex:1;">
+                            <span class="model-name" id="label-proj-def-model">Use Global Default</span>
+                            <span class="model-effort-inline" id="label-proj-def-effort"></span>
+                            <span class="arrow-down">⌵</span>
+                        </button>
+                        <button type="button" class="btn-secondary" id="btn-clear-proj-def-model" title="Reset to global default">Reset</button>
+                    </div>
+                    <span class="settings-sub-caption" id="label-proj-def-provider-hint">Provider resolved from selected model</span>
+                </div>
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="proj-def-server">Default Execution Server</label>
+                        <select id="proj-def-server" class="form-input"></select>
+                    </div>
+                    <div class="form-group">
+                        <label for="proj-def-orchestrator">Default Orchestrator Mode</label>
+                        <select id="proj-def-orchestrator" class="form-input">
+                            <option value="inherit">Use Global Setting</option>
+                            <option value="enabled">Enabled (Orchestrator)</option>
+                            <option value="disabled">Disabled (Direct Agent)</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn-secondary" id="btn-cancel-proj-settings">Cancel</button>
+                <button type="button" class="btn-primary" id="btn-save-proj-settings">Save Project Defaults</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- IN-BROWSER FILE / FOLDER BROWSER MODAL -->
+    <div id="file-browser-modal" class="modal-backdrop hidden">
+        <div class="modal-card file-browser-card">
+            <div class="modal-header">
+                <div class="modal-title">
+                    <span class="modal-icon">📁</span>
+                    <h3 id="file-browser-title">Select Project Directory</h3>
+                </div>
+                <button class="close-btn" id="btn-close-file-browser">✕</button>
+            </div>
+            
+            <div class="browser-nav-bar">
+                <div class="browser-nav-left">
+                    <button type="button" class="browser-nav-btn" id="btn-browser-back" title="Go Back">←</button>
+                    <button type="button" class="browser-nav-btn" id="btn-browser-up" title="Parent Directory">↑</button>
+                    <button type="button" class="browser-nav-btn" id="btn-browser-refresh" title="Refresh">↻</button>
+                </div>
+                <div class="browser-path-bar" id="browser-breadcrumbs-container">
+                    <input type="text" id="browser-path-input" class="browser-path-field" placeholder="Directory path...">
+                </div>
+                <div class="browser-nav-right">
+                    <label class="browser-dirs-toggle" title="Show only folders when picking a workspace">
+                        <input type="checkbox" id="browser-dirs-only-toggle" checked>
+                        <span>Folders only</span>
+                    </label>
+                    <button type="button" class="btn-browser-action" id="btn-browser-mkdir" title="Create New Folder in this directory">+ New Folder</button>
+                </div>
+            </div>
+
+            <div class="browser-split-body">
+                <div class="browser-sidebar">
+                    <div class="browser-section-label">Favorites</div>
+                    <div class="browser-shortcuts-list" id="browser-favorites-list"></div>
+
+                    <div class="browser-section-label">Drives</div>
+                    <div class="browser-shortcuts-list" id="browser-drives-list"></div>
+                </div>
+
+                <div class="browser-main-panel">
+                    <div class="browser-table-head">
+                        <span class="col-name">Name</span>
+                        <span class="col-type">Type</span>
+                        <span class="col-size">Size</span>
+                        <span class="col-date">Modified</span>
+                    </div>
+                    <div class="browser-entries-container" id="browser-entries-list">
+                        <div class="loading-state">Loading directory...</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="modal-footer browser-footer">
+                <div class="browser-selection-info">
+                    <span class="selection-label">Selected:</span>
+                    <span class="selection-path" id="browser-selected-label">--</span>
+                </div>
+                <div class="browser-footer-actions">
+                    <button type="button" class="btn-secondary" id="btn-cancel-browser">Cancel</button>
+                    <button type="button" class="btn-primary" id="btn-confirm-browser-select">Select Folder</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- COMMAND PALETTE (Ctrl+K) -->
+    <div id="command-palette-modal" class="modal-backdrop hidden">
+        <div class="modal-card command-palette-card">
+            <div class="palette-search-bar">
+                <span class="palette-search-icon">🔍</span>
+                <input type="text" id="palette-search-input" placeholder="Search commands, skills, projects, conversations... (Esc to close)" autocomplete="off">
+                <span class="palette-shortcut-badge">ESC</span>
+            </div>
+            <div class="palette-results-list" id="palette-results-list"></div>
+            <div class="palette-footer">
+                <span class="palette-hint"><span>↑</span> <span>↓</span> to navigate · <span>↵</span> to select · <span>esc</span> to dismiss</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- IMAGE LIGHTBOX MODAL -->
+    <div id="image-lightbox-modal" class="modal-backdrop hidden">
+        <div class="lightbox-card">
+            <div class="lightbox-header">
+                <span id="lightbox-title">Browser Screenshot</span>
+                <button type="button" class="close-btn" id="btn-close-lightbox">✕</button>
+            </div>
+            <div class="lightbox-body">
+                <img id="lightbox-img" src="" alt="Browser UI Screenshot">
+            </div>
+        </div>
+    </div>
+
+    <!-- CONTEXT UTILIZATION & TOKEN ANALYTICS POPOVER -->
+    <div id="token-analytics-popover" class="popover-menu token-analytics-popover hidden">
+        <div class="popover-header">
+            <span>Context &amp; Token Analytics</span>
+            <button class="btn-text-action" id="btn-popover-compact-ctx" title="Archive older turns to free context window">🗜 Compact Context</button>
+        </div>
+        <div class="token-analytics-body">
+            <div class="token-meter-section">
+                <div class="meter-labels">
+                    <span>Context Utilization</span>
+                    <strong id="analytics-ctx-util-text">0 / 128k (0.0%)</strong>
+                </div>
+                <div class="token-progress-track">
+                    <div class="token-progress-bar" id="analytics-ctx-progress" style="width: 0%;"></div>
+                </div>
+            </div>
+
+            <div class="token-stats-grid">
+                <div class="stat-card">
+                    <span class="stat-card-label">Input (Prompt)</span>
+                    <strong class="stat-card-val" id="analytics-prompt-tokens">0</strong>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-card-label">Output (Generated)</span>
+                    <strong class="stat-card-val" id="analytics-completion-tokens">0</strong>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-card-label">Prompt Cache Read</span>
+                    <strong class="stat-card-val" id="analytics-cached-tokens">0</strong>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-card-label">Cache Hit Rate</span>
+                    <strong class="stat-card-val highlight-green" id="analytics-cache-hit-rate">0.0%</strong>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-card-label">Total Session Tokens</span>
+                    <strong class="stat-card-val" id="analytics-total-tokens">0</strong>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-card-label">Estimated Cost</span>
+                    <strong class="stat-card-val highlight-blue" id="analytics-cost-usd">$0.0000</strong>
+                </div>
+            </div>
+
+            <div class="token-analytics-footer-hint">
+                <span id="analytics-model-window-hint">Model Window: 128k tokens · Automatic prompt caching active</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Prompt Autocomplete Menu (@ Mention & / Slash Commands) -->
+    <div id="prompt-autocomplete-menu" class="popover-menu autocomplete-popover hidden">
+        <div class="autocomplete-header" id="autocomplete-header">Available Mentions</div>
+        <div class="autocomplete-list" id="autocomplete-list"></div>
+    </div>
+
+    <!-- Custom Confirm / Prompt Dialog Modal (replaces browser native confirm/prompt) -->
+    <div id="ui-dialog-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="ui-dialog-title">
+        <div class="modal-card ui-dialog-card">
+            <div class="modal-header">
+                <h3 id="ui-dialog-title">Confirm Action</h3>
+                <button type="button" class="close-btn" id="btn-ui-dialog-close" aria-label="Close">✕</button>
+            </div>
+            <div class="modal-body ui-dialog-body">
+                <p id="ui-dialog-message" class="ui-dialog-message"></p>
+                <div id="ui-dialog-input-wrap" class="form-group hidden">
+                    <input type="text" id="ui-dialog-input" class="form-input" autocomplete="off">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn-secondary" id="btn-ui-dialog-cancel">Cancel</button>
+                <button type="button" class="btn-primary" id="btn-ui-dialog-confirm">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Custom Non-Blocking Toast Notifications (replaces browser alert) -->
+    <div id="toast-container" class="toast-container" aria-live="polite" aria-atomic="true"></div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
