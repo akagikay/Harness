@@ -4,6 +4,7 @@ pub mod engine;
 pub mod models;
 pub mod plugins;
 pub mod remote;
+pub mod skill_router;
 pub mod state;
 pub mod web;
 

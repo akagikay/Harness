@@ -64,8 +64,14 @@ pub fn build_router(state: AppState) -> Router {
             "/api/automations",
             get(handlers::list_automations).post(handlers::save_automation),
         )
-        .route("/api/automations/:id", delete(handlers::delete_automation))
+        .route("/api/automation/logs", get(handlers::automation_logs_handler))
+        .route(
+            "/api/automations/:id",
+            patch(handlers::update_automation_handler).delete(handlers::delete_automation),
+        )
+        .route("/api/automations/:id/logs", get(handlers::automation_logs_for_handler))
         .route("/api/automations/:id/run", post(handlers::run_automation_now))
+        .route("/api/automations/:id/stop", post(handlers::stop_automation_handler))
         .route("/api/models/remote", get(handlers::list_remote_models).post(handlers::list_remote_models_post))
         .route("/api/models/all", get(handlers::list_all_provider_models))
         .route("/api/models/reasoning", get(handlers::get_model_reasoning))

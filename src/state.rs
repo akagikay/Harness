@@ -189,6 +189,81 @@ pub fn build_slash_command_directive(
     }
 }
 
+/// Automatically route a plain user message to matching skills.
+///
+/// Returns `(command, label, directive)` triples — the same shape as
+/// [`build_slash_command_directive`] — so an auto-routed skill is injected as a
+/// labelled `[SYSTEM COMMAND DIRECTIVE /<skill>]` system message, exactly like an
+/// explicit `/skill` command but without the user typing one.
+///
+/// Safety contract:
+/// - Returns nothing when `auto_skill_router` is disabled (behaviour identical to
+///   a build without routing).
+/// - Returns nothing for an empty prompt (no signal to route on).
+/// - Never more than `skill_router_max_skills` entries, and only skills whose
+///   router confidence clears `skill_router_min_confidence`.
+/// - Callers must not use this when an explicit `/slash` command is present: an
+///   explicit command always wins.
+pub fn build_auto_skill_directives(
+    conf: &HarnessConfig,
+    sandbox: &std::path::Path,
+    prompt: &str,
+) -> Vec<(String, String, String)> {
+    if !conf.auto_skill_router || prompt.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let skills = conf
+        .discover_skills_in(sandbox)
+        .into_iter()
+        .filter(|s| s.enabled)
+        .map(|s| {
+            crate::skill_router::RoutableSkill::from_definition_merged(
+                &s,
+                crate::builtin_skills::BUILTIN_SKILLS,
+            )
+        })
+        .collect::<Vec<_>>();
+    if skills.is_empty() {
+        return Vec::new();
+    }
+
+    crate::skill_router::route_skills(prompt, &skills, conf.skill_router_settings())
+        .into_iter()
+        .map(|matched| {
+            let matched_terms = if matched.matched_terms.is_empty() {
+                String::new()
+            } else {
+                format!(" Matched on: {}.", matched.matched_terms.join(", "))
+            };
+            let tool_note = if matched.tool_hints.is_empty() {
+                String::new()
+            } else {
+                format!(" Tool hints: {}.", matched.tool_hints.join(", "))
+            };
+            let directive = format!(
+                "[SYSTEM COMMAND DIRECTIVE /{}] Auto-routed skill '{}' ({}) with confidence {:.2}.\n\
+                 The user did not invoke this skill explicitly; the router matched this message to it, so \
+                 follow it as a system directive and let the user's request take precedence where they conflict.{}{}\n\
+                 Description: {}\n\nSkill Instructions:\n{}",
+                matched.name,
+                matched.name,
+                matched.path,
+                matched.confidence,
+                matched_terms,
+                tool_note,
+                matched.description,
+                matched.content
+            );
+            (
+                matched.name.clone(),
+                format!("Skill: {}", matched.name),
+                directive,
+            )
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct ServerRunHandle {
     pub run_id: String,
@@ -1121,6 +1196,19 @@ if !saved_conf.onboarded {
             None
         };
 
+        // No explicit slash command: let the router try to match a skill to the
+        // user's own words. Never runs when a `/slash` command is present, never
+        // runs for an empty prompt, and never runs when `auto_skill_router` is
+        // disabled (the function returns an empty vec in that case).
+        let auto_skill_directives: Vec<(String, String, String)> =
+            if resolved_cmd.is_none() && !prompt.trim().is_empty() {
+                let sandbox = self.resolve_session_sandbox(session_id).await;
+                let conf = self.config.read().await.clone();
+                build_auto_skill_directives(&conf, &sandbox, prompt)
+            } else {
+                Vec::new()
+            };
+
         let mut lock = self.sessions.write().await;
         let session = lock.get_mut(session_id)?;
 
@@ -1163,6 +1251,21 @@ if !saved_conf.onboarded {
                 command,
                 args,
                 icon,
+                label,
+                timestamp: timestamp.clone(),
+            };
+            session.history.push(sys_evt.clone());
+            let _ = session.event_tx.send(sys_evt);
+            session.llm_messages.push(ChatMessage::system(directive));
+        }
+        // Auto-routed skills (no explicit slash command) are injected here, one
+        // labelled directive per matched skill, at most `skill_router_max_skills`.
+        for (command, label, directive) in auto_skill_directives {
+            let sys_evt = HarnessEvent::SystemCommand {
+                turn_id,
+                command,
+                args: String::new(),
+                icon: "skill".to_string(),
                 label,
                 timestamp: timestamp.clone(),
             };
@@ -1337,7 +1440,26 @@ if !saved_conf.onboarded {
                 format!("{}\n\n{}", directive, item.content)
             }
         } else {
-            item.content.clone()
+            // No slash command: auto-route the queued prompt exactly like a fresh
+            // turn, so a promoted queued prompt gets the same skill guidance.
+            let sandbox = self.resolve_session_sandbox(session_id).await;
+            let conf = self.config.read().await.clone();
+            let auto = build_auto_skill_directives(&conf, &sandbox, &item.content);
+            if item.content.trim().is_empty() {
+                auto.into_iter()
+                    .map(|(_, _, directive)| directive)
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            } else if auto.is_empty() {
+                item.content.clone()
+            } else {
+                let prefix = auto
+                    .into_iter()
+                    .map(|(_, _, directive)| directive)
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                format!("{}\n\n{}", prefix, item.content)
+            }
         };
         inbox.lock().await.push_back(steer_text);
         Some((item, remaining))
@@ -2221,5 +2343,262 @@ mod condense_skill_tests {
         assert_eq!(kind, "condense");
         assert!(directive.contains("create_skill"), "directive must instruct calling create_skill");
         assert!(directive.contains("SYSTEM COMMAND DIRECTIVE /condense"));
+    }
+}
+
+#[cfg(test)]
+mod auto_skill_router_tests {
+    use super::*;
+
+    fn default_conf() -> HarnessConfig {
+        HarnessConfig::default()
+    }
+
+    /// Text of every system-role message injected into a session.
+    fn system_texts(state: &crate::state::AppState, session_id: &str) -> Vec<String> {
+        state
+            .sessions
+            .try_read()
+            .ok()
+            .and_then(|lock| lock.get(session_id).map(|s| s.llm_messages.clone()))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| m.role == "system")
+            .filter_map(|m| m.content)
+            .collect()
+    }
+
+    #[test]
+    fn routing_message_injects_the_matching_skill_directive() {
+        let conf = default_conf();
+        let directives = crate::state::build_auto_skill_directives(
+            &conf,
+            std::path::Path::new("."),
+            "Refactor the router and run the tests to verify it",
+        );
+        assert_eq!(directives.len(), 1, "one clear intent -> exactly one skill");
+        let (command, label, directive) = &directives[0];
+        assert_eq!(command, "code");
+        assert_eq!(label, "Skill: code");
+        assert!(directive.starts_with("[SYSTEM COMMAND DIRECTIVE /code] Auto-routed skill"));
+        assert!(directive.contains("builtin://code"));
+        assert!(directive.contains("Skill Instructions:"));
+        assert!(directive.contains("Read before writing."));
+    }
+
+    #[test]
+    fn low_signal_messages_inject_nothing() {
+        let conf = default_conf();
+        for msg in ["ok", "thanks", "hi", ""] {
+            assert!(
+                crate::state::build_auto_skill_directives(&conf, std::path::Path::new("."), msg)
+                    .is_empty(),
+                "'{msg}' must not inject a skill"
+            );
+        }
+    }
+
+    #[test]
+    fn at_mention_hint_still_routes() {
+        let conf = default_conf();
+        let directives = crate::state::build_auto_skill_directives(
+            &conf,
+            std::path::Path::new("."),
+            "Fix the failing build and refactor the parser, check it with @bash",
+        );
+        assert_eq!(directives.len(), 1);
+        assert_eq!(directives[0].0, "code");
+        assert!(directives[0].2.contains("Tool hints: bash."));
+    }
+
+    #[test]
+    fn multi_intent_stays_within_the_cap() {
+        let msg = "Research and cite the latest sources, then implement and test the fix";
+        let mut conf = default_conf();
+        conf.skill_router_max_skills = 1;
+        let capped = crate::state::build_auto_skill_directives(&conf, std::path::Path::new("."), msg);
+        assert_eq!(capped.len(), 1, "the cap must limit injection to one skill");
+
+        conf.skill_router_max_skills = 2;
+        let both = crate::state::build_auto_skill_directives(&conf, std::path::Path::new("."), msg);
+        assert_eq!(both.len(), 2, "near-tie multi-intent may inject two skills");
+        let names: Vec<&str> = both.iter().map(|d| d.0.as_str()).collect();
+        assert_eq!(names, vec!["web-research", "code"]);
+    }
+
+    #[test]
+    fn threshold_gate_blocks_weak_matches() {
+        let mut conf = default_conf();
+        conf.skill_router_min_confidence = 0.99;
+        let directives = crate::state::build_auto_skill_directives(
+            &conf,
+            std::path::Path::new("."),
+            "Refactor the skill router and run the tests to verify it",
+        );
+        assert!(directives.is_empty(), "a high threshold must block injection");
+    }
+
+    #[test]
+    fn disabled_flag_produces_no_injection() {
+        let mut conf = default_conf();
+        conf.auto_skill_router = false;
+        assert!(crate::state::build_auto_skill_directives(
+            &conf,
+            std::path::Path::new("."),
+            "Refactor the skill router and run the tests to verify it"
+        )
+        .is_empty());
+        // A clearly routing message must stay silent while disabled.
+        assert!(crate::state::build_auto_skill_directives(
+            &conf,
+            std::path::Path::new("."),
+            "Research and cite sources for async runtimes"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn explicit_slash_command_wins_over_auto_routing() {
+        let conf = default_conf();
+        // The slash path is separate; the auto path must not fire for the same
+        // message that an explicit command covers.
+        let (kind, _label, directive) = build_slash_command_directive(
+            &conf,
+            std::path::Path::new("."),
+            "review",
+            "src/state.rs",
+        );
+        assert_eq!(kind, "review");
+        assert!(directive.starts_with("[SYSTEM COMMAND DIRECTIVE /review]"));
+    }
+
+    #[tokio::test]
+    async fn begin_turn_injects_the_routed_skill_for_a_plain_message() {
+        let mut cfg = default_conf();
+        cfg.mock_mode = true;
+        let state = crate::state::AppState::new(cfg);
+        let session_id = "ses_auto_router".to_string();
+        state
+            .create_session_with_options(
+                session_id.clone(),
+                "Auto router".to_string(),
+                "harness".to_string(),
+                None,
+                None,
+                None,
+                "idle",
+            )
+            .await;
+
+        let (turn_id, messages, _steer) = state
+            .begin_turn(&session_id, "Refactor the router and run the tests to verify it")
+            .await
+            .expect("turn starts");
+        assert_eq!(turn_id, 1);
+        let injected = messages
+            .iter()
+            .find(|m| {
+                m.content
+                    .as_deref()
+                    .map(|c| c.contains("Auto-routed skill"))
+                    .unwrap_or(false)
+            })
+            .expect("routed skill directive injected");
+        assert!(injected
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("SYSTEM COMMAND DIRECTIVE /code"));
+        assert!(injected
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("Skill Instructions:"));
+
+        // The same directive is broadcast to the UI as a SystemCommand event.
+        let history = {
+            let lock = state.sessions.read().await;
+            lock.get(&session_id)
+                .map(|s| s.history.clone())
+                .unwrap_or_default()
+        };
+        let commands: Vec<String> = history
+            .iter()
+            .filter_map(|e| match e {
+                crate::engine::events::HarnessEvent::SystemCommand { command, .. } => {
+                    Some(command.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(commands.contains(&"code".to_string()));
+    }
+
+    #[tokio::test]
+    async fn begin_turn_with_slash_command_skips_auto_routing() {
+        let mut cfg = default_conf();
+        cfg.mock_mode = true;
+        let state = crate::state::AppState::new(cfg);
+        let session_id = "ses_auto_router_slash".to_string();
+        state
+            .create_session_with_options(
+                session_id.clone(),
+                "Auto router".to_string(),
+                "harness".to_string(),
+                None,
+                None,
+                None,
+                "idle",
+            )
+            .await;
+
+        let (_turn_id, messages, _steer) = state
+            .begin_turn_with_command(&session_id, "", Some("review"), Some("src/state.rs"))
+            .await
+            .expect("turn starts");
+        assert!(
+            !system_texts(&state, &session_id)
+                .iter()
+                .any(|c| c.contains("Auto-routed skill")),
+            "an explicit slash command must never trigger auto routing"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m
+                    .content
+                    .as_deref()
+                    .map(|c| c.contains("SYSTEM COMMAND DIRECTIVE /review"))
+                    .unwrap_or(false))
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_turn_with_low_signal_message_injects_nothing() {
+        let mut cfg = default_conf();
+        cfg.mock_mode = true;
+        let state = crate::state::AppState::new(cfg);
+        let session_id = "ses_auto_router_low".to_string();
+        state
+            .create_session_with_options(
+                session_id.clone(),
+                "Auto router".to_string(),
+                "harness".to_string(),
+                None,
+                None,
+                None,
+                "idle",
+            )
+            .await;
+
+        let (_turn_id, messages, _steer) = state
+            .begin_turn(&session_id, "thanks!")
+            .await
+            .expect("turn starts");
+        assert!(messages.iter().all(|m| m
+            .content
+            .as_deref()
+            .map(|c| !c.contains("Auto-routed skill"))
+            .unwrap_or(true)));
     }
 }

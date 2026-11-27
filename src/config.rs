@@ -492,6 +492,14 @@ fn default_true() -> bool {
     true
 }
 
+fn default_skill_router_min_confidence() -> f32 {
+    0.35
+}
+
+fn default_skill_router_max_skills() -> u32 {
+    2
+}
+
 fn default_mcp_transport() -> String {
     "stdio".to_string()
 }
@@ -757,6 +765,17 @@ pub struct HarnessConfig {
     pub active_project_id: String,
     #[serde(default)]
     pub disabled_skills: Vec<String>,
+    /// Automatically route each user message to matching skills and inject the
+    /// best one's instructions as a system directive (see `crate::skill_router`).
+    /// When false, skills are only activated by an explicit `/skill` command.
+    #[serde(default = "default_true")]
+    pub auto_skill_router: bool,
+    /// Minimum router confidence (0.0..=1.0) required before a skill is injected.
+    #[serde(default = "default_skill_router_min_confidence")]
+    pub skill_router_min_confidence: f32,
+    /// Maximum number of skills injected for one message (multi-intent cap).
+    #[serde(default = "default_skill_router_max_skills")]
+    pub skill_router_max_skills: u32,
     #[serde(default)]
     pub skills_dirs: Vec<String>,
     #[serde(default)]
@@ -838,6 +857,9 @@ impl Default for HarnessConfig {
             projects: default_projects(),
             active_project_id: default_active_project_id(),
             disabled_skills: Vec::new(),
+            auto_skill_router: true,
+            skill_router_min_confidence: default_skill_router_min_confidence(),
+            skill_router_max_skills: default_skill_router_max_skills(),
             skills_dirs: Vec::new(),
             memory: MemoryConfig::default(),
             orchestrator: OrchestratorConfig::default(),
@@ -1082,10 +1104,27 @@ impl HarnessConfig {
             return String::new();
         }
         let mut out = String::from("\nAvailable Workspace Skills:\n");
-        for s in enabled.iter().take(12) {
+        for s in enabled.iter().take(16) {
             out.push_str(&format!("- {} ({}): {}\n", s.name, s.path, s.description));
         }
         out
+    }
+
+    /// Effective knobs for the automatic skill router. Values are clamped so a
+    /// hand-edited config can never disable injection unintentionally or flood
+    /// the context with skills.
+    pub fn skill_router_settings(&self) -> crate::skill_router::RouterSettings {
+        let settings = crate::skill_router::RouterSettings {
+            min_confidence: self.skill_router_min_confidence,
+            max_skills: self.skill_router_max_skills as usize,
+            min_margin: crate::skill_router::DEFAULT_MIN_MARGIN,
+        };
+        let clamped = settings.clamped();
+        crate::skill_router::RouterSettings {
+            min_confidence: clamped.min_confidence,
+            max_skills: clamped.max_skills,
+            min_margin: clamped.min_margin,
+        }
     }
 }
 
@@ -1185,6 +1224,100 @@ mod operator_override_tests {
 
 
 #[cfg(test)]
+mod skill_router_config_tests {
+    use super::*;
+
+    #[test]
+    fn skill_router_defaults_are_enabled_and_conservative() {
+        let cfg = HarnessConfig::default();
+        assert!(cfg.auto_skill_router, "auto routing should ship enabled");
+        assert_eq!(cfg.skill_router_min_confidence, 0.35);
+        assert_eq!(cfg.skill_router_max_skills, 2);
+
+        let settings = cfg.skill_router_settings();
+        assert_eq!(
+            settings.min_confidence,
+            crate::skill_router::DEFAULT_MIN_CONFIDENCE
+        );
+        assert_eq!(settings.max_skills, crate::skill_router::DEFAULT_MAX_SKILLS);
+    }
+
+    #[test]
+    fn skill_router_fields_deserialize_from_partial_json() {
+        // Configs saved before these fields existed must keep the defaults.
+        let json = r#"{
+            "host": "127.0.0.1",
+            "port": 8080,
+            "api_base": "",
+            "api_key": "",
+            "model": "",
+            "tinyfish_api_key": "",
+            "provider": "",
+            "temperature": 0.6,
+            "max_tool_output_bytes": 16384,
+            "tool_timeout_secs": 30,
+            "sandbox_root": ".",
+            "mock_mode": false,
+            "permissions": {
+                "mode": "safe",
+                "bash_policy": "ask",
+                "file_write_policy": "allow",
+                "file_read_policy": "allow",
+                "web_policy": "allow"
+            }
+        }"#;
+        let cfg: HarnessConfig = serde_json::from_str(json).expect("legacy config parses");
+        assert!(cfg.auto_skill_router);
+        assert_eq!(cfg.skill_router_min_confidence, 0.35);
+        assert_eq!(cfg.skill_router_max_skills, 2);
+    }
+
+    #[test]
+    fn skill_router_disabling_flag_round_trips() {
+        // Round-trip a full config snapshot, the way `POST /api/config` does.
+        let mut value = serde_json::to_value(HarnessConfig::default()).expect("serializes");
+        let obj = value.as_object_mut().expect("object");
+        obj.insert("auto_skill_router".to_string(), serde_json::json!(false));
+        obj.insert(
+            "skill_router_min_confidence".to_string(),
+            serde_json::json!(0.5),
+        );
+        obj.insert("skill_router_max_skills".to_string(), serde_json::json!(3));
+        let cfg: HarnessConfig = serde_json::from_value(value).expect("config parses");
+        assert!(!cfg.auto_skill_router);
+        let settings = cfg.skill_router_settings();
+        assert_eq!(settings.min_confidence, 0.5);
+        assert_eq!(settings.max_skills, 3);
+        let serialized = serde_json::to_value(&cfg).expect("serializes");
+        assert_eq!(serialized["auto_skill_router"], serde_json::json!(false));
+        assert_eq!(
+            serialized["skill_router_min_confidence"],
+            serde_json::json!(0.5)
+        );
+        assert_eq!(
+            serialized["skill_router_max_skills"],
+            serde_json::json!(3)
+        );
+    }
+
+    #[test]
+    fn router_settings_clamp_hostile_values() {
+        let mut cfg = HarnessConfig::default();
+        cfg.skill_router_min_confidence = f32::NAN;
+        cfg.skill_router_max_skills = 99;
+        let settings = cfg.skill_router_settings();
+        assert_eq!(
+            settings.min_confidence,
+            crate::skill_router::DEFAULT_MIN_CONFIDENCE
+        );
+        assert_eq!(
+            settings.max_skills,
+            crate::skill_router::MAX_INJECTABLE_SKILLS
+        );
+    }
+}
+
+#[cfg(test)]
 mod builtin_skills_discovery_tests {
     use super::*;
 
@@ -1196,7 +1329,7 @@ mod builtin_skills_discovery_tests {
         let all = cfg.discover_skills_in(&root);
         assert!(all.iter().any(|s| s.name == "code" && s.path == "builtin://code"));
         assert!(all.iter().any(|s| s.name == "reviewer"));
-        assert!(all.iter().filter(|s| s.name == "knowledge-work").count() == 1);
+        assert!(all.iter().filter(|s| s.name == "web-research").count() == 1);
 
         let mut disabled = cfg.clone();
         disabled.disabled_skills = vec!["code".to_string()];

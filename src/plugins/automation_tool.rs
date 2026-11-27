@@ -86,9 +86,13 @@ impl ToolPlugin for ManageAutomationsPlugin {
     }
 
     fn description(&self) -> &str {
-        "Create, list, run, enable/disable, or remove automations. An automation is a saved \
-         prompt with a trigger (interval, cron, always-on, or manual) that runs as its own \
-         agent session. It can be standalone or bound to a project, and can override the model."
+        "Create, inspect, edit, run, enable/disable, or remove automations. An automation is a \
+         saved prompt with a trigger (interval, cron, always-on, or manual) that runs as its own \
+         detached agent run - the output goes to the automation's run log, NOT a conversation. \
+         It can be standalone or bound to a project, and can override the model. \
+         Use action=update to edit an existing automation in place (only the fields you pass \
+         change). Read-only actions: 'logs' (recent runs), 'status' (is it running, next due, \
+         recent summary), 'audit' (roll-up across every automation)."
     }
 
     fn contract(&self) -> ToolContract {
@@ -100,10 +104,25 @@ impl ToolPlugin for ManageAutomationsPlugin {
             fields: vec![
                 ToolFieldSpec::required_string(
                     "action",
-                    "Operation: list, create, run, enable, disable, or remove.",
-                    "Use one of: list, create, run, enable, disable, remove.",
+                    "Operation: list, create, update (edit in place), run, enable, disable, \
+                     remove, logs, status, or audit. The read-only actions (list, logs, \
+                     status, audit) never start or change anything.",
+                    "Use one of: list, create, update, run, enable, disable, remove, logs, \
+                     status, audit.",
                 )
-                .with_enum(["list", "create", "run", "enable", "disable", "remove"])
+                .with_enum([
+                    "list",
+                    "create",
+                    "update",
+                    "edit",
+                    "run",
+                    "enable",
+                    "disable",
+                    "remove",
+                    "logs",
+                    "status",
+                    "audit",
+                ])
                 .non_empty(),
                 ToolFieldSpec::optional_string("id", "Automation id (for run/enable/disable/remove)."),
                 ToolFieldSpec::optional_string(
@@ -326,7 +345,112 @@ impl ToolPlugin for ManageAutomationsPlugin {
                 state.persist_config().await;
                 Ok(json!({ "status": "removed", "id": id }).to_string())
             }
-            other => Err(format!("Unknown action '{other}'. Use list, create, run, enable, disable, or remove.")),
+            // ---- edit an existing automation in place ----
+            "update" | "edit" => {
+                let id = require_id(&args)?;
+                let edit = crate::automation::AutomationEdit::from_json(&args)
+                    .map_err(|e| e)?;
+                let updated = {
+                    let mut conf = state.config.write().await;
+                    let Some(existing) = conf.automations.iter_mut().find(|a| a.id == id) else {
+                        return Err(format!("Automation '{id}' not found."));
+                    };
+                    existing.apply_edit(&edit);
+                    existing.clone()
+                };
+                crate::automation::validate(&updated)?;
+                state.persist_config().await;
+                Ok(json!({
+                    "status": "updated",
+                    "automation": updated,
+                    "trigger": updated.trigger.describe()
+                })
+                .to_string())
+            }
+            // ---- read-only inspection for the agent ----
+            "logs" => {
+                let id = require_id(&args)?;
+                let logs = state.automation_logs_for(&id, 50).await;
+                Ok(serde_json::to_string_pretty(&json!({
+                    "automation_id": id,
+                    "runs": logs,
+                    "summary": crate::automation::summarize_logs(&logs)
+                }))
+                .unwrap_or_default())
+            }
+            "status" => {
+                let id = require_id(&args)?;
+                let (automation, running) = {
+                    let conf = state.config.read().await;
+                    let a = conf
+                        .automations
+                        .iter()
+                        .find(|a| a.id == id)
+                        .cloned()
+                        .ok_or_else(|| format!("Automation '{id}' not found."))?;
+                    (
+                        a,
+                        state
+                            .all_running_run_ids()
+                            .await
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                };
+                let logs = state.automation_logs_for(&id, 10).await;
+                Ok(json!({
+                    "id": id,
+                    "enabled": automation.enabled,
+                    "trigger": automation.trigger.describe(),
+                    "last_status": automation.last_status,
+                    "last_run_at": automation.last_run_at,
+                    "run_count": automation.run_count,
+                    "is_running": !running.is_empty(),
+                    "running_run_ids": running,
+                    "next_due_at": automation.next_due_at(chrono::Local::now()),
+                    "recent": crate::automation::summarize_logs(&logs)
+                })
+                .to_string())
+            }
+            "audit" => {
+                // Read-only roll-up across every automation.
+                let (conf, logs) = {
+                    let conf = state.config.read().await.clone();
+                    let logs = state.automation_logs(200).await;
+                    (conf, logs)
+                };
+                let per: Vec<Value> = conf
+                    .automations
+                    .iter()
+                    .map(|a| {
+                        let own: Vec<_> = logs
+                            .iter()
+                            .filter(|l| l.automation_id == a.id)
+                            .cloned()
+                            .collect();
+                        json!({
+                            "id": a.id,
+                            "name": a.name,
+                            "enabled": a.enabled,
+                            "trigger": a.trigger.describe(),
+                            "last_status": a.last_status,
+                            "is_running": own.iter().any(|l| l.is_running()),
+                            "summary": crate::automation::summarize_logs(&own)
+                        })
+                    })
+                    .collect();
+                Ok(serde_json::to_string_pretty(&json!({
+                    "automations": per,
+                    "overall": crate::automation::summarize_logs(&logs),
+                    "sample_size": logs.len()
+                }))
+                .unwrap_or_default())
+            }
+            other => Err(format!(
+                "Unknown action '{other}'. Use list, create, update, run, enable, disable, \
+                 remove, logs, status, or audit."
+            )),
         }
     }
 }

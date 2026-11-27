@@ -4499,35 +4499,7 @@ pub async fn security_status(State(state): State<AppState>) -> Json<serde_json::
 // Automations (first-class scheduled agent runs)
 // ============================================================================
 
-/// `GET /api/automations` — list automations with their trigger descriptions.
-pub async fn list_automations(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let conf = state.config.read().await;
-    let items: Vec<serde_json::Value> = conf
-        .automations
-        .iter()
-        .map(|a| {
-            serde_json::json!({
-                "id": a.id,
-                "name": a.name,
-                "description": a.description,
-                "prompt": a.prompt,
-                "project_id": a.project_id,
-                "provider_id": a.provider_id,
-                "model": a.model,
-                "enabled": a.enabled,
-                "trigger": a.trigger,
-                "trigger_label": a.trigger.describe(),
-                "created_at": a.created_at,
-                "last_run_at": a.last_run_at,
-                "run_count": a.run_count,
-                "last_status": a.last_status,
-            })
-        })
-        .collect();
-    Json(serde_json::json!({ "automations": items }))
-}
-
-/// `POST /api/automations` — create or update an automation.
+/// `POST /api/automations` - create or update an automation.
 pub async fn save_automation(
     State(state): State<AppState>,
     Json(mut automation): Json<crate::automation::Automation>,
@@ -4590,7 +4562,125 @@ pub async fn delete_automation(
     Ok(Json(serde_json::json!({ "status": "deleted", "id": id })))
 }
 
-/// `POST /api/automations/:id/run` — trigger immediately.
+/// `GET /api/automations` - list automations with status, run counts and logs.
+///
+/// The UI renders the sidebar from this: `is_running` and the recent-run
+/// counters let it show state without a second request per automation.
+pub async fn list_automations(State(state): State<AppState>) -> Json<serde_json::Value> {
+    // Snapshot the in-flight runs once (one lock) so every row renders from the
+    // same view of the world without a lock per automation.
+    let running = state.all_running_run_ids().await;
+    let conf = state.config.read().await;
+    let items: Vec<serde_json::Value> = conf
+        .automations
+        .iter()
+        .map(|a| {
+            let runs = running.get(&a.id).cloned().unwrap_or_default();
+            serde_json::json!({
+                "id": a.id,
+                "name": a.name,
+                "description": a.description,
+                "prompt": a.prompt,
+                "project_id": a.project_id,
+                "provider_id": a.provider_id,
+                "model": a.model,
+                "enabled": a.enabled,
+                "trigger": a.trigger,
+                "trigger_label": a.trigger.describe(),
+                "created_at": a.created_at,
+                "last_run_at": a.last_run_at,
+                "run_count": a.run_count,
+                "last_status": a.last_status,
+                "is_running": !runs.is_empty(),
+                "running_run_ids": runs,
+                "next_due_at": a.next_due_at(chrono::Local::now())
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "automations": items }))
+}
+
+/// `PATCH /api/automations/:id` - edit an existing automation in place.
+///
+/// Only the fields present in the body change; everything else is preserved
+/// (including `last_run_at` / `run_count`, which the scheduler owns).
+pub async fn update_automation_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let edit = crate::automation::AutomationEdit::from_json(&body)
+        .map_err(|e| json_api_error(StatusCode::BAD_REQUEST, e))?;
+
+    let updated = {
+        let mut conf = state.config.write().await;
+        let Some(existing) = conf.automations.iter_mut().find(|a| a.id == id) else {
+            return Err(json_api_error(
+                StatusCode::NOT_FOUND,
+                format!("Automation '{id}' not found"),
+            ));
+        };
+        existing.apply_edit(&edit);
+        existing.clone()
+    };
+    crate::automation::validate(&updated)
+        .map_err(|e| json_api_error(StatusCode::BAD_REQUEST, e))?;
+
+    // Re-validate inside the lock: a concurrent writer may have changed the base.
+    {
+        let conf = state.config.read().await;
+        let stored = conf
+            .automations
+            .iter()
+            .find(|a| a.id == id)
+            .ok_or_else(|| json_api_error(StatusCode::NOT_FOUND, format!("Automation '{id}' not found")))?;
+        crate::automation::validate(stored)
+            .map_err(|e| json_api_error(StatusCode::BAD_REQUEST, e))?;
+    }
+
+    state.reload_plugins().await;
+    state.persist_config().await;
+    Ok(Json(serde_json::json!({ "status": "updated", "automation": updated })))
+}
+
+/// `GET /api/automation/logs?automation_id=&limit=` - recent automation run logs.
+pub async fn automation_logs_handler(
+    State(state): State<AppState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let limit = q
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(1, 500);
+    let items = match q.get("automation_id").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(id) => state.automation_logs_for(id, limit).await,
+        None => state.automation_logs(limit).await,
+    };
+    Json(serde_json::json!({
+        "logs": items,
+        "count": items.len(),
+        "automation_id": q.get("automation_id").cloned()
+    }))
+}
+
+/// `GET /api/automations/:id/logs` - logs for one automation.
+pub async fn automation_logs_for_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let items = state.automation_logs_for(&id, 100).await;
+    Json(serde_json::json!({
+        "automation_id": id,
+        "logs": items,
+        "count": items.len(),
+        "summary": crate::automation::summarize_logs(&items)
+    }))
+}
+
+/// `POST /api/automations/:id/run` - trigger immediately.
+///
+/// Returns the *run* id: an automation run is a log entry, not a conversation.
 pub async fn run_automation_now(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -4601,16 +4691,35 @@ pub async fn run_automation_now(
             .iter()
             .find(|a| a.id == id)
             .cloned()
-            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Automation '{id}' not found")))? 
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Automation '{id}' not found")))?
     };
-    let session_id = state
-        .run_automation(automation)
+    let trigger = automation.trigger.clone();
+    // A manual run is explicit even when the automation is triggered on a schedule.
+    let _ = trigger;
+    let run_id = state
+        .run_automation_with_trigger(automation, crate::automation::AutomationRunTrigger::Manual)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     Ok(Json(serde_json::json!({
         "status": "started",
-        "session_id": session_id
+        "run_id": run_id,
+        "automation_id": id
     })))
+}
+
+/// `POST /api/automations/:id/stop` - cancel a running automation run.
+pub async fn stop_automation_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    match state.stop_automation(&id).await {
+        Ok(run_ids) => Ok(Json(serde_json::json!({
+            "status": "stopping",
+            "automation_id": id,
+            "run_ids": run_ids
+        }))),
+        Err(e) => Err((StatusCode::CONFLICT, e)),
+    }
 }
 // ============================================================================
 // First-run onboarding

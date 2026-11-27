@@ -98,6 +98,10 @@ pub struct UpdateStatus {
     pub html_url: String,
     #[serde(default)]
     pub notes: String,
+    /// True when the failure is temporary (network hiccup, GitHub 5xx) and the
+    /// pipeline retries on its own. Lets the UI soften the wording.
+    #[serde(default)]
+    pub transient: bool,
     /// Wall-clock (unix seconds) of the last change.
     #[serde(default)]
     pub updated_at: u64,
@@ -112,6 +116,7 @@ impl UpdateStatus {
         self.phase = phase;
         self.message = message.into();
         self.error = None;
+        self.transient = false;
         self.touch();
     }
 
@@ -119,7 +124,15 @@ impl UpdateStatus {
         self.phase = UpdatePhase::Failed;
         self.error = Some(error.into());
         self.message = self.error.clone().unwrap_or_default();
+        self.transient = false;
         self.touch();
+    }
+
+    /// A failure the pipeline retries by itself (GitHub 5xx, rate limit,
+    /// DNS/timeout). Rendered gently so a blip does not look like a crash.
+    pub fn fail_transient(&mut self, error: impl Into<String>) {
+        self.fail(error);
+        self.transient = true;
     }
 }
 
@@ -173,6 +186,78 @@ fn client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
+/// How many times a transient failure is retried before giving up.
+const MAX_ATTEMPTS: u32 = 4;
+/// Retro of transient failures (doubles each attempt).
+const FIRST_RETRY_DELAY: Duration = Duration::from_millis(900);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(20);
+
+/// Statuses that are worth retrying: GitHub returns 502/503/504 and 429 under
+/// load, and a single one must not abort an otherwise valid update.
+fn is_retryable_status(code: u16) -> bool {
+    matches!(code, 408 | 425 | 429 | 500 | 502 | 503 | 504 | 511)
+}
+
+fn retryable_error(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect()
+}
+
+/// Describe a response status the way a human wants to read it.
+fn status_phrase(status: reqwest::StatusCode) -> String {
+    if status == reqwest::StatusCode::FORBIDDEN {
+        return "403 Forbidden (GitHub rate limit or blocked)".to_string();
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return "429 Too Many Requests (GitHub rate limit)".to_string();
+    }
+    match status.canonical_reason() {
+        Some(reason) => format!("{} {reason}", status.as_u16()),
+        None => format!("{} (unexpected status)", status.as_u16()),
+    }
+}
+
+/// GET with exponential backoff for transient network/server failures.
+///
+/// Returns the final response even when it is an error status, so callers can
+/// decide what it means; only gives up after [`MAX_ATTEMPTS`] tries.
+pub async fn get_with_retry(
+    url: &str,
+    accept: Option<&str>,
+) -> Result<reqwest::Response, String> {
+    let mut attempt = 0;
+    let mut delay = FIRST_RETRY_DELAY;
+    loop {
+        attempt += 1;
+        let mut req = client()?.get(url);
+        if let Some(a) = accept {
+            req = req.header("Accept", a);
+        }
+        let sent = req.send().await;
+        let resp = match sent {
+            Ok(resp) => resp,
+            Err(e) if retryable_error(&e) && attempt < MAX_ATTEMPTS => {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(MAX_RETRY_DELAY);
+                continue;
+            }
+            Err(e) => return Err(format!("Request to GitHub failed: {e}")),
+        };
+        let status = resp.status();
+        if is_retryable_status(status.as_u16()) && attempt < MAX_ATTEMPTS {
+            let after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(|s| Duration::from_secs(s.min(60)));
+            tokio::time::sleep(after.unwrap_or(delay)).await;
+            delay = (delay * 2).min(MAX_RETRY_DELAY);
+            continue;
+        }
+        return Ok(resp);
+    }
+}
+
 /// Query the latest GitHub release and compare it with the running version.
 pub async fn check(repo: &str, current_version: &str) -> Result<UpdateInfo, String> {
     check_for_exe(repo, current_version, &current_exe_name()).await
@@ -187,10 +272,7 @@ pub async fn check_for_exe(
 ) -> Result<UpdateInfo, String> {
     let repo = if repo.trim().is_empty() { DEFAULT_REPO } else { repo.trim() };
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let resp = client()?
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
+    let resp = get_with_retry(&url, Some("application/vnd.github+json"))
         .await
         .map_err(|e| format!("Update check failed: {e}"))?;
 
@@ -198,7 +280,10 @@ pub async fn check_for_exe(
         return Err(format!("No published releases found for {repo}"));
     }
     if !resp.status().is_success() {
-        return Err(format!("GitHub API returned {}", resp.status()));
+        return Err(format!(
+            "Update check failed: GitHub API returned {} after {MAX_ATTEMPTS} attempts",
+            status_phrase(resp.status())
+        ));
     }
 
     let body: serde_json::Value = resp
@@ -337,14 +422,16 @@ where
         .ok_or_else(|| format!("Release {} has no asset named {}", info.latest_version, current_exe_name()))?;
     std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
 
-    let resp = client()?
-        .get(&asset.url)
-        .send()
+    let resp = get_with_retry(&asset.url, None)
         .await
         .map_err(|e| format!("Download failed: {e}"))?;
-    let resp = resp
-        .error_for_status()
-        .map_err(|e| format!("Download failed: {e}"))?;
+    let status = resp.status();
+    let resp = resp.error_for_status().map_err(|_| {
+        format!(
+            "Download failed: GitHub returned {} after {MAX_ATTEMPTS} attempts",
+            status_phrase(status)
+        )
+    })?;
 
     let total = if asset.size > 0 {
         Some(asset.size)
@@ -384,9 +471,7 @@ where
     }
 
     if let Some(sums_asset) = &info.checksums {
-        let sums = client()?
-            .get(&sums_asset.url)
-            .send()
+        let sums = get_with_retry(&sums_asset.url, None)
             .await
             .map_err(|e| format!("Checksum download failed: {e}"))?
             .text()

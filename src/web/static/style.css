@@ -4241,17 +4241,48 @@ select.form-input {
     font-size: 0.82rem;
 }
 
-/* Responsive */
-@media (max-width: 1200px) {
+/* ==========================================================================
+   Responsive layout (em-based breakpoints)
+
+   Breakpoints are expressed in em (1em = 16px at the browser default) so they
+   scale with the user's preferred font size instead of only the viewport, and
+   so the tiers can be exercised by scaling the root font size in a test.
+   Tiers: 96em (1536px) / 80em (1280px) / 64em (1024px) / 52em (832px)
+          / 40em (640px), plus a large-screen tier at 120em (1920px).
+   ========================================================================== */
+
+/* --- Large screens: give the conversation room to breathe --- */
+@media (min-width: 120em) {
+    .sidebar {
+        width: 280px;
+    }
+    .inspector-pane {
+        width: 460px;
+    }
+    .prompt-dock-container {
+        max-width: 900px;
+    }
+    .settings-hub-card {
+        max-width: 1024px !important;
+    }
+    .modal-card {
+        max-width: 640px;
+    }
+    .modal-large {
+        max-width: 960px !important;
+    }
+}
+
+@media (max-width: 96em) {
+    .inspector-pane {
+        width: 380px;
+    }
     .bc-active {
-        max-width: 220px;
+        max-width: 200px;
     }
     .top-nav {
-        padding: 0 10px;
+        padding: 0 12px;
         gap: 8px;
-    }
-    .top-nav-right {
-        gap: 4px;
     }
     .telemetry-pill, .permission-mode-pill {
         padding: 2px 7px;
@@ -4261,7 +4292,7 @@ select.form-input {
         padding: 2px 7px;
         font-size: 0.69rem;
         gap: 5px;
-        max-width: 205px;
+        max-width: 182px;
     }
     .top-icon-btn {
         width: 26px;
@@ -4269,28 +4300,43 @@ select.form-input {
     }
 }
 
-@media (max-width: 1024px) {
+@media (max-width: 80em) {
+    /* The inspector becomes an overlay drawer so the stream keeps its width. */
     .inspector-pane:not(.collapsed) {
         position: absolute;
         right: 0;
         top: 0;
         height: 100%;
-        width: 360px;
+        width: min(420px, 92vw);
         max-width: 92vw;
         box-shadow: -12px 0 40px rgba(0, 0, 0, 0.65);
     }
+    .inspector-pane.swarm-expanded {
+        width: min(560px, 94vw);
+        max-width: 94vw;
+    }
+    .sidebar {
+        width: 236px;
+    }
     .bc-active {
-        max-width: 160px;
+        max-width: 150px;
+    }
+    .prompt-dock-container {
+        max-width: 92vw;
     }
 }
 
-@media (max-width: 768px) {
+@media (max-width: 64em) {
+    /* Sidebar becomes an off-canvas drawer (toggle in the top bar). */
     .sidebar {
         position: absolute;
         top: 0;
         left: 0;
         height: 100vh;
+        width: min(280px, 86vw);
         transform: translateX(-100%);
+        box-shadow: 12px 0 40px rgba(0, 0, 0, 0.65);
+        z-index: 30;
     }
     .sidebar.open {
         transform: translateX(0);
@@ -4298,11 +4344,20 @@ select.form-input {
     .mobile-sidebar-toggle {
         display: block;
     }
+    .sidebar.collapsed {
+        width: min(280px, 86vw);
+        opacity: 1;
+        transform: translateX(-100%);
+        pointer-events: auto;
+    }
+    .inspector-pane:not(.collapsed) {
+        width: min(400px, 96vw);
+    }
     .starter-prompts {
         grid-template-columns: 1fr;
     }
     .prompt-dock-container {
-        padding: 0 10px;
+        padding: 0 12px;
         bottom: 12px;
     }
     .form-grid {
@@ -4313,6 +4368,110 @@ select.form-input {
     }
     .ct-field-row {
         grid-template-columns: 1fr;
+    }
+    .settings-hub-card {
+        height: 90vh;
+        max-height: none;
+    }
+    .settings-hub-body {
+        flex-direction: column;
+    }
+    .settings-nav-rail {
+        width: 100%;
+        flex-direction: row;
+        overflow-x: auto;
+        border-right: none;
+        border-bottom: 1px solid var(--border-subtle);
+        padding: 8px;
+        gap: 6px;
+        flex-shrink: 0;
+    }
+    .settings-nav-item {
+        width: auto;
+        white-space: nowrap;
+        padding: 6px 10px;
+    }
+    .runtime-telemetry-strip,
+    .settings-toggles-row {
+        grid-template-columns: 1fr;
+    }
+}
+
+@media (max-width: 52em) {
+    .top-nav {
+        padding: 0 8px;
+        gap: 6px;
+    }
+    .top-nav-right {
+        gap: 4px;
+    }
+    /* Secondary telemetry steps aside on tight viewports; the values remain
+       available in Settings > Runtime. */
+    .telemetry-pill .telemetry-label,
+    .permission-mode-pill .mode-label {
+        display: none;
+    }
+    .task-running-indicator {
+        max-width: 96px;
+    }
+    .sidebar {
+        width: min(300px, 92vw);
+    }
+    .sidebar.collapsed {
+        width: min(300px, 92vw);
+    }
+    .inspector-pane:not(.collapsed) {
+        width: 100vw;
+        max-width: 100vw;
+    }
+    .inspector-pane.swarm-expanded {
+        width: 100vw;
+        max-width: 100vw;
+    }
+    .starter-prompts {
+        gap: 6px;
+    }
+    .modal-card {
+        width: 96%;
+        max-height: 92vh;
+    }
+    .tools-modal-card {
+        max-width: 96% !important;
+    }
+    .bc-active {
+        max-width: 110px;
+    }
+}
+
+@media (max-width: 40em) {
+    body.dark-theme {
+        font-size: 0.95rem;
+    }
+    .top-nav {
+        height: 44px;
+    }
+    .telemetry-pill, .permission-mode-pill {
+        display: none;
+    }
+    .modal-card {
+        width: 98%;
+        border-radius: 12px;
+    }
+    .modal-header {
+        padding: 12px 14px;
+    }
+    .modal-footer {
+        padding: 12px 14px;
+    }
+    .settings-hub-card {
+        width: 98%;
+        height: 94vh;
+        border-radius: 12px;
+    }
+    .update-drawer {
+        left: 12px;
+        right: 12px;
+        width: auto;
     }
 }
 
@@ -5187,33 +5346,8 @@ select.form-input {
     color: #fde68a;
 }
 
-@media (max-width: 768px) {
-    .settings-hub-card {
-        height: 90vh;
-        max-height: none;
-    }
-    .settings-hub-body {
-        flex-direction: column;
-    }
-    .settings-nav-rail {
-        width: 100%;
-        flex-direction: row;
-        overflow-x: auto;
-        border-right: none;
-        border-bottom: 1px solid var(--border-subtle);
-        padding: 8px;
-        gap: 6px;
-    }
-    .settings-nav-item {
-        width: auto;
-        white-space: nowrap;
-        padding: 6px 10px;
-    }
-    .runtime-telemetry-strip,
-    .settings-toggles-row {
-        grid-template-columns: 1fr;
-    }
-}
+/* (Settings-hub responsiveness is defined with the other breakpoints above,
+   in the shared responsive tier at 64em / 1024px.) */
 
 /* ==========================================================================
    Bespoke UI Controls (Replaces native select / datalist / checkbox / dialogs)

@@ -2,6 +2,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use crate::automation::AutomationLog;
 use crate::config::{HarnessConfig, Project, ServerNodeConfig};
 use crate::engine::context::ChatMessage;
 use crate::engine::events::HarnessEvent;
@@ -149,6 +150,21 @@ impl HarnessDb {
                 next_turn_id INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             );
+
+            -- Automation run logs: one row per run, never a conversation.
+            CREATE TABLE IF NOT EXISTS automation_logs (
+                run_id TEXT PRIMARY KEY,
+                automation_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                started_at TEXT NOT NULL,
+                record_json TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_automation_logs_automation
+                ON automation_logs(automation_id, started_at DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_automation_logs_started
+                ON automation_logs(started_at DESC);
             ",
         )
         .map_err(|e| format!("Failed to initialize SQLite schema: {}", e))?;
@@ -453,6 +469,114 @@ impl HarnessDb {
         .map_err(|e| e.to_string())
     }
 
+    /// Insert or update an automation run log row (the whole record is JSON-encoded,
+    /// mirroring `conversation_events`; the scalar columns exist for indexing).
+    pub fn upsert_automation_log(&self, log: &AutomationLog) -> Result<(), String> {
+        let json = serde_json::to_string(log).map_err(|e| e.to_string())?;
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO automation_logs (run_id, automation_id, status, started_at, record_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(run_id) DO UPDATE SET
+               automation_id = excluded.automation_id,
+               status = excluded.status,
+               started_at = excluded.started_at,
+               record_json = excluded.record_json",
+            params![
+                log.run_id,
+                log.automation_id,
+                log.status.as_str(),
+                log.started_at,
+                json
+            ],
+        )
+        .map_err(|e| format!("Failed to upsert automation log: {}", e))?;
+        Ok(())
+    }
+
+    /// Load automation run logs, newest first.
+    ///
+    /// Corrupt rows are skipped (like `load_events`) so one bad row cannot hide every run.
+    pub fn list_automation_logs(
+        &self,
+        automation_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AutomationLog>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let (sql, params): (String, Vec<String>) = match automation_id {
+            Some(id) => (
+                "SELECT record_json FROM automation_logs WHERE automation_id = ?1
+                 ORDER BY started_at DESC LIMIT ?2"
+                    .to_string(),
+                vec![id.to_string(), limit.max(1).to_string()],
+            ),
+            None => (
+                "SELECT record_json FROM automation_logs
+                 ORDER BY started_at DESC LIMIT ?1"
+                    .to_string(),
+                vec![limit.max(1).to_string()],
+            ),
+        };
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| e.to_string())?;
+        let mut list = Vec::new();
+        for row in rows {
+            let json = row.map_err(|e| e.to_string())?;
+            match serde_json::from_str::<AutomationLog>(&json) {
+                Ok(log) => list.push(log),
+                Err(e) => eprintln!("[harness-db] skipping corrupt automation log row: {e}"),
+            }
+        }
+        Ok(list)
+    }
+
+    /// Enforce the run-log ring buffer: keep the newest `per_automation` rows per
+    /// automation and the newest `total` rows overall. Returns the rows deleted.
+    pub fn prune_automation_logs(
+        &self,
+        per_automation: usize,
+        total: usize,
+    ) -> Result<usize, String> {
+        let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let automation_ids: Vec<String> = {
+            let mut stmt = tx
+                .prepare("SELECT DISTINCT automation_id FROM automation_logs")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<String>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        let per = per_automation.max(1) as i64;
+        let mut removed = 0usize;
+        for id in automation_ids {
+            removed += tx
+                .execute(
+                    "DELETE FROM automation_logs WHERE automation_id = ?1 AND run_id NOT IN (
+                         SELECT run_id FROM automation_logs WHERE automation_id = ?1
+                         ORDER BY started_at DESC LIMIT ?2)",
+                    params![id, per],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        let all = total.max(1) as i64;
+        removed += tx
+            .execute(
+                "DELETE FROM automation_logs WHERE run_id NOT IN (
+                     SELECT run_id FROM automation_logs ORDER BY started_at DESC LIMIT ?1)",
+                params![all],
+            )
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(removed)
+    }
+
     pub fn delete_conversation(&self, id: &str) -> Result<bool, String> {
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
@@ -672,6 +796,126 @@ impl HarnessDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn automation_log(run_id: &str, automation_id: &str, started_at: &str) -> AutomationLog {
+        AutomationLog {
+            run_id: run_id.to_string(),
+            automation_id: automation_id.to_string(),
+            automation_name: automation_id.to_string(),
+            status: crate::automation::AutomationRunStatus::Success,
+            trigger: crate::automation::AutomationRunTrigger::Cron,
+            started_at: started_at.to_string(),
+            finished_at: Some(started_at.to_string()),
+            duration_ms: Some(1000),
+            project_id: None,
+            model: "mock".to_string(),
+            provider_id: "local".to_string(),
+            output: "done".to_string(),
+            error: None,
+            tool_calls: 1,
+            tokens: 5,
+        }
+    }
+
+    #[test]
+    fn automation_logs_round_trip_and_update_in_place() {
+        let db = HarnessDb::open_in_memory().expect("open in-memory db");
+        let mut log = automation_log("auto-a-1", "a", "2026-11-27T12:00:00+00:00");
+        db.upsert_automation_log(&log).expect("insert");
+
+        let loaded = db.list_automation_logs(None, 10).expect("list");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].run_id, "auto-a-1");
+        assert_eq!(loaded[0].output, "done");
+        assert_eq!(loaded[0].tool_calls, 1);
+
+        log.status = crate::automation::AutomationRunStatus::Failed;
+        log.error = Some("boom".to_string());
+        db.upsert_automation_log(&log).expect("update in place");
+        let loaded = db.list_automation_logs(None, 10).expect("list");
+        assert_eq!(loaded.len(), 1, "same run id updates the row");
+        assert_eq!(loaded[0].status.as_str(), "failed");
+        assert_eq!(loaded[0].error.as_deref(), Some("boom"));
+
+        assert_eq!(db.list_automation_logs(Some("a"), 10).unwrap().len(), 1);
+        assert_eq!(db.list_automation_logs(Some("b"), 10).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn automation_logs_are_newest_first_and_limit_bounded() {
+        let db = HarnessDb::open_in_memory().expect("open in-memory db");
+        for i in 0..5 {
+            let ts = format!("2026-11-27T12:0{i}:00+00:00");
+            db.upsert_automation_log(&automation_log(&format!("auto-a-{i}"), "a", &ts))
+                .unwrap();
+        }
+        let rows = db.list_automation_logs(None, 3).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].run_id, "auto-a-4", "newest first");
+        assert_eq!(rows[2].run_id, "auto-a-2");
+    }
+
+    #[test]
+    fn automation_log_ring_buffer_prunes_per_automation_and_overall() {
+        let db = HarnessDb::open_in_memory().expect("open in-memory db");
+        for i in 0..8 {
+            let ts = format!("2026-11-27T12:00:{i:02}+00:00");
+            db.upsert_automation_log(&automation_log(&format!("auto-a-{i}"), "a", &ts))
+                .unwrap();
+        }
+        for i in 0..6 {
+            let ts = format!("2026-11-27T13:00:{i:02}+00:00");
+            db.upsert_automation_log(&automation_log(&format!("auto-b-{i}"), "b", &ts))
+                .unwrap();
+        }
+        // Keep 5 per automation, 9 overall: 5+5 = 10 survivors after the per-automation
+        // pass, so the overall cap drops the single oldest (an 'a' row).
+        let deleted = db.prune_automation_logs(5, 9).unwrap();
+        assert!(deleted > 0, "rows must be pruned: {deleted}");
+        let rows = db.list_automation_logs(None, 100).unwrap();
+        assert!(rows.len() <= 9, "overall cap holds: {}", rows.len());
+        assert_eq!(db.list_automation_logs(Some("a"), 100).unwrap().len(), 4);
+        assert_eq!(db.list_automation_logs(Some("b"), 100).unwrap().len(), 5);
+        // The newest entry overall survived.
+        assert_eq!(rows[0].run_id, "auto-b-5");
+        // Per-automation pruning keeps the newest, not the oldest.
+        let a_ids: Vec<String> = db
+            .list_automation_logs(Some("a"), 100)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.run_id)
+            .collect();
+        assert_eq!(
+            a_ids,
+            vec!["auto-a-7", "auto-a-6", "auto-a-5", "auto-a-4"],
+            "the newest rows survive"
+        );
+    }
+
+    #[test]
+    fn automation_logs_skip_corrupt_rows() {
+        let db = HarnessDb::open_in_memory().expect("open in-memory db");
+        db.upsert_automation_log(&automation_log("auto-a-1", "a", "2026-11-27T12:00:00+00:00"))
+            .unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO automation_logs (run_id, automation_id, status, started_at, record_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "auto-bad",
+                    "a",
+                    "failed",
+                    "2026-11-27T12:01:00+00:00",
+                    "{corrupt"
+                ],
+            )
+            .unwrap();
+        }
+        let rows = db.list_automation_logs(None, 10).unwrap();
+        assert_eq!(rows.len(), 1, "the good row survives the corrupt one");
+        assert_eq!(rows[0].run_id, "auto-a-1");
+    }
 
     #[test]
     fn load_config_errors_on_corrupt_row_instead_of_returning_defaults() {

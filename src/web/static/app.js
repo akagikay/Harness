@@ -571,7 +571,12 @@ async function fetchUpdateStatus() {
         showToast(`Harness v${data.target_version} is available - installing automatically.`, 'info', 8000);
     }
     if (data.phase === 'failed' && previous !== 'failed') {
-        showToast('Update failed: ' + (data.error || 'unknown error'), 'error', 9000);
+        const msg = data.error || 'unknown error';
+        if (data.transient) {
+            showToast('Update check delayed - ' + msg + ' (will retry automatically).', 'warning', 9000);
+        } else {
+            showToast('Update failed: ' + msg, 'error', 9000);
+        }
     }
     const runningVersionEl = document.getElementById('cfg-running-version');
     if (runningVersionEl && data.current_version) {
@@ -620,9 +625,13 @@ function renderUpdateDrawer(data) {
         failed: 'Update failed'
     };
     if (title) {
-        title.textContent = data.phase === 'failed'
-            ? (data.error || labels.failed)
-            : (labels[data.phase] || data.message || 'Updating\u2026');
+        if (data.phase === 'failed') {
+            title.textContent = data.transient
+                ? 'Update check delayed \u2014 retrying soon'
+                : (data.error || labels.failed);
+        } else {
+            title.textContent = labels[data.phase] || data.message || 'Updating\u2026';
+        }
     }
     if (icon) icon.textContent = data.phase === 'failed' ? '\u26A0' : '\u21BB';
 
@@ -1216,15 +1225,39 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // Sidebar Toggles
+    // Below 64em the sidebar is an off-canvas drawer instead of a collapsing
+    // column, so the "collapse" button must close (not hide) it there.
+    const sidebarIsDrawer = () => window.matchMedia('(max-width: 64em)').matches;
+    const closeSidebarDrawer = () => {
+        sidebar.classList.remove('open');
+    };
     const toggleSidebar = () => {
+        if (sidebarIsDrawer()) {
+            const wasOpen = sidebar.classList.contains('open');
+            if (wasOpen) closeSidebarDrawer();
+            else sidebar.classList.add('open');
+            return;
+        }
         const collapsed = sidebar.classList.toggle('collapsed');
         document.body.classList.toggle('sidebar-is-collapsed', collapsed);
     };
     if (btnSidebarToggle) btnSidebarToggle.addEventListener('click', toggleSidebar);
     if (btnExpandSidebar) btnExpandSidebar.addEventListener('click', toggleSidebar);
-    if (btnMobileSidebar) {
-        btnMobileSidebar.addEventListener('click', () => sidebar.classList.toggle('open'));
-    }
+    if (btnMobileSidebar) btnMobileSidebar.addEventListener('click', toggleSidebar);
+    // Tapping the workspace (or pressing Escape) dismisses the drawer.
+    document.addEventListener('click', (e) => {
+        if (!sidebar.classList.contains('open')) return;
+        if (sidebar.contains(e.target)) return;
+        if (e.target.closest && e.target.closest('#btn-mobile-sidebar, #btn-sidebar-toggle, .top-nav-left')) return;
+        closeSidebarDrawer();
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && sidebar.classList.contains('open')) closeSidebarDrawer();
+    });
+    // Leaving drawer mode (window widened) must not strand the sidebar off-screen.
+    window.matchMedia('(min-width: 64.0625em)').addEventListener?.('change', (ev) => {
+        if (ev.matches) closeSidebarDrawer();
+    });
 
     // Inspector Toggles & Tabs
     if (btnToggleDrawer) {

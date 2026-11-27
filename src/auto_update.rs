@@ -22,6 +22,8 @@ use crate::updater::{self, UpdateInfo, UpdatePhase};
 
 /// How often to re-check once the first pass has finished.
 const RECHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// A transient failure (GitHub 5xx, rate limit, network) retries much sooner.
+const RETRY_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// Give the server time to come up before the first network call.
 const INITIAL_DELAY: Duration = Duration::from_secs(3);
 /// Wait this long for running work to settle before installing.
@@ -44,21 +46,25 @@ pub fn spawn(state: Arc<AppState>, current_version: &'static str) {
                     conf.auto_update_apply,
                 )
             };
-            if do_check {
-                let _ = run_once(&state, &repo, current_version, do_install).await;
-            }
-            tokio::time::sleep(RECHECK_INTERVAL).await;
+            // A transient network/GitHub failure retries in minutes, not 6 hours.
+            let transient = if do_check {
+                run_once(&state, &repo, current_version, do_install).await
+            } else {
+                false
+            };
+            tokio::time::sleep(if transient { RETRY_INTERVAL } else { RECHECK_INTERVAL }).await;
         }
     });
 }
 
-/// One check + (optionally) install pass. Returns `None` when no update exists.
+/// One check + (optionally) install pass. Returns `true` when the pass failed
+/// for a retryable reason (network/GitHub), so the caller can retry sooner.
 async fn run_once(
     state: &AppState,
     repo: &str,
     current_version: &'static str,
     auto_install: bool,
-) -> Option<UpdateInfo> {
+) -> bool {
     state
         .set_update_status(|s| {
             s.current_version = current_version.to_string();
@@ -69,8 +75,10 @@ async fn run_once(
     let info = match updater::check(repo, current_version).await {
         Ok(info) => info,
         Err(e) => {
-            state.set_update_status(|s| s.fail(e)).await;
-            return None;
+            let msg = e.clone();
+            state.set_update_status(|s| s.fail_transient(e)).await;
+            eprintln!("[harness-update] check failed (will retry): {msg}");
+            return true;
         }
     };
 
@@ -100,7 +108,7 @@ async fn run_once(
                 s.touch();
             })
             .await;
-        return None;
+        return false;
     }
 
     state
@@ -120,7 +128,7 @@ async fn run_once(
             "[harness-update] v{} available at {} (set auto_update_apply = true to install automatically)",
             info.latest_version, info.html_url
         );
-        return Some(info);
+        return false;
     }
 
     // Never re-install the same target forever: a release whose binary reports
@@ -139,7 +147,7 @@ async fn run_once(
                 s.touch();
             })
             .await;
-        return Some(info);
+        return false;
     }
 
     // Mark the target first, so even a crash mid-install cannot loop.
@@ -151,9 +159,13 @@ async fn run_once(
     }
 
     if let Err(e) = install(state, &info).await {
-        state.set_update_status(|s| s.fail(e)).await;
+        // A download failure is usually transient; retry sooner.
+        let msg = e.clone();
+        state.set_update_status(|s| s.fail_transient(e)).await;
+        eprintln!("[harness-update] auto-update failed (will retry): {msg}");
+        return true;
     }
-    Some(info)
+    false
 }
 
 /// Download (with live progress), verify, wait for idle, install, relaunch.

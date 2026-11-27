@@ -5816,7 +5816,6 @@ fn test_credentials_are_encrypted_at_rest_and_migrate() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 // ============================================================================
 // Auto-update helpers
 // ============================================================================
@@ -5944,7 +5943,7 @@ async fn test_github_repo_watcher_automation_create_list_and_run() {
         .iter()
         .any(|a| a.id == "github-repo-watcher"));
 
-    // 4. Trigger it now; a session must be created.
+    // 4. Trigger it now. A run is a *log entry*, never a conversation.
     let run: Value = client
         .post(format!("{}/api/automations/github-repo-watcher/run", base))
         .send()
@@ -5954,8 +5953,93 @@ async fn test_github_repo_watcher_automation_create_list_and_run() {
         .await
         .unwrap();
     assert_eq!(run["status"], "started");
-    let session_id = run["session_id"].as_str().unwrap().to_string();
-    assert!(session_id.starts_with("auto-github-repo-watcher-"));
+    let run_id = run["run_id"].as_str().unwrap().to_string();
+    assert!(
+        run_id.starts_with("auto-github-repo-watcher-"),
+        "run ids are namespaced by automation: {run_id}"
+    );
+    assert!(run["session_id"].is_null(), "runs must not be sessions");
+
+    // The run produced a log row rather than a conversation. A run is async, so
+    // poll for its terminal state instead of assuming it already finished.
+    let mut log_rows: Vec<Value> = Vec::new();
+    for _ in 0..120 {
+        let logs: Value = client
+            .get(format!("{}/api/automations/github-repo-watcher/logs", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        log_rows = logs["logs"].as_array().unwrap().clone();
+        let done = log_rows
+            .iter()
+            .find(|l| l["run_id"] == Value::from(run_id.as_str()))
+            .and_then(|l| l["status"].as_str())
+            .map(|s| s != "running")
+            .unwrap_or(false);
+        if done {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(!log_rows.is_empty(), "the run must be logged");
+    let entry = log_rows
+        .iter()
+        .find(|l| l["run_id"] == Value::from(run_id.as_str()))
+        .expect("the run must be in the log");
+    assert_eq!(entry["status"], "success", "run error: {}", entry["error"]);
+    assert!(
+        entry["output"].as_str().map(|s| !s.trim().is_empty()).unwrap_or(false),
+        "the final answer is logged"
+    );
+    assert!(entry["finished_at"].is_string());
+    // No conversation was created for the run.
+    let sessions: Value = client
+        .get(format!("{}/api/sessions", base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session_list = sessions
+        .as_array()
+        .cloned()
+        .or_else(|| sessions.get("sessions").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_default();
+    assert!(
+        session_list.iter().all(|s| s["id"] != Value::from(run_id.as_str())),
+        "an automation run must never appear as a conversation"
+    );
+
+    // 4b. Editing an existing automation in place.
+    let edited: Value = client
+        .patch(format!("{}/api/automations/github-repo-watcher", base))
+        .json(&serde_json::json!({ "description": "Watches and triages new issues." }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(edited["status"], "updated");
+    assert_eq!(edited["automation"]["description"], "Watches and triages new issues.");
+    assert_eq!(
+        edited["automation"]["trigger"]["kind"], "cron",
+        "untouched fields are preserved"
+    );
+    assert_eq!(edited["automation"]["run_count"], 1, "run history survives an edit");
+
+    // An invalid edit is rejected and changes nothing.
+    let bad_edit = client
+        .patch(format!("{}/api/automations/github-repo-watcher", base))
+        .json(&serde_json::json!({ "trigger": { "kind": "cron", "expr": "nope" } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_edit.status(), 400);
 
     // The automation recorded the run.
     let after = state
@@ -6397,6 +6481,57 @@ async fn test_update_download_streams_progress_and_verifies_checksum() {
 
     srv.abort();
     let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[tokio::test]
+async fn test_update_request_retries_transient_github_failures() {
+    use deepseek_harness_rs::updater::get_with_retry;
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let hits = Arc::new(AtomicU32::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let router = axum::Router::new().route(
+        "/flaky",
+        axum::routing::get({
+            let hits = Arc::clone(&hits);
+            move || {
+                let hits = Arc::clone(&hits);
+                async move {
+                    let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n < 3 {
+                        // GitHub returns these under load; a single one must not
+                        // abort the update.
+                        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "busy").into_response()
+                    } else {
+                        (axum::http::StatusCode::OK, "ok").into_response()
+                    }
+                }
+            }
+        }),
+    );
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let resp = get_with_retry(&format!("http://{addr}/flaky"), None)
+        .await
+        .expect("transient failures must be retried");
+    assert_eq!(resp.status(), 200, "must eventually succeed");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        3,
+        "the first two 503s must be retried"
+    );
+
+    // A permanent failure still gives up, with a readable message.
+    hits.store(0, Ordering::SeqCst);
+    let resp = get_with_retry(&format!("http://{addr}/missing"), None)
+        .await
+        .expect("the response is returned, even as an error status");
+    assert_eq!(resp.status(), 404);
+
+    srv.abort();
 }
 
 #[tokio::test]
