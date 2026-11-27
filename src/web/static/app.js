@@ -2037,8 +2037,14 @@ document.addEventListener('DOMContentLoaded', () => {
     if (optToggleMock) {
         optToggleMock.addEventListener('click', () => {
             mockModeEnabled = !mockModeEnabled;
+            // Persist it too, so the switch and the server agree after a reload.
+            if (currentConfig) {
+                currentConfig.mock_mode = mockModeEnabled;
+                persistDisplayVerbosityConfig();
+            }
             if (optMockStatus) optMockStatus.textContent = mockModeEnabled ? 'On' : 'Off';
             closeAllPopovers();
+            showToast(mockModeEnabled ? 'Mock model on - no API calls.' : 'Mock model off - real provider.', 'info');
         });
     }
 
@@ -4525,6 +4531,8 @@ function startNewConversation(knowledgeMode = false) {
     }
     renderProjectsList();
     streamContainer.innerHTML = '';
+    // Any outstanding approval belonged to the stream we just discarded.
+    clearAllPendingPermissions();
     if (welcomeCanvas) {
         welcomeCanvas.style.display = 'flex';
         streamContainer.appendChild(welcomeCanvas);
@@ -4941,19 +4949,31 @@ async function submitPromptText(rawTask, clearInput = false) {
                 })
             });
 
-            // Name the fix, not just the failure: the most common cause of this is an
-            // unconfigured provider, and the user needs to know where to go.
-            let detail = '';
-            try { detail = (await res.text()) || ''; } catch (_) {}
-            let hint = 'Check Settings → AI Providers for a valid API key and model.';
-            const low = detail.toLowerCase();
-            if (low.includes('provider') || low.includes('api key') || low.includes('no model')) {
-                hint = 'No API key or model configured. Settings → AI Providers → add a provider, then try again.';
-            } else if (low.includes('project')) {
-                hint = 'The selected project is missing or unusable. Pick another project in the sidebar.';
+            // Only a NON-OK response is a failure: a 200 must fall through to the session.
+            // (Getting this backwards makes every first prompt fail with
+            // "Could not start a session (HTTP 200)".)
+            if (!res.ok) {
+                // Name the fix, not just the failure: the most common cause is an
+                // unconfigured provider, and the user needs to know where to go.
+                let detail = '';
+                try { detail = (await res.text()) || ''; } catch (_) {}
+                let hint = 'Check Settings → AI Providers for a valid API key and model.';
+                const low = detail.toLowerCase();
+                if (low.includes('provider') || low.includes('api key') || low.includes('no model')) {
+                    hint = 'No API key or model configured. Settings → AI Providers → add a provider, then try again.';
+                } else if (low.includes('project')) {
+                    hint = 'The selected project is missing or unusable. Pick another project in the sidebar.';
+                } else if (res.status === 429) {
+                    hint = 'The model provider is rate-limiting this key. Wait a moment, or use another provider.';
+                } else if (res.status === 401 || res.status === 403) {
+                    hint = 'The API key was rejected. Settings → AI Providers → re-enter it.';
+                }
+                throw new Error(`Could not start a session (HTTP ${res.status}). ${hint}`);
             }
-            throw new Error(`Could not start a session (HTTP ${res.status}). ${hint}`);
             const { session_id } = await res.json();
+            if (!session_id) {
+                throw new Error('The server did not return a session id. Try again.');
+            }
             currentSessionId = session_id;
             updateBreadcrumbSessionUI(taskDisplayTitle);
 
@@ -5911,6 +5931,8 @@ function finalizeOrphanedStreamStates() {
 
 function replayHistoryEvents(events) {
     streamContainer.innerHTML = '';
+    // Any outstanding approval belonged to the stream we just discarded.
+    clearAllPendingPermissions();
     activeReasoningDrawer = null;
     activeMessageBox = null;
     activeTurnId = null;
@@ -7217,6 +7239,9 @@ function renderPermissionPrompt(permId, tool, description, args) {
     // reader has auto-scroll turned off to read earlier output.
     card.setAttribute('role', 'alert');
     card.setAttribute('aria-live', 'assertive');
+    // Explicit "still waiting" marker: the badge's click handler only jumps to
+    // cards that still carry it, and it is removed the moment it is answered.
+    card.setAttribute('data-pending', '1');
     card.innerHTML = `
         <div class="permission-card-head">
             <span class="perm-shield-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>
@@ -7251,6 +7276,13 @@ function clearPendingPermission(permId) {
     __pendingPerms.delete(permId);
     syncPermissionBadge();
 }
+/// Forget every outstanding approval, e.g. when the stream is torn down.
+/// Without this the badge keeps claiming "1 awaiting approval" for cards that
+/// no longer exist (session switch, opening history, new chat).
+function clearAllPendingPermissions() {
+    __pendingPerms.clear();
+    syncPermissionBadge();
+}
 function syncPermissionBadge() {
     const n = __pendingPerms.size;
     document.body.classList.toggle('has-pending-permission', n > 0);
@@ -7259,7 +7291,9 @@ function syncPermissionBadge() {
         badge.textContent = n > 0 ? `${n} awaiting approval` : '';
         badge.classList.toggle('hidden', n === 0);
         badge.onclick = () => {
-            const first = document.querySelector('.permission-card[role="alert"]');
+            // Only the cards that are still waiting: an answered card keeps no
+            // alert role, so the badge can never jump to a dead prompt.
+            const first = document.querySelector('.permission-card[data-pending="1"]');
             if (first) {
                 first.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 const approve = first.querySelector('.perm-btn.approve');
@@ -7305,7 +7339,10 @@ function updatePermissionPromptDecision(permId, approved, alwaysAllow = false) {
                 </span>
             `;
         }
+        card.removeAttribute('role');
+        card.removeAttribute('data-pending');
         card.setAttribute('aria-live', 'off');
+        card.setAttribute('data-decided', '1');
     }
 }
 
@@ -7378,6 +7415,8 @@ async function loadHistoricalSession(id, task) {
     updateBreadcrumbSessionUI(task || 'Conversation');
     if (welcomeCanvas) welcomeCanvas.style.display = 'none';
     streamContainer.innerHTML = '';
+    // Any outstanding approval belonged to the stream we just discarded.
+    clearAllPendingPermissions();
     activeReasoningDrawer = null;
     activeMessageBox = null;
     resetInspectorState();
@@ -9382,6 +9421,12 @@ async function loadConfig() {
         const res = await fetch('/api/config');
         if (!res.ok) return;
         currentConfig = await res.json();
+        // The mock switch is a UI-local toggle, but the SERVER's mock_mode is the
+        // source of truth: without this, enabling mock mode in Settings (or via
+        // the API) has no effect and every conversation still hits a real model.
+        mockModeEnabled = currentConfig.mock_mode === true;
+        const optMockStatus = document.getElementById('opt-mock-status');
+        if (optMockStatus) optMockStatus.textContent = mockModeEnabled ? 'On' : 'Off';
 
         if (cfgApiBase) cfgApiBase.value = currentConfig.api_base || '';
         if (cfgApiKey) cfgApiKey.value = currentConfig.api_key || '';

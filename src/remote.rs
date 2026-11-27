@@ -167,6 +167,20 @@ pub async fn forward_remote_permission_decision(
     perm_id: &str,
     approved: bool,
 ) -> Result<(), String> {
+    forward_remote_permission_decision_with(server, perm_id, approved, false).await
+}
+
+/// Forward a decision, optionally carrying "always allow".
+///
+/// Without `always_allow` in the body the remote server records a one-shot
+/// decision, so the UI's "Approve & always allow" would be a lie on every
+/// multi-server setup: the next identical tool call prompts again.
+pub async fn forward_remote_permission_decision_with(
+    server: &ServerNodeConfig,
+    perm_id: &str,
+    approved: bool,
+    always_allow: bool,
+) -> Result<(), String> {
     let base = normalized_base_url(server);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(6))
@@ -175,7 +189,10 @@ pub async fn forward_remote_permission_decision(
     let resp = apply_auth(
         client
             .post(format!("{}/api/permissions/{}/decision", base, perm_id))
-            .json(&serde_json::json!({ "approved": approved })),
+            .json(&serde_json::json!({
+                "approved": approved,
+                "always_allow": always_allow
+            })),
         server,
     )
     .send()

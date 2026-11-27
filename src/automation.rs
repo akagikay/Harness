@@ -580,12 +580,15 @@ fn field_matches(field: &str, value: u32, min: u32, max: u32) -> bool {
                 Err(_) => continue,
             }
         };
-        if value >= lo && value <= hi && (value - lo) % step == 0 {
-            return true;
-        }
-        // 7 == Sunday for day-of-week.
-        if max == 7 && value == 0 && lo == 7 && hi == 7 {
-            return true;
+        // Day-of-week accepts both 0 and 7 as Sunday. chrono reports Sunday as 0, so
+        // when matching a DOW field for Sunday also test 7: a range like `5-7`
+        // (Fri,Sat,Sun) or a list like `6,7` (Sat,Sun) is Sun-inclusive even
+        // though the value handed to this function is 0.
+        let candidates: [u32; 2] = if value == 0 && max == 7 { [0, 7] } else { [value, value] };
+        for v in candidates {
+            if v >= lo && v <= hi && (v - lo) % step == 0 {
+                return true;
+            }
         }
     }
     false
@@ -676,6 +679,22 @@ mod tests {
         assert!(cron_matches("0 9-17 * * 1-5", &at(2026, 11, 27, 12, 0)));
         assert!(!cron_matches("0 9-17 * * 1-5", &at(2026, 11, 29, 12, 0)));
         assert!(cron_matches("0 0 1,15 * *", &at(2026, 11, 15, 0, 0)));
+    }
+
+    #[test]
+    fn cron_dow_seven_is_sunday_and_ranges_include_sunday() {
+        // 2026-11-29 is a Sunday (chrono num_days_from_sunday == 0).
+        let sunday = at(2026, 11, 29, 0, 0);
+        assert_eq!(sunday.weekday().num_days_from_sunday(), 0);
+        // Literal 7 and 0 both mean Sunday.
+        assert!(cron_matches("0 0 * * 7", &sunday), "7 must mean Sunday");
+        assert!(cron_matches("0 0 * * 0", &sunday), "0 must mean Sunday");
+        // Ranges and lists that include 7 must include Sunday.
+        assert!(cron_matches("0 0 * * 5-7", &sunday), "5-7 = Fri,Sat,Sun");
+        assert!(cron_matches("0 0 * * 1-7", &sunday), "1-7 = every day");
+        assert!(cron_matches("0 0 * * 6,7", &sunday), "6,7 = Sat,Sun");
+        // A range that excludes Sunday must still NOT match Sunday.
+        assert!(!cron_matches("0 0 * * 1-6", &sunday), "1-6 = Mon..Sat, no Sunday");
     }
 
     #[test]

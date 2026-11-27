@@ -1213,34 +1213,25 @@ impl AgentLoopRunner {
                             None => false,
                         };
                         if already_allowed {
+                            // Say it once per session/tool, not once per call: a
+                            // chatty tool would otherwise spam the stream with
+                            // identical notices.
                             if let Some(ref st) = self.state {
-                                let _ = event_tx
-                                    .send(HarnessEvent::Warning {
-                                        message: format!("Tool '{tool_name}' approved for this session (always allow)."),
-                                    })
+                                let first = !st
+                                    .is_tool_allow_noted(&self.session_id, tool_name)
                                     .await;
-                                let _ = st;
+                                if first {
+                                    st.note_tool_allowed(&self.session_id, tool_name).await;
+                                    let _ = event_tx
+                                        .send(HarnessEvent::Warning {
+                                            message: format!(
+                                                "Tool '{tool_name}' is approved for the rest of this session (always allow)."
+                                            ),
+                                        })
+                                        .await;
+                                }
                             }
                         } else if let Some(ref st) = self.state {
-                            // A denied (or unanswered) permission must not let
-                            // the model burn 120s per attempt on the same tool
-                            // forever: cap denials per turn and fail fast.
-                            turn_permission_denials += 1;
-                            if turn_permission_denials > 3 {
-                                let msg = format!(
-                                    "Aborting turn: {turn_permission_denials} permission requests were \
-                                     denied or timed out. Approve the tool in the permission prompt, or \
-                                     switch the permission mode to Autonomous."
-                                );
-                                let _ = event_tx
-                                    .send(HarnessEvent::Warning { message: msg.clone() })
-                                    .await;
-                                context.messages.push(ChatMessage::tool(
-                                    tool_call.id.clone(),
-                                    format!("Error: {msg}"),
-                                ));
-                                return Err(msg);
-                            }
                             let perm_seq = PERM_SEQ.fetch_add(1, Ordering::Relaxed);
                             let perm_id = format!(
                                 "perm_{}_{}_{}_{}",
@@ -1292,6 +1283,27 @@ impl AgentLoopRunner {
                             }).await;
 
                             if !approved {
+                                // Only a *denied* (or timed-out) request counts
+                                // toward the per-turn fail-fast cap. An approved
+                                // request must never accumulate here, or a turn
+                                // that legitimately needs several approvals would
+                                // be aborted after the third one.
+                                turn_permission_denials += 1;
+                                if turn_permission_denials > 3 {
+                                    let msg = format!(
+                                        "Aborting turn: {turn_permission_denials} permission requests were \
+                                         denied or timed out. Approve the tool in the permission prompt, or \
+                                         switch the permission mode to Autonomous."
+                                    );
+                                    let _ = event_tx
+                                        .send(HarnessEvent::Warning { message: msg.clone() })
+                                        .await;
+                                    context.messages.push(ChatMessage::tool(
+                                        tool_call.id.clone(),
+                                        format!("Error: {msg}"),
+                                    ));
+                                    return Err(msg);
+                                }
                                 let msg = format!("Execution denied by user permission policy for tool '{}'.", tool_name);
                                 context.messages.push(ChatMessage::tool(tool_call.id.clone(), format!("Error: {}", msg)));
                                 tc_idx += 1;

@@ -2,7 +2,7 @@
 
 _Running log. Each round: a set of adversarial agents attacks the project; findings are consolidated here and fixed; the loop repeats until a clean round._
 
-Last updated: 2026-11-28 (round 4 prep)
+Last updated: 2026-11-28 (round 5 findings applied)
 
 ---
 
@@ -120,3 +120,22 @@ Roles in rotation:
 4. **Feature / architecture reviewer** — what is missing or structurally wrong.
 
 Rule: findings land in this file; only ONE agent edits source at a time.
+
+### Round 4 — launched (4 concurrent, all read-only reporters)
+| Agent | Mandate |
+|---|---|
+| Red team | auth/Host-guard rebinding, sandbox escape vectors, secret leakage through every surface, agent-level prompt attack, remote-server dispatch abuse, the updater trust chain, DoS |
+| Functional QA | state machine under concurrency, automation schedulers, remote-server failure modes, data survival + DB corruption, malformed input on every endpoint, feature gaps |
+| UX round 2 | attacks the round-3 *fixes* (friendly errors, the badge, always-allow, the hidden section) then everything else: first-run, feedback, a11y, layout, copy |
+| Architecture | trust-boundary map, scaling limits with named lines, async failure modes, what is untested, feature keep/build/cut verdicts, delete list |
+
+### Round 3 — shipped in `69b0118` (verified live in the browser)
+| Finding | Fix | Evidence |
+|---|---|---|
+| Sidebar CTA created a knowledge-mode chat while Ctrl+N created a project chat | button is now "New Project Chat" and matches Ctrl+N | `btnLabel:"New Project Chat"` |
+| Permission prompt invisible → agent hung silently | `role=alert`, aria-live, forced scroll-into-view, top-bar badge, "the agent is paused" | prompt renders 820x129px, badge "1 awaiting approval", `role:alert`, `ariaLive:assertive` |
+| No way to stop re-approving the same tool | "Approve & always allow" + per-session allowlist | `pendingCount` 1→0, badge hides, label "✓ Approved — always allowed" |
+| Skill-routing setting dangled under every tab | moved inside `#settings-page-skills` | `onSkills:true, onProviders:false, onMemory:false, onMcp:false` |
+| Raw "Failed to create session" | names the cause + fix (provider/project) | code only; the live variant needs a failing provider |
+
+Console errors on load: none.

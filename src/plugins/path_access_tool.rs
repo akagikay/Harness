@@ -101,9 +101,7 @@ impl ToolPlugin for RequestPathAccessPlugin {
         _sandbox: &Path,
         ctx: Option<&SessionToolContext>,
     ) -> Result<String, String> {
-        let state = ctx
-            .and_then(|c| c.state.clone())
-            .ok_or_else(|| "request_path_access requires application state.".to_string())?;
+        let ctx = ctx.ok_or_else(|| "request_path_access requires session context.".to_string())?;
         let raw = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -114,18 +112,63 @@ impl ToolPlugin for RequestPathAccessPlugin {
             return Err(format!("'{}' is a file, not a directory.", folder.display()));
         }
 
-        {
-            let mut conf = state.config.write().await;
-            if !conf.extra_access_roots.iter().any(|r| r == &folder) {
-                conf.extra_access_roots.push(folder.clone());
-            }
+        // SECURITY: this tool widens the agent's own reach, so it must never
+        // self-authorise. Writing it straight to `config.extra_access_roots`
+        // (and persisting) let an agent in Autonomous mode grant itself any
+        // absolute path, permanently, for every project - the exact opposite of
+        // what this module promises.
+        //
+        // The grant is (a) only honored when a human explicitly approves it in
+        // the permission prompt, and (b) scoped to this session, so it cannot
+        // outlive the conversation or leak into another project.
+        let approved = args
+            .get("approved")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let always = args
+            .get("always_allow")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // The permission mode must be one that is actually asking a human.
+        // `Safe` prompts; `Auto`/`Autonomous`/`Yolo` would let the agent widen
+        // its own reach with no human in the loop, which is exactly what this
+        // tool must not be able to do.
+        let mode = ctx.config.permissions.mode;
+        let approval_expected = matches!(mode, crate::config::PermissionMode::Safe);
+        if !approval_expected {
+            return Err(format!(
+                "Requesting new folder access requires a human approval, but the current \
+                 permission mode does not prompt one. Switch to the Safe mode, or add the folder \
+                 to the project yourself in Settings → Projects."
+            ));
         }
-        state.persist_config().await;
+        if !approved {
+            return Err(
+                "Awaiting explicit approval: this folder is outside the project and needs a human \
+                 to approve it before the agent may read or write in it."
+                    .to_string(),
+            );
+        }
+
+        let state = ctx
+            .state
+            .clone()
+            .ok_or_else(|| "request_path_access requires application state.".to_string())?;
+        // Session-scoped: the grant lives and dies with this conversation.
+        let scope = if always { "session" } else { "turn" };
+        state
+            .grant_session_path_access(&ctx.session_id, &folder, always)
+            .await;
+        if always {
+            state.allow_tool_for_session(&ctx.session_id, "request_path_access").await;
+        }
 
         Ok(json!({
             "status": "granted",
             "path": folder.display().to_string(),
-            "note": "This folder is now readable/writable by file tools for this harness."
+            "scope": scope,
+            "note": "Approved for this session only. It is not persisted to any other project."
         })
         .to_string())
     }

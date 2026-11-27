@@ -410,6 +410,11 @@ pub struct AppState {
     pub pending_permission_meta: Arc<RwLock<HashMap<String, (String, String)>>>,
     /// Tools a user approved for the rest of a session ("always allow").
     pub session_tool_allowlist: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    /// Allowlist entries already announced to the user (one notice, not many).
+    pub session_tool_allow_noted: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    /// Folders a session was granted access to through an approved
+    /// request_path_access call. Session-scoped, never persisted to config.
+    pub session_path_grants: Arc<RwLock<HashMap<String, Vec<std::path::PathBuf>>>>,
     pub remote_perm_routes: Arc<RwLock<HashMap<String, String>>>,
     pub server_runs: Arc<RwLock<HashMap<String, ServerRunHandle>>>,
     pub active_remote_runs: Arc<RwLock<HashMap<String, (crate::config::ServerNodeConfig, String)>>>,
@@ -434,6 +439,8 @@ impl AppState {
             pending_permissions: Arc::new(RwLock::new(HashMap::new())),
             pending_permission_meta: Arc::new(RwLock::new(HashMap::new())),
             session_tool_allowlist: Arc::new(RwLock::new(HashMap::new())),
+            session_tool_allow_noted: Arc::new(RwLock::new(HashMap::new())),
+            session_path_grants: Arc::new(RwLock::new(HashMap::new())),
             remote_perm_routes: Arc::new(RwLock::new(HashMap::new())),
             server_runs: Arc::new(RwLock::new(HashMap::new())),
             active_remote_runs: Arc::new(RwLock::new(HashMap::new())),
@@ -597,6 +604,8 @@ if !saved_conf.onboarded {
             pending_permissions: Arc::new(RwLock::new(HashMap::new())),
             pending_permission_meta: Arc::new(RwLock::new(HashMap::new())),
             session_tool_allowlist: Arc::new(RwLock::new(HashMap::new())),
+            session_tool_allow_noted: Arc::new(RwLock::new(HashMap::new())),
+            session_path_grants: Arc::new(RwLock::new(HashMap::new())),
             remote_perm_routes: Arc::new(RwLock::new(HashMap::new())),
             server_runs: Arc::new(RwLock::new(HashMap::new())),
             active_remote_runs: Arc::new(RwLock::new(HashMap::new())),
@@ -1218,9 +1227,66 @@ if !saved_conf.onboarded {
             .unwrap_or(false)
     }
 
+    /// True the first time a given allowlist entry is reported, so the UI says
+    /// "approved for this session" once instead of on every tool call.
+    pub async fn is_tool_allow_noted(&self, session_id: &str, tool: &str) -> bool {
+        let lock = self.session_tool_allow_noted.read().await;
+        lock.get(session_id)
+            .map(|tools| tools.contains(tool))
+            .unwrap_or(false)
+    }
+
+    pub async fn note_tool_allowed(&self, session_id: &str, tool: &str) {
+        self.session_tool_allow_noted
+            .write()
+            .await
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(tool.to_string());
+    }
+
+    /// Grant a session access to one extra folder, for the life of the session.
+    ///
+    /// Deliberately NOT written to `config.extra_access_roots`: that list is
+    /// global and persisted, so a tool that could append to it would let an
+    /// agent widen its own reach permanently and for every project. Session
+    /// grants die with the conversation (and with the process).
+    pub async fn grant_session_path_access(
+        &self,
+        session_id: &str,
+        folder: &std::path::Path,
+        persistent_for_session: bool,
+    ) -> Vec<std::path::PathBuf> {
+        let mut grants = self.session_path_grants.write().await;
+        let entry = grants.entry(session_id.to_string()).or_default();
+        let folder = folder.to_path_buf();
+        if !entry.iter().any(|p| p == &folder) {
+            entry.push(folder);
+        }
+        let _ = persistent_for_session;
+        entry.clone()
+    }
+
+    /// Folders a session was explicitly granted access to (see
+    /// [`Self::grant_session_path_access`]).
+    pub async fn session_path_grants(&self, session_id: &str) -> Vec<std::path::PathBuf> {
+        self.session_path_grants
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Drop a session's granted folders (e.g. on delete).
+    pub async fn clear_session_path_grants(&self, session_id: &str) {
+        self.session_path_grants.write().await.remove(session_id);
+    }
+
     /// Forget every "always allow" decision for a session (e.g. on delete).
     pub async fn clear_tool_allowlist(&self, session_id: &str) {
         self.session_tool_allowlist.write().await.remove(session_id);
+        self.session_tool_allow_noted.write().await.remove(session_id);
     }
 
     /// Replace a session's `cancel_notify` with a fresh `Notify` when resuming an idle/stopped session.
@@ -1831,6 +1897,7 @@ if !saved_conf.onboarded {
         }
         // A deleted session must not carry its "always allow" trust forward.
         self.clear_tool_allowlist(session_id).await;
+        self.clear_session_path_grants(session_id).await;
         // Record the deletion so ensure_session_loaded cannot resurrect this id from a DB read
         // that raced with the delete.
         {

@@ -764,11 +764,20 @@ pub async fn decide_permission(
             conf.servers.iter().find(|s| s.id == srv_id).cloned()
         };
         if let Some(srv) = srv_opt {
-            if crate::remote::forward_remote_permission_decision(&srv, &perm_id, payload.approved)
-                .await
-                .is_ok()
-            {
-                return Ok(Json(serde_json::json!({ "status": "forwarded", "server_id": srv_id, "approved": payload.approved })));
+            let forwarded = crate::remote::forward_remote_permission_decision_with(
+                &srv,
+                &perm_id,
+                payload.approved,
+                payload.always_allow,
+            )
+            .await;
+            if forwarded.is_ok() {
+                return Ok(Json(serde_json::json!({
+                    "status": "forwarded",
+                    "server_id": srv_id,
+                    "approved": payload.approved,
+                    "always_allowed": payload.always_allow
+                })));
             }
         }
     }
