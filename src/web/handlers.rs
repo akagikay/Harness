@@ -1722,6 +1722,45 @@ mod ui_structure_tests {
         }
     }
 
+    /// A malformed `app.js` silently kills the ENTIRE UI: one stray brace from a
+    /// line-splicing edit and the browser refuses to parse the script, so no
+    /// listener is ever attached and every control - including the Settings hub -
+    /// is inert while the HTML still looks perfect. Rust cannot parse JS, so this
+    /// pins the structure of the wiring that was spliced in: each handler exists
+    /// exactly once, and the endpoint it must call is present.
+    #[test]
+    fn app_js_security_wiring_is_present_exactly_once() {
+        for fn_name in [
+            "function setPermissionMode(",
+            "function savePermissions(",
+            "function describePermissionMode(",
+            "async function setPrivilegedShell(",
+        ] {
+            assert_eq!(
+                APP_JS.matches(fn_name).count(),
+                1,
+                "'{fn_name}' must be declared exactly once - a duplicated or dropped \
+                 declaration means the spliced edit damaged the file"
+            );
+        }
+        for endpoint in [
+            "/api/security/privileged-shell",
+            "/api/security/permissions",
+            "/api/security/update-pin",
+        ] {
+            assert!(
+                APP_JS.contains(endpoint),
+                "app.js must call {endpoint}, or the corresponding operator control is \
+                 writing to a field the server ignores"
+            );
+        }
+        // The permission pill must follow the SERVER's answer, not the click.
+        assert!(
+            APP_JS.contains("setPermissionMode(saved.permissions.mode, false)"),
+            "the pill must adopt the mode the server echoes back"
+        );
+    }
+
     #[test]
     fn ui_carries_no_inline_event_handlers() {
         for handler in [
@@ -5641,6 +5680,142 @@ pub struct PrivilegedShellRequest {
 #[derive(Deserialize)]
 pub struct RotateTokenRequest {
     pub token: String,
+}
+
+#[derive(Deserialize, Default)]
+pub struct UpdatePermissionsRequest {
+    /// `safe` | `auto` | `autonomous` | `yolo` | `read_only`
+    pub mode: Option<String>,
+    pub bash_policy: Option<String>,
+    pub file_write_policy: Option<String>,
+    pub file_read_policy: Option<String>,
+    pub web_policy: Option<String>,
+}
+
+/// `POST /api/security/permissions` - the only way to change the permission policy.
+///
+/// The policy is a security boundary, so `POST /api/config` deliberately ignores
+/// it (a stale snapshot must not be able to turn the whole harness into
+/// auto-approve). That left the Settings > Tools > Permissions control COMPLETELY
+/// INERT: it saved, returned 200, and changed nothing - the pill moved and the
+/// session's real policy did not. This endpoint is the explicit operator action
+/// that makes the control real, and it echoes back what is actually in force so
+/// the UI can verify instead of trusting.
+pub async fn update_permissions(
+    State(state): State<AppState>,
+    Json(payload): Json<UpdatePermissionsRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let parse_mode = |value: Option<String>| -> Result<Option<crate::config::PermissionMode>, (StatusCode, String)> {
+        match value.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            None => Ok(None),
+            Some(raw) => match raw.to_ascii_lowercase().as_str() {
+                "safe" => Ok(Some(crate::config::PermissionMode::Safe)),
+                "auto" => Ok(Some(crate::config::PermissionMode::Auto)),
+                "autonomous" => Ok(Some(crate::config::PermissionMode::Autonomous)),
+                "yolo" => Ok(Some(crate::config::PermissionMode::Yolo)),
+                "read_only" | "readonly" => Ok(Some(crate::config::PermissionMode::ReadOnly)),
+                other => Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("Unknown permission mode '{other}': expected safe, auto, autonomous, yolo or read_only."),
+                )),
+            },
+        }
+    };
+    let parse_policy = |value: Option<String>| -> Result<Option<PermissionLevel>, (StatusCode, String)> {
+        match value.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            None => Ok(None),
+            Some(raw) => match raw.to_ascii_lowercase().as_str() {
+                "allow" => Ok(Some(PermissionLevel::Allow)),
+                "ask" => Ok(Some(PermissionLevel::Ask)),
+                "deny" => Ok(Some(PermissionLevel::Deny)),
+                other => Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("Unknown permission level '{other}': expected allow, ask or deny."),
+                )),
+            },
+        }
+    };
+
+    let effective = {
+        let mut conf = state.config.write().await;
+        if let Some(mode) = parse_mode(payload.mode)? {
+            conf.permissions.mode = mode;
+        }
+        if let Some(policy) = parse_policy(payload.bash_policy)? {
+            conf.permissions.bash_policy = policy;
+        }
+        if let Some(policy) = parse_policy(payload.file_write_policy)? {
+            conf.permissions.file_write_policy = policy;
+        }
+        if let Some(policy) = parse_policy(payload.file_read_policy)? {
+            conf.permissions.file_read_policy = policy;
+        }
+        if let Some(policy) = parse_policy(payload.web_policy)? {
+            conf.permissions.web_policy = policy;
+        }
+        (
+            conf.permissions.mode.as_str().to_string(),
+            conf.permissions.bash_policy.as_str().to_string(),
+            conf.permissions.file_write_policy.as_str().to_string(),
+            conf.permissions.file_read_policy.as_str().to_string(),
+            conf.permissions.web_policy.as_str().to_string(),
+        )
+    };
+    state.bump_config_revision().await;
+    state.persist_config().await;
+    Ok(Json(serde_json::json!({
+        "status": "saved",
+        "permissions": {
+            "mode": effective.0,
+            "bash_policy": effective.1,
+            "file_write_policy": effective.2,
+            "file_read_policy": effective.3,
+            "web_policy": effective.4,
+        }
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct UpdatePinRequest {
+    pub pin: String,
+}
+
+/// `POST /api/security/update-pin` - set or clear the updater's version pin.
+///
+/// A pin is authoritative: one pointing at an OLD release makes the updater
+/// install it (a silent downgrade) and one equal to the running version
+/// suppresses updates entirely, which is why `POST /api/config` ignores it. The
+/// Settings field therefore needs a real endpoint of its own - it validated and
+/// toasted success on a value the server silently dropped.
+pub async fn update_pin(
+    State(state): State<AppState>,
+    Json(payload): Json<UpdatePinRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pin = payload.pin.trim().to_string();
+    if !pin.is_empty() && !crate::updater::is_valid_version_pin(&pin) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Invalid version pin '{pin}': expected a dotted version such as 1.2.3 (optionally v-prefixed)."),
+        ));
+    }
+    {
+        let mut conf = state.config.write().await;
+        // Store the normalized form (`1.1.5`, not `v1.1.5`) so the config, the UI
+        // and the updater all agree on what is pinned.
+        conf.update_pin_version = if pin.is_empty() {
+            String::new()
+        } else {
+            crate::updater::normalize_version(&pin)
+        };
+    }
+    state.bump_config_revision().await;
+    state.persist_config().await;
+    let pin = { state.config.read().await.update_pin_version.clone() };
+    Ok(Json(serde_json::json!({
+        "status": "saved",
+        "update_pin_version": pin,
+        "pinned": !pin.is_empty(),
+    })))
 }
 
 /// `POST /api/security/token` - rotate the API bearer token at runtime.

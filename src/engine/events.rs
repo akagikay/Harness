@@ -28,6 +28,12 @@ pub enum HarnessEvent {
         perm_id: String,
         tool: String,
         approved: bool,
+        /// Why it was not approved: "timeout" (no answer within 120s), "stopped"
+        /// (the user stopped the turn), or None for a plain denial. A timeout or a
+        /// stop is NOT a denial, and telling the user they denied something they
+        /// never saw is a lie that costs them trust in every other prompt.
+        #[serde(default)]
+        reason: Option<String>,
     },
     ToolCallStarted {
         call_id: String,

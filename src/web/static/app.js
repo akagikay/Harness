@@ -1837,18 +1837,39 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
     if (cfgUpdatePin) {
-        cfgUpdatePin.addEventListener('change', () => {
+        cfgUpdatePin.addEventListener('change', async () => {
             if (!currentConfig) return;
             const raw = (cfgUpdatePin.value || '').trim().replace(/^v/i, '');
-            currentConfig.update_pin_version = /^[0-9][0-9A-Za-z.\-+]*$/.test(raw) ? raw : '';
-            cfgUpdatePin.value = currentConfig.update_pin_version;
-            persistDisplayVerbosityConfig();
-            showToast(
-                currentConfig.update_pin_version
-                    ? `Updates pinned to v${currentConfig.update_pin_version} (older versions install too).`
-                    : 'Update pin cleared - following the latest release.',
-                currentConfig.update_pin_version ? 'info' : 'success'
-            );
+            cfgUpdatePin.disabled = true;
+            try {
+                // The pin is authoritative (an old one downgrades, an equal one
+                // suppresses updates), so it is server-owned and `POST /api/config`
+                // ignores it. Saving it through the whole snapshot reported success
+                // while the server dropped the value.
+                const res = await fetch('/api/security/update-pin', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ pin: raw })
+                });
+                if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
+                const saved = await res.json();
+                const pin = saved.update_pin_version || '';
+                currentConfig.update_pin_version = pin;
+                cfgUpdatePin.value = pin;
+                showToast(
+                    pin
+                        ? `Updates pinned to v${pin} (older versions install too).`
+                        : 'Update pin cleared - following the latest release.',
+                    pin ? 'info' : 'success'
+                );
+            } catch (e) {
+                // Restore the server's value: the field must never claim a pin the
+                // server refused.
+                cfgUpdatePin.value = currentConfig.update_pin_version || '';
+                showToast('Could not save the version pin: ' + e.message, 'error');
+            } finally {
+                cfgUpdatePin.disabled = false;
+            }
         });
     }
     if (cfgPrivilegedShell) {
@@ -6302,7 +6323,7 @@ function handleHarnessEvent(event, isReplay = false) {
             break;
 
         case 'PermissionDecided':
-            updatePermissionPromptDecision(data.perm_id, data.approved);
+            updatePermissionPromptDecision(data.perm_id, data.approved, false, data.reason);
             break;
 
         case 'ToolCallStarted':
@@ -7453,15 +7474,18 @@ window.decidePermission = async function(permId, approved, alwaysAllow = false) 
     }
 };
 
-function updatePermissionPromptDecision(permId, approved, alwaysAllow = false) {
+function updatePermissionPromptDecision(permId, approved, alwaysAllow = false, reason = null) {
     clearPendingPermission(permId);
     const card = document.getElementById(`perm-${permId}`);
     if (card) {
         const actions = card.querySelector('.permission-card-actions');
         if (actions) {
+            // A timeout or a Stop is NOT a denial. Label it the way it happened.
             const label = approved
-                ? (alwaysAllow ? 'Approved — always allowed' : 'Approved')
-                : 'Denied';
+                ? (alwaysAllow ? 'Approved - always allowed' : 'Approved')
+                : (reason === 'timeout'
+                    ? 'Not answered - timed out after 120s'
+                    : (reason === 'stopped' ? 'Cancelled - the turn was stopped' : 'Denied'));
             actions.innerHTML = `
                 <span style="font-size: 0.8rem; font-weight: 600; color: ${approved ? 'var(--accent-green)' : 'var(--accent-red)'};">
                     ${approved ? '✓' : '✕'} ${label}
@@ -8809,8 +8833,29 @@ function setPermissionMode(mode, persist = true) {
     }
 
     if (persist && currentConfig && currentConfig.permissions) {
-        currentConfig.permissions.mode = mode;
-        persistCurrentConfigInBackground();
+        // The permission policy is server-owned: `POST /api/config` deliberately
+        // ignores it, so writing the pill into `currentConfig` and saving the whole
+        // snapshot used to return 200 and change NOTHING - the control lied. It now
+        // round-trips through its own endpoint, and the pill follows what the server
+        // echoes back rather than what the user clicked.
+        (async () => {
+            try {
+                const res = await fetch('/api/security/permissions', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mode })
+                });
+                if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
+                const saved = await res.json();
+                setPermissionMode(saved.permissions.mode, false);
+                if (currentConfig.permissions) Object.assign(currentConfig.permissions, saved.permissions);
+                showToast('Permission mode set to ' + describePermissionMode(saved.permissions.mode), 'success');
+            } catch (e) {
+                // Revert: the pill must never claim a mode the server refused.
+                setPermissionMode((currentConfig.permissions && currentConfig.permissions.mode) || 'safe', false);
+                showToast('Could not change the permission mode: ' + e.message, 'error');
+            }
+        })();
     }
     closeAllPopovers();
 }
@@ -10411,7 +10456,7 @@ async function savePermissions() {
     const globalModeBtn = document.querySelector('#perm-global-mode .seg-btn.active');
     const globalMode = globalModeBtn ? globalModeBtn.getAttribute('data-val') : 'safe';
 
-    currentConfig.permissions = {
+    const requested = {
         mode: globalMode,
         bash_policy: getSegActive('bash'),
         file_write_policy: getSegActive('file_write'),
@@ -10419,15 +10464,33 @@ async function savePermissions() {
         web_policy: getSegActive('web')
     };
 
+    // `POST /api/config` ignores the permission policy on purpose (a stale
+    // snapshot must not be able to turn the whole harness into auto-approve), so
+    // this save goes through the dedicated endpoint and adopts what the server
+    // echoes back. Before, this handler reported success on a no-op.
     try {
-        const result = await saveCurrentConfig();
-        if (result.ok) {
-            setPermissionMode(globalMode);
-            showSettingsFeedback('✓ Tool permissions saved');
+        const res = await fetch('/api/security/permissions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requested)
+        });
+        if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
+        const saved = await res.json();
+        const perms = saved.permissions || requested;
+        if (currentConfig.permissions) Object.assign(currentConfig.permissions, perms);
+        setPermissionMode(perms.mode, false);
+        if (typeof syncPermissionControls === 'function') syncPermissionControls();
+        showSettingsFeedback(`Tool permissions saved (${describePermissionMode(perms.mode)}, bash: ${perms.bash_policy}).`);
+        if (perms.mode !== globalMode) {
+            showSettingsFeedback(`Note: the server applied ${describePermissionMode(perms.mode)}, not ${describePermissionMode(globalMode)}.`, true);
         }
     } catch (e) {
-        showSettingsFeedback(`✕ Failed to save permissions: ${e.message}`, true);
+        showSettingsFeedback(`Failed to save permissions: ${e.message}`, true);
     }
+}
+
+function describePermissionMode(mode) {
+    return { 'safe': 'Safe (Ask)', 'auto': 'Auto', 'autonomous': 'Autonomous', 'yolo': 'Yolo', 'read_only': 'Read Only' }[mode] || mode;
 }
 
 let cachedToolsList = [];

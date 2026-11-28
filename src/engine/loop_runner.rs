@@ -1389,24 +1389,46 @@ impl AgentLoopRunner {
                             let decision = tokio::select! {
                                 _ = self.cancel_notify.notified() => {
                                     st.cancel_permission_waiter(&perm_id).await;
+                                    // Resolve the prompt on the way out. Without
+                                    // this the card kept `data-pending="1"` and the
+                                    // top bar kept claiming "N awaiting approval"
+                                    // for a prompt the agent had abandoned, and
+                                    // clicking Approve 404'd - a user-blaming error.
+                                    let _ = event_tx.send(HarnessEvent::PermissionDecided {
+                                        perm_id: perm_id.clone(),
+                                        tool: tool_name.clone(),
+                                        approved: false,
+                                        reason: Some("stopped".to_string()),
+                                    }).await;
                                     return Err("Stopped while awaiting approval.".to_string());
                                 }
                                 d = tokio::time::timeout(Duration::from_secs(120), perm_rx) => d,
                             };
-                            let approved = match decision {
+                            let approved = match &decision {
                                 Ok(Ok(true)) => true,
                                 _ => false,
                             };
+                            let timed_out = matches!(&decision, Err(_));
                             if !approved {
                                 // Remove the waiter on every non-approved path so
                                 // pending entries cannot accumulate.
                                 st.cancel_permission_waiter(&perm_id).await;
                             }
 
+                            // A timeout is not a denial. Label it the way it happened so the card
+                            // does not claim the user refused something they never saw.
+                            let reason = if approved {
+                                None
+                            } else if timed_out {
+                                Some("timeout".to_string())
+                            } else {
+                                None
+                            };
                             let _ = event_tx.send(HarnessEvent::PermissionDecided {
                                 perm_id,
                                 tool: tool_name.clone(),
                                 approved,
+                                reason,
                             }).await;
 
                             if !approved {

@@ -8362,3 +8362,162 @@ async fn test_a_finished_session_closes_its_stream_and_replays_history() {
     srv.abort();
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
+
+/// P0-1 (round 9): the permission-mode control was INERT. `POST /api/config`
+/// deliberately ignores the policy, and no endpoint could change it, so picking
+/// Autonomous saved, returned 200, and changed nothing - the pill lied about the
+/// security state of the running harness. The policy must be settable through its
+/// own endpoint and echoed back so the UI adopts the server's answer.
+#[tokio::test]
+async fn test_the_permission_policy_is_settable_and_echoed_back() {
+    let temp_dir = std::env::temp_dir().join(format!("harness-r9-perm-{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+    let mut cfg = HarnessConfig::default();
+    cfg.sandbox_root = temp_dir.clone();
+    cfg.auth_token = String::new();
+    cfg.permissions.mode = deepseek_harness_rs::config::PermissionMode::Safe;
+    let state = AppState::new(cfg);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // A whole-config snapshot must still be ignored (a stale tab must not be able
+    // to turn the harness into auto-approve).
+    let snapshot: Value = client
+        .get(format!("{base}/api/config"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut hostile = snapshot;
+    hostile["permissions"]["mode"] = json!("yolo");
+    client
+        .post(format!("{base}/api/config"))
+        .json(&hostile)
+        .send()
+        .await
+        .unwrap();
+    let after_snapshot: Value = client
+        .get(format!("{base}/api/config"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        after_snapshot["permissions"]["mode"], "safe",
+        "a config snapshot must not widen the permission policy"
+    );
+
+    // The dedicated endpoint DOES change it, and echoes the effective value back.
+    let resp = client
+        .post(format!("{base}/api/security/permissions"))
+        .json(&json!({ "mode": "autonomous", "bash_policy": "allow" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+    let saved: Value = resp.json().await.unwrap();
+    assert_eq!(saved["permissions"]["mode"], "autonomous");
+    assert_eq!(saved["permissions"]["bash_policy"], "allow");
+
+    let after: Value = client
+        .get(format!("{base}/api/config"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        after["permissions"]["mode"], "autonomous",
+        "the endpoint must actually apply the mode, not just echo it"
+    );
+
+    // A malformed mode is refused rather than silently ignored.
+    let bad = client
+        .post(format!("{base}/api/security/permissions"))
+        .json(&json!({ "mode": "yolo-mode" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400, "an unknown mode must be refused");
+
+    srv.abort();
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// The update pin is server-owned (a pin is authoritative: an old one downgrades,
+/// an equal one suppresses updates), so the Settings field needs its own endpoint
+/// or it toasts success on a value the server drops.
+#[tokio::test]
+async fn test_the_update_pin_is_settable_through_its_own_endpoint() {
+    let temp_dir = std::env::temp_dir().join(format!("harness-r9-pin-{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+    let mut cfg = HarnessConfig::default();
+    cfg.sandbox_root = temp_dir.clone();
+    cfg.auth_token = String::new();
+    let state = AppState::new(cfg);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    let set: Value = client
+        .post(format!("{base}/api/security/update-pin"))
+        .json(&json!({ "pin": "v1.1.5" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(set["update_pin_version"], "1.1.5");
+    assert_eq!(set["pinned"], true);
+
+    let cfg_after: Value = client
+        .get(format!("{base}/api/config"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cfg_after["update_pin_version"], "1.1.5");
+
+    // A malformed pin is refused (it is interpolated into the GitHub API path).
+    let bad = client
+        .post(format!("{base}/api/security/update-pin"))
+        .json(&json!({ "pin": "1.1.5/../../.." }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+
+    // Clearing works.
+    let cleared: Value = client
+        .post(format!("{base}/api/security/update-pin"))
+        .json(&json!({ "pin": "" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cleared["update_pin_version"], "");
+    assert_eq!(cleared["pinned"], false);
+
+    srv.abort();
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}

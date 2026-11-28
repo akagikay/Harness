@@ -16,6 +16,17 @@ impl Default for PermissionLevel {
     }
 }
 
+impl PermissionLevel {
+    /// The stable snake_case name used by the API and the config file.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PermissionLevel::Allow => "allow",
+            PermissionLevel::Ask => "ask",
+            PermissionLevel::Deny => "deny",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
