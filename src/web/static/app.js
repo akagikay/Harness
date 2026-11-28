@@ -6393,6 +6393,11 @@ function handleHarnessEvent(event, isReplay = false) {
         case 'Error':
             appendSystemError(data.message || '');
             finalizeOrphanedStreamStates();
+            // A terminal Error means the turn is over, so any pending approval is
+            // dead with it. Without this the top bar kept claiming "N awaiting
+            // approval" for a prompt the agent had abandoned, and its Approve click
+            // 404'd against an already-finished session.
+            clearAllPendingPermissions();
             if (!isReplay) {
                 btnSubmit.disabled = false;
                 setSessionRunning(false);
@@ -6403,6 +6408,10 @@ function handleHarnessEvent(event, isReplay = false) {
             if (!isReplay) {
                 setSessionRunning(false);
             }
+            // Terminal either way (including a user Stop): any pending approval is
+            // dead, so clear the badge rather than leaving a prompt the agent has
+            // abandoned on screen claiming it is still awaiting approval.
+            clearAllPendingPermissions();
             finishSession(data.final_answer || '', data.total_steps || 0, data.duration_secs || 0, isReplay);
             break;
     }

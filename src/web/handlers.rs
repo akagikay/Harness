@@ -1697,6 +1697,31 @@ mod ui_structure_tests {
         assert!(tabs >= 8, "expected the settings tabs to be discovered, got {tabs}");
     }
 
+    /// P0-3: a Stop (or any terminal event) left the top-bar badge claiming "N awaiting
+    /// approval" for a prompt the agent had already abandoned, whose Approve click
+    /// 404'd. Both terminal cases must clear the pending set.
+    #[test]
+    fn terminal_events_clear_a_stale_approval_badge() {
+        let error_arm = APP_JS
+            .find("case 'Error':")
+            .expect("the Error case is missing from handleHarnessEvent");
+        let completed_arm = APP_JS
+            .find("case 'SessionCompleted':")
+            .expect("the SessionCompleted case is missing from handleHarnessEvent");
+        for (name, at) in [("Error", error_arm), ("SessionCompleted", completed_arm)] {
+            // The clear must be inside the case, before the next case starts.
+            let end = APP_JS[at..]
+                .find("break;")
+                .map(|e| at + e)
+                .unwrap_or(APP_JS.len());
+            assert!(
+                APP_JS[at..end].contains("clearAllPendingPermissions()"),
+                "the {name} case must clear pending permissions, or the badge lies \
+                 about an approval the agent abandoned"
+            );
+        }
+    }
+
     #[test]
     fn ui_carries_no_inline_event_handlers() {
         for handler in [
