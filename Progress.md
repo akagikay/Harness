@@ -537,3 +537,47 @@ All six are implemented; regression tests added for each. Details:
   `test_auto_skill_directives_are_not_injected_for_a_weak_match`.
 
 Test status: 228 unit + 78 integration, all green.
+
+### Post-release self-audit - two more defects found and FIXED (`d41e4f6`, `bab9f7c`)
+
+Both were introduced by the checkpoint fix above, and both were found by
+re-reading my own new code rather than by an agent:
+
+- **A per-round-trip DB write storm.** The checkpoint sink called
+  `save_llm_messages` (in-memory update + `persist_session_record`) on EVERY model
+  round-trip. That function holds the global `sessions` **write** lock across
+  three deep clones plus a DB transaction serializing the whole history, so on a
+  long conversation every session read on the machine queued behind a disk write
+  once per round-trip. Now: in-memory history on every snapshot, DB write
+  debounced to 1/second, and every terminal arm flushes (so a failed turn is
+  still durable). Tests: `in_memory_checkpoint_updates_history_without_touching_the_db`,
+  `flush_makes_the_last_checkpoint_durable`.
+- **A checkpoint could resurrect a rolled-back conversation.** The guard was a
+  check at the call site followed by an awaited write, so an `undo` landing in
+  that window let a stale snapshot write back the messages the user just threw
+  away. `checkpoint_turn_messages` now compares the cancellation token and
+  updates the history under ONE write-lock acquisition, so a stale or deleted
+  session is refused instead of partially written. Tests:
+  `a_checkpoint_after_undo_is_rejected_by_the_live_turn_guard`,
+  `a_checkpoint_into_a_deleted_session_is_refused`.
+
+Also verified by hand: `POST /api/security/privileged-shell` requires the bearer
+token (`/api/security/*` is not on the public-path exemption) and is NOT exposed
+on the pure execution-server router, so a cluster worker cannot be flipped to the
+unjailed shell by a client; there is no permissive CORS layer; the `biased`
+select polls `event_rx` first each iteration so agent events always win over
+snapshots; and a client cannot widen a remote server's shell scope because the
+runner's registry is built from the server's own config.
+
+Current status: **234 unit + 78 integration, all green.**
+
+## Round 8 - in flight (4 concurrent critics, all read-only reporters)
+
+Launched 2026-11-28 against v1.1.5. Mandates: UX critic (first-run, permission
+prompt, settings discoverability of the NEW `bash` opt-in and `update_pin_version`,
+a11y, narrow viewport), functional QA (the new code hardest, then every endpoint),
+red team (the privileged-shell endpoint, the checkpoint sink, the remote-root
+contract, DB quarantine, updater pin, plus the classics), architecture
+(trust-boundary map, the checkpoint cost, dead-code delete list, feature
+verdicts). Reports land in `.harness_reports/round8-*.md` (gitignored) and are
+consolidated here by the orchestrator, which is the only editor.
