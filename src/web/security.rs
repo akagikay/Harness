@@ -119,6 +119,69 @@ pub fn is_loopback_host(host: &str) -> bool {
     }
 }
 
+/// Reject a cross-origin state-changing request.
+///
+/// The app is served same-origin, so a state-changing request with an `Origin`
+/// that is not this server is always an attempt to drive the UI from another
+/// page: DNS rebinding (a page on `evil.com` whose A-record points at
+/// `127.0.0.1`) or an ordinary CSRF. The loopback `Host` rule does NOT catch
+/// this - the browser sends the correct `Host: 127.0.0.1:8290` for a rebound
+/// request, so the check passes. `Sec-Fetch-Site: same-origin` is the modern
+/// signal and is what current browsers send; `Origin` is the portable one.
+///
+/// This is deliberately independent of CORS: today the protection is an
+/// accident (the `Json` extractor's content-type check forces a preflight that
+/// no `CorsLayer` answers, so the browser blocks the request). Adding a
+/// permissive `CorsLayer` for a legitimate reason - it is one line, and the
+/// dependency is already enabled - would instantly hand any website the ability
+/// to enable an unjailed shell, flip the permission policy to yolo, or overwrite
+/// a run. The boundary should not depend on an extractor detail.
+///
+/// Returns `Some(origin)` when the request must be refused.
+pub fn cross_origin_state_change(req: &Request<Body>) -> Option<String> {
+    let headers = req.headers();
+    // `Sec-Fetch-Site` is authoritative when present.
+    if let Some(site) = headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_ascii_lowercase())
+    {
+        if site == "none" || site == "cross-site" {
+            return Some(format!("Sec-Fetch-Site: {site}"));
+        }
+        return None;
+    }
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_ascii_lowercase())
+    else {
+        // No Origin and no Sec-Fetch-Site: a non-browser client (curl, the harness
+        // client/server, tests). The bearer-token rule still applies.
+        return None;
+    };
+    if origin.is_empty() || origin == "null" {
+        return Some("opaque Origin".to_string());
+    }
+    // A same-origin request's Origin is exactly the server's own origin: the
+    // `Host` we are serving, on whichever scheme the bind uses.
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        // No Host to compare against: nothing can prove same-origin, and this is
+        // a state-changing request, so refuse rather than trust.
+        return Some(origin);
+    }
+    if origin == format!("http://{host}") || origin == format!("https://{host}") {
+        return None;
+    }
+    Some(origin)
+}
+
 /// True when a *bind* address is loopback-only (so a rebinding guard applies).
 pub fn is_loopback_bind(host: &str) -> bool {
     is_loopback_host(host)
@@ -216,8 +279,23 @@ pub async fn security_middleware(
     next: Next,
 ) -> Response {
     let path = req.uri().path().to_string();
+    let is_state_change = !matches!(*req.method(), axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS);
 
-    // 1) DNS-rebinding guard: only accept loopback Host headers on loopback binds.
+    // 1) Cross-origin state-changing requests are refused outright. The app is
+    //    same-origin, so an Origin/Sec-Fetch-Site that says otherwise is a
+    //    rebinding page or a CSRF trying to flip a security boundary (enable the
+    //    unjailed shell, set yolo, overwrite a run). See `cross_origin_state_change`.
+    if is_state_change {
+        if let Some(origin) = cross_origin_state_change(&req) {
+            return (
+                StatusCode::FORBIDDEN,
+                format!("Rejected: cross-origin request ({origin}). The Harness UI must be driven from its own origin."),
+            )
+                .into_response();
+        }
+    }
+
+    // 2) DNS-rebinding guard: only accept loopback Host headers on loopback binds.
     if security.require_loopback_host {
         // `is_loopback_host` parses the value (brackets, port, IP), so a raw
         // `Host` of `127.0.0.1.evil.com:80` is rejected as it must be.

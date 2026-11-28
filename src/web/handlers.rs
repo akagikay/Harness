@@ -1082,6 +1082,27 @@ pub fn merge_config_update(existing: &HarnessConfig, incoming: HarnessConfig) ->
     // The remote-root allowlist defines what a client may reach on THIS server;
     // a client-supplied config must not widen it.
     merged.remote_root_allowlist = existing.remote_root_allowlist.clone();
+    // The permission policy is a security boundary: `POST /api/config` accepts
+    // the whole config from any caller, so honouring a client `permissions`
+    // block would let one request turn the entire harness into auto-approve for
+    // every tool - including `bash` when the privileged shell is on, and every
+    // `ShellOrNetwork`/`WorkspaceWrite` custom tool - with no confirmation
+    // anywhere. Verified live before the fix: a body with
+    // `"permissions":{"mode":"yolo"}` was accepted and persisted. Mode, per-tool
+    // policies and rules all come from the operator's own settings now; a
+    // tightening still ships through the normal settings UI.
+    merged.permissions = existing.permissions.clone();
+    // A pin is authoritative: a pin to an OLD release makes the updater install
+    // it (a silent downgrade to a build that may contain known holes), and a pin
+    // equal to the running version suppresses updates entirely. It is seeded
+    // from the environment/CLI at startup and changed deliberately, never by a
+    // whole-config snapshot.
+    merged.update_pin_version = existing.update_pin_version.clone();
+    // The auth token gates every `/api/*` route: a snapshot must not be able to
+    // blank it (locking the owner out) or silently install a new one. Rotation
+    // stays available through `POST /api/security/token`, an explicit operator
+    // action, so a leaked token can still be revoked at runtime with no restart.
+    merged.auth_token = existing.auth_token.clone();
     merged
 }
 
@@ -1292,7 +1313,7 @@ mod handlers_config_merge_tests {
             id: "foo".into(),
             name: "Foo".into(),
             path: std::path::PathBuf::from("C:\\tmp\\foo"),
-            icon: "📁".into(),
+            icon: "ðŸ“".into(),
             created_at: "now".into(),
             is_active: true,
             defaults: Default::default(),
@@ -1451,7 +1472,7 @@ mod sensitive_entry_tests {
 
 #[cfg(test)]
 mod ui_structure_tests {
-    use super::{APP_JS, INDEX_HTML};
+    use super::{APP_JS, INDEX_HTML, STYLE_CSS};
 
     /// A permission prompt must survive a reload.
     ///
@@ -1552,6 +1573,40 @@ mod ui_structure_tests {
         assert!(
             APP_JS.contains("syncPrivilegedShellUi(!next)"),
             "a failed toggle has to restore the previous state instead of claiming success"
+        );
+    }
+
+    /// A responsive override that sits BEFORE its base rule is dead CSS.
+    ///
+    /// The settings hub's `max-width: 64em` overrides used to be declared ~700
+    /// lines above the base `.settings-*` rules. With equal specificity the later
+    /// rule wins, so on a narrow viewport the rail kept the base
+    /// `flex-direction: column` and the hub rendered as a 396px rail stacked above
+    /// a 57px page pane - the whole Settings modal was a letterbox. Verified live
+    /// at a 1000px-wide viewport before and after the move.
+    #[test]
+    fn the_settings_hub_responsive_rules_come_after_the_base_rules() {
+        let base = STYLE_CSS
+            .find(".settings-nav-rail {")
+            .expect("the base settings rail rule is missing");
+        // The override that must win: the LAST declaration of the rail, which has
+        // to be the narrow-viewport one (with equal specificity, later wins).
+        let override_at = STYLE_CSS
+            .rfind(".settings-nav-rail {")
+            .expect("the narrow-viewport rail override is missing");
+        assert!(
+            override_at > base,
+            "the settings hub's responsive overrides must come AFTER the base rules, \
+             otherwise the base rule wins and the hub collapses on narrow viewports"
+        );
+        assert!(
+            STYLE_CSS[override_at..override_at + 400].contains("flex-direction: row;"),
+            "the narrow-viewport rail override must set the rail to a row"
+        );
+        // The pane must never be squeezed to nothing when the hub stacks.
+        assert!(
+            STYLE_CSS[override_at..].contains("min-height: min(60vh, 420px)"),
+            "the stacked settings pane needs a min-height so it keeps a usable viewport"
         );
     }
 
@@ -2624,7 +2679,7 @@ pub async fn save_project(
         }
     };
 
-    let icon = payload.icon.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "📁".to_string());
+    let icon = payload.icon.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "≡ƒôü".to_string());
     let set_active = payload.set_active.unwrap_or(true);
 
     // Resolve and validate additional folders (created if missing).
@@ -3735,8 +3790,34 @@ pub async fn server_info(State(state): State<AppState>) -> Json<serde_json::Valu
         "sandbox_root": conf.sandbox_root.display().to_string(),
         "tools_count": tools.len(),
         "tools": tools,
-        "active_runs": active_runs
+        "active_runs": active_runs,
+        // Auditable posture: what a dispatched run will actually be allowed to
+        // do here. A client used to be able to override this per-run.
+        "permission_mode": conf.permissions.mode.as_str(),
+        "privileged_shell": conf.allow_privileged_shell,
     }))
+}
+
+/// True when `candidate` grants strictly more than `server`.
+///
+/// The ordering the harness enforces, most permissive first:
+/// `ReadOnly < Safe < Auto < Autonomous < Yolo`. A client-dispatched run may only
+/// ever run at the server's own strictness or stricter - a remote caller must not
+/// be able to widen the operator's policy.
+fn permission_mode_is_looser(
+    candidate: crate::config::PermissionMode,
+    server: crate::config::PermissionMode,
+) -> bool {
+    fn rank(mode: crate::config::PermissionMode) -> u8 {
+        match mode {
+            crate::config::PermissionMode::Yolo => 4,
+            crate::config::PermissionMode::Autonomous => 3,
+            crate::config::PermissionMode::Auto => 2,
+            crate::config::PermissionMode::Safe => 1,
+            crate::config::PermissionMode::ReadOnly => 0,
+        }
+    }
+    rank(candidate) > rank(server)
 }
 
 /// Roots a remote execution server is willing to grant a client-dispatched run.
@@ -3818,19 +3899,21 @@ pub async fn start_server_run(
         .prune_finished_server_runs(Duration::from_secs(600))
         .await;
 
-    // The client sends its project folders (and human-approved roots) in
-    // `config`. Decide which of them this server may actually grant BEFORE
-    // registering the run, so a refusal is a clear 409 rather than a run that
-    // silently loses folders.
+    // The client sends its approved access roots in `config`. Decide which of them
+    // this server may actually grant BEFORE registering the run, so a refusal is a
+    // clear 409 rather than a run that silently loses folders.
+    //
+    // Only `extra_access_roots` is requested: the caller fills it with exactly the
+    // folders the run needs (`spawn_session_turn` puts every folder of the
+    // session's project in there, which is what multi-folder projects rely on).
+    // Requesting the client's `sandbox_root` as well breaks subagent dispatch -
+    // a nested run inherits its PARENT's sandbox, which is a path on the parent's
+    // host, not on this one - and iterating the whole `projects` registry
+    // validated unrelated folders (the default project beside the executable,
+    // every other project the client knows about) and refused the whole run for
+    // folders it never touches.
     let server_conf = state.config.read().await.clone();
-    let mut requested_roots: Vec<PathBuf> = payload.config.extra_access_roots.clone();
-    for project in &payload.config.projects {
-        for root in project.all_paths() {
-            if !requested_roots.iter().any(|r| r == &root) {
-                requested_roots.push(root);
-            }
-        }
-    }
+    let requested_roots: Vec<PathBuf> = payload.config.extra_access_roots.clone();
     let (granted_roots, missing_roots) = resolve_remote_run_roots(&server_conf, &requested_roots)
         .map_err(|e| (StatusCode::CONFLICT, e))?;
 
@@ -3840,6 +3923,19 @@ pub async fn start_server_run(
 
     {
         let mut runs = state.server_runs.write().await;
+        // SECURITY (H2): `run_id` is client-chosen, and the insert used to
+        // overwrite unconditionally. A client that observed or guessed another
+        // client's id destroyed its whole handle - the final answer, the updated
+        // messages, and the cancellation token, so the victim could no longer
+        // stop its own run - and its SSE stream then re-read a handle that is
+        // still `"running"`, finds no terminal status, and spins forever. A
+        // collision is now a 409 instead of a silent hijack.
+        if runs.contains_key(&run_id) {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("run_id '{}' is already in use on this server", run_id),
+            ));
+        }
         runs.insert(
             run_id.clone(),
             crate::state::ServerRunHandle {
@@ -3880,9 +3976,44 @@ pub async fn start_server_run(
             }
         }
         run_conf.projects = server_conf.projects.clone();
+        // SECURITY (H1): the same argument that applies to the sandbox applies to the
+        // permission policy. `payload.config` is client-supplied, so a token
+        // holder could dispatch a run carrying `permissions.mode: yolo` and have
+        // every tool - including `bash` when the operator enabled the privileged
+        // shell - auto-approved on the server host with no prompt, while the
+        // server operator's own Safe-mode policy was discarded. The policy and
+        // the resource caps are now taken from the server too; only `read_only`
+        // (a tightening) is honoured from the payload, and a client can never
+        // *loosen* the effective mode.
+        run_conf.permissions = server_conf.permissions.clone();
+        run_conf.knowledge_only = false;
+        run_conf.max_iterations = server_conf.max_iterations;
+        run_conf.max_tool_output_bytes = server_conf.max_tool_output_bytes;
+        run_conf.tool_timeout_secs = server_conf.tool_timeout_secs;
+        // MCP servers run INSIDE the server process, so they are the server's.
+        // (The tool registry is already built from the server's own config, so
+        // this is about not letting a client shape the outbound surface.)
+        run_conf.mcp_servers = server_conf.mcp_servers.clone();
+        // NOTE: the model/provider/credential surface stays client-supplied. In a
+        // client/server cluster the client owns the model subscription and the
+        // server only executes - that is the documented split, and pinning the
+        // server's own (usually empty) provider config here would break every
+        // real dispatch.
         if payload.read_only {
             run_conf.permissions.mode = crate::config::PermissionMode::ReadOnly;
         }
+        if permission_mode_is_looser(run_conf.permissions.mode, server_conf.permissions.mode) {
+            run_conf.permissions.mode = server_conf.permissions.mode;
+        }
+        // Never carry a client's update/identity/config-scope state onto the
+        // server: the shell flag, the pin, the updater repo, the DB override and
+        // the remote-root allowlist are all server-owned.
+        run_conf.allow_privileged_shell = server_conf.allow_privileged_shell;
+        run_conf.update_pin_version = server_conf.update_pin_version.clone();
+        run_conf.update_repo = server_conf.update_repo.clone();
+        run_conf.remote_root_allowlist = server_conf.remote_root_allowlist.clone();
+        run_conf.db_path = None;
+        run_conf.mock_mode = payload.use_mock || server_conf.mock_mode;
         if !server_conf.server_identity.trim().is_empty() {
             run_conf.server_identity = server_conf.server_identity.clone();
         }
@@ -4014,7 +4145,10 @@ pub async fn stream_server_run_events(
     Ok(Sse::new(s).keep_alive(KeepAlive::new().interval(Duration::from_secs(10))))
 }
 
-fn async_stream_unfold_run(
+/// Build the SSE stream for one remote run. Public so the stream's termination
+/// contract can be tested directly (a stream whose run handle has disappeared
+/// must end rather than spin).
+pub fn async_stream_unfold_run(
     state: AppState,
     run_id: String,
     rx: broadcast::Receiver<HarnessEvent>,
@@ -4054,36 +4188,63 @@ fn async_stream_unfold_run(
         }
 
         loop {
-            match tokio::time::timeout(Duration::from_millis(250), st.rx.recv()).await {
+            match tokio::time::timeout(Duration::from_secs(1), st.rx.recv()).await {
                 Ok(Ok(evt)) => {
                     let json_data = serde_json::to_string(&evt).unwrap_or_default();
                     return Some((Ok(Event::default().data(json_data)), st));
                 }
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) | Err(_) => {
-                    let fin_opt = {
-                        let runs = st.state.server_runs.read().await;
-                        runs.get(&st.run_id).and_then(|h| {
-                            if h.status != "running" {
-                                Some(crate::remote::RemoteRunFinished {
-                                    status: h.status.clone(),
-                                    final_answer: h.final_answer.clone().unwrap_or_default(),
-                                    error: h.error.clone(),
-                                    updated_messages: h.updated_messages.clone().unwrap_or_default(),
-                                })
-                            } else {
-                                None
-                            }
-                        })
-                    };
-                    if let Some(fin) = fin_opt {
+                // No event within the poll window: keep waiting, UNLESS the run
+                // has already reached a terminal status. That second half is the
+                // normal path - a finished run keeps its handle (and therefore its
+                // sender) alive for the reconnect grace period, so the broadcast
+                // never reports Closed here. Without this check the stream never
+                // ends and the client waits forever for `run_finished`.
+                Err(_) => {
+                    let fin = terminal_finished(&st.state, &st.run_id);
+                    if let Some(fin) = fin {
                         st.finished_sent = true;
                         let fin_json = serde_json::to_string(&fin).unwrap_or_default();
                         return Some((Ok(Event::default().event("run_finished").data(fin_json)), st));
                     }
+                    continue;
+                }
+                // The sender is gone: the handle was pruned, removed, or
+                // overwritten by a duplicate run_id. Emit the terminal payload
+                // when there is one, and end the stream either way.
+                //
+                // Before, neither case ended it: the `loop` iterated,
+                // `rx.recv()` returned `Closed` again, and the task spun at ~4 Hz
+                // for the life of the process, re-acquiring the `server_runs`
+                // read lock on every pass. N such streams wedged the server.
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    if let Some(fin) = terminal_finished(&st.state, &st.run_id) {
+                        st.finished_sent = true;
+                        let fin_json = serde_json::to_string(&fin).unwrap_or_default();
+                        return Some((Ok(Event::default().event("run_finished").data(fin_json)), st));
+                    }
+                    return None;
                 }
             }
         }
+    })
+}
+
+/// The terminal payload of a remote run, if it has finished.
+fn terminal_finished(
+    state: &AppState,
+    run_id: &str,
+) -> Option<crate::remote::RemoteRunFinished> {
+    let runs = state.server_runs.try_read().ok()?;
+    let h = runs.get(run_id)?;
+    if h.status == "running" {
+        return None;
+    }
+    Some(crate::remote::RemoteRunFinished {
+        status: h.status.clone(),
+        final_answer: h.final_answer.clone().unwrap_or_default(),
+        error: h.error.clone(),
+        updated_messages: h.updated_messages.clone().unwrap_or_default(),
     })
 }
 
@@ -4174,7 +4335,7 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
     favorites.push(FavoritePath {
         name: "Workspace".to_string(),
         path: cwd_norm,
-        icon: "📁".to_string(),
+        icon: "ðŸ“".to_string(),
     });
 
     let projects_dir = cwd.join("projects");
@@ -4182,7 +4343,7 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
         favorites.push(FavoritePath {
             name: "Projects".to_string(),
             path: normalize_display_path(&projects_dir),
-            icon: "🚀".to_string(),
+            icon: "ðŸš€".to_string(),
         });
     }
 
@@ -4192,7 +4353,7 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
             favorites.push(FavoritePath {
                 name: "Home".to_string(),
                 path: normalize_display_path(&home_p),
-                icon: "🏠".to_string(),
+                icon: "ðŸ ".to_string(),
             });
         }
 
@@ -4201,7 +4362,7 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
             favorites.push(FavoritePath {
                 name: "Downloads".to_string(),
                 path: normalize_display_path(&downloads),
-                icon: "📥".to_string(),
+                icon: "ðŸ“¥".to_string(),
             });
         }
 
@@ -4210,7 +4371,7 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
             favorites.push(FavoritePath {
                 name: "Desktop".to_string(),
                 path: normalize_display_path(&desktop),
-                icon: "🖥️".to_string(),
+                icon: "ðŸ–¥ï¸".to_string(),
             });
         }
 
@@ -4219,7 +4380,7 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
             favorites.push(FavoritePath {
                 name: "Documents".to_string(),
                 path: normalize_display_path(&docs),
-                icon: "📄".to_string(),
+                icon: "ðŸ“„".to_string(),
             });
         }
     }
@@ -5385,6 +5546,42 @@ pub async fn security_status(State(state): State<AppState>) -> Json<serde_json::
 #[derive(Deserialize)]
 pub struct PrivilegedShellRequest {
     pub enabled: bool,
+}
+
+#[derive(Deserialize)]
+pub struct RotateTokenRequest {
+    pub token: String,
+}
+
+/// `POST /api/security/token` - rotate the API bearer token at runtime.
+///
+/// Rotation is a legitimate, required operation (a leaked token must be
+/// revocable with no restart), so it lives here rather than being blocked
+/// outright: `merge_config_update` preserves `auth_token` from a whole-config
+/// snapshot so one stale payload cannot blank it, and this endpoint is the only
+/// way to change it - an explicit operator action that re-reads the live token
+/// source immediately.
+pub async fn rotate_auth_token(
+    State(state): State<AppState>,
+    Json(payload): Json<RotateTokenRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let token = payload.token.trim().to_string();
+    // An empty token disables auth entirely; refuse that through this endpoint
+    // so a typo cannot silently strip the guard off every route.
+    if token.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "A token cannot be empty. Set HARNESS_AUTH_TOKEN to change how auth is configured."
+                .to_string(),
+        ));
+    }
+    {
+        let mut conf = state.config.write().await;
+        conf.auth_token = token;
+    }
+    state.bump_config_revision().await;
+    state.persist_config().await;
+    Ok(Json(serde_json::json!({ "status": "rotated" })))
 }
 
 /// `POST /api/security/privileged-shell` - explicitly opt in/out of the

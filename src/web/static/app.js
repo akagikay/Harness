@@ -3448,8 +3448,24 @@ function openSettingsModal(tabName = 'memory') {
     switchSettingsTab(tabName);
 }
 
+/// Every settings page, discovered from the DOM rather than a hardcoded list.
+///
+/// The list used to be literals in this function, so adding a settings page
+/// (Security) made the rail render a tab that silently fell back to `memory`
+/// on click: the button moved, nothing else did. Deriving the set from the
+/// markup keeps the two in step, and the unit test below asserts they match.
+function settingsTabNames() {
+    const names = [];
+    document.querySelectorAll('.settings-nav-item[data-settings-tab]').forEach(btn => {
+        const name = btn.getAttribute('data-settings-tab');
+        if (name && !names.includes(name)) names.push(name);
+    });
+    if (!names.includes('memory')) names.unshift('memory');
+    return names;
+}
+
 function switchSettingsTab(tabName = 'memory') {
-    const validTabs = ['memory', 'providers', 'orchestrator', 'servers', 'mcp', 'search', 'tools', 'skills'];
+    const validTabs = settingsTabNames();
     const tab = validTabs.includes(tabName) ? tabName : 'memory';
     activeSettingsTab = tab;
 
@@ -3493,6 +3509,8 @@ function switchSettingsTab(tabName = 'memory') {
         }
     } else if (tab === 'skills') {
         fetchSkills();
+    } else if (tab === 'security') {
+        syncPrivilegedShellUi(currentConfig && currentConfig.allow_privileged_shell === true);
     }
 }
 

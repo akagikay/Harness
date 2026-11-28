@@ -273,6 +273,43 @@ pub fn normalize_version(v: &str) -> String {
         .to_string()
 }
 
+/// True when `version` is a well-formed dotted version (plus optional
+/// `-prerelease` / `+build` metadata).
+///
+/// The pin is interpolated straight into a GitHub API path
+/// (`/releases/tags/v{pin}`), so an unvalidated value can re-shape the request -
+/// `/`, `?`, `#`, `..` and `%2f` are all meaningful to a URL parser. Newlines and
+/// control characters are rejected upstream, so this is an input-validation and
+/// API-abuse gap rather than a host pivot, but a pin is also *authoritative*:
+/// accepting arbitrary text there widens the surface for nothing.
+pub fn is_valid_version_pin(v: &str) -> bool {
+    let core = v
+        .trim()
+        .trim_start_matches('v')
+        .trim_start_matches('V');
+    if core.is_empty() {
+        return false;
+    }
+    // Split off optional pre-release / build metadata.
+    let (numeric, _meta) = match core.split_once('-') {
+        Some((a, b)) => (a, Some(b)),
+        None => (core, None),
+    };
+    let numeric = numeric.split('+').next().unwrap_or(numeric);
+    let mut parts = numeric.split('.');
+    let first = parts.next().unwrap_or("");
+    numeric
+        .split('.')
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        && !first.is_empty()
+        && _meta.map(|m| {
+            !m.is_empty()
+                && m.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        })
+        .unwrap_or(true)
+}
+
 /// Query the latest GitHub release and compare it with the running version.
 pub async fn check(repo: &str, current_version: &str) -> Result<UpdateInfo, String> {
     check_for_exe(repo, current_version, &current_exe_name()).await
@@ -307,7 +344,15 @@ pub async fn check_for_exe_pinned(
     pin: &str,
 ) -> Result<UpdateInfo, String> {
     let repo = if repo.trim().is_empty() { DEFAULT_REPO } else { repo.trim() };
-    let pin = normalize_version(pin);
+    let raw_pin = pin.trim().to_string();
+    // Fail closed on a malformed pin rather than interpolating it into a URL:
+    // `/`, `?`, `#`, `..` and `%2f` would let a caller re-shape the request path.
+    if !raw_pin.is_empty() && !is_valid_version_pin(&raw_pin) {
+        return Err(format!(
+            "Invalid update pin '{raw_pin}': expected a dotted version such as 1.2.3 (optionally v-prefixed)."
+        ));
+    }
+    let pin = normalize_version(&raw_pin);
     let pinned = !pin.is_empty();
     // Tags in the wild are split between `1.2.3` and `v1.2.3`; try the
     // canonical `v` form first, then the bare one.

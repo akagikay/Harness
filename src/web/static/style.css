@@ -4402,24 +4402,11 @@ select.form-input {
         height: 90vh;
         max-height: none;
     }
-    .settings-hub-body {
-        flex-direction: column;
-    }
-    .settings-nav-rail {
-        width: 100%;
-        flex-direction: row;
-        overflow-x: auto;
-        border-right: none;
-        border-bottom: 1px solid var(--border-subtle);
-        padding: 8px;
-        gap: 6px;
-        flex-shrink: 0;
-    }
-    .settings-nav-item {
-        width: auto;
-        white-space: nowrap;
-        padding: 6px 10px;
-    }
+    /* NOTE: the settings hub's own responsive overrides live right after the
+       base `.settings-*` rules at the end of this file. They used to sit here,
+       where the equally-specific base rules further down overrode them, so a
+       narrow viewport stacked the rail as a 396px column above a 57px page pane
+       and the whole Settings hub became a letterbox. */
     .runtime-telemetry-strip,
     .settings-toggles-row {
         grid-template-columns: 1fr;
@@ -5199,6 +5186,37 @@ select.form-input {
     padding: 18px 22px;
     display: flex;
     flex-direction: column;
+}
+
+/* Narrow viewports stack the rail above the pages. These MUST come after the
+   base `.settings-*` rules above: with equal specificity the later rule wins, so
+   placing them earlier (they used to live in a `max-width: 64em` block far above)
+   left the base `flex-direction: column` on the rail intact and the hub rendered
+   as a 396px rail above a 57px pane. */
+@media (max-width: 64em) {
+    .settings-hub-body {
+        flex-direction: column;
+    }
+    .settings-nav-rail {
+        width: 100%;
+        flex-direction: row;
+        overflow-x: auto;
+        border-right: none;
+        border-bottom: 1px solid var(--border-subtle);
+        padding: 8px;
+        gap: 6px;
+        flex-shrink: 0;
+    }
+    .settings-nav-item {
+        width: auto;
+        white-space: nowrap;
+        padding: 6px 10px;
+    }
+    /* The pane must keep a usable viewport even though the rail now eats the
+       height: without this it collapsed to the leftover 57px. */
+    .settings-pages-pane {
+        min-height: min(60vh, 420px);
+    }
 }
 
 .settings-page {

@@ -1480,6 +1480,93 @@ fn make_tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
     }
 }
 
+/// A checkpoint taken between an assistant `tool_calls` push and its `tool`
+/// replies must not persist a dangling pair. The v1.1.5 checkpoint used to fire
+/// exactly there, so a turn that died one round later persisted
+/// `[.., assistant(tool_calls=[call_x])]` with no reply: strict providers answer
+/// the next request with `HTTP 400 messages with role 'tool' must be a response
+/// to a preceding message with 'tool_calls'`, and the bad pair was written back
+/// to the DB, wedging the session permanently.
+#[test]
+fn test_checkpoint_sanitizer_drops_unpaired_tool_calls_and_replies() {
+    use deepseek_harness_rs::engine::loop_runner::sanitize_checkpoint_messages;
+
+    let dangling = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::user("do a thing"),
+        ChatMessage::assistant(
+            Some("calling a tool".to_string()),
+            None,
+            Some(vec![make_tool_call("call_x", "sys_info", "{}")]),
+        ),
+    ];
+    let clean = sanitize_checkpoint_messages(&dangling);
+    assert_eq!(
+        clean.len(),
+        2,
+        "the unanswered tool_calls message must be dropped: {clean:?}"
+    );
+    assert!(clean
+        .iter()
+        .all(|m| m.tool_calls.as_ref().map(|c| c.is_empty()).unwrap_or(true)));
+
+    // A fully answered pair is preserved verbatim.
+    let answered = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::user("do a thing"),
+        ChatMessage::assistant(
+            Some("calling a tool".to_string()),
+            None,
+            Some(vec![make_tool_call("call_x", "sys_info", "{}")]),
+        ),
+        ChatMessage::tool("call_x", "System Information: ..."),
+    ];
+    assert_eq!(sanitize_checkpoint_messages(&answered).len(), 4);
+
+    // A partially answered batch keeps the answered call and its result, and drops
+    // only the dangling one.
+    let partial = vec![
+        ChatMessage::user("two tools"),
+        ChatMessage::assistant(
+            None,
+            None,
+            Some(vec![
+                make_tool_call("call_a", "sys_info", "{}"),
+                make_tool_call("call_b", "sys_info", "{}"),
+            ]),
+        ),
+        ChatMessage::tool("call_a", "ok"),
+    ];
+    let kept = sanitize_checkpoint_messages(&partial);
+    assert_eq!(kept.len(), 3, "user + trimmed assistant + its tool reply");
+    let assistant_calls = kept[1].tool_calls.as_ref().unwrap();
+    assert_eq!(
+        assistant_calls.len(),
+        1,
+        "only the answered call may survive: {assistant_calls:?}"
+    );
+    assert_eq!(assistant_calls[0].id, "call_a");
+
+    // A tool reply with no preceding request is dropped too.
+    let orphan = vec![
+        ChatMessage::user("hi"),
+        ChatMessage::tool("call_nobody", "orphan result"),
+    ];
+    assert_eq!(
+        sanitize_checkpoint_messages(&orphan).len(),
+        1,
+        "an orphan tool reply must be dropped"
+    );
+
+    // Plain prose is untouched.
+    let prose = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::user("hi"),
+        ChatMessage::assistant(Some("hello".to_string()), None, None),
+    ];
+    assert_eq!(sanitize_checkpoint_messages(&prose).len(), 3);
+}
+
 #[test]
 fn test_memory_config_defaults_and_pair_safe_compaction() {
     let defaults = MemoryConfig::default();
@@ -7592,7 +7679,8 @@ async fn test_auth_token_rotation_takes_effect_immediately() {
     // Before: the leaked token works.
     assert_eq!(authed("leaked-token").send().await.unwrap().status(), 200);
 
-    // Rotate through the API itself.
+    // Rotate through the dedicated endpoint (the whole-config snapshot must NOT be
+    // able to install or blank a token - see `merge_config_update`).
     let snapshot: Value = authed("leaked-token")
         .send()
         .await
@@ -7601,7 +7689,7 @@ async fn test_auth_token_rotation_takes_effect_immediately() {
         .await
         .unwrap();
     let mut rotated = snapshot.clone();
-    rotated["auth_token"] = json!("fresh-token");
+    rotated["auth_token"] = json!("attacker-token");
     let resp = client
         .post(format!("{base}/api/config"))
         .header("Authorization", "Bearer leaked-token")
@@ -7610,6 +7698,33 @@ async fn test_auth_token_rotation_takes_effect_immediately() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+    assert_eq!(
+        authed("attacker-token").send().await.unwrap().status(),
+        401,
+        "a token planted through a whole-config snapshot must be rejected"
+    );
+    let resp = client
+        .post(format!("{base}/api/security/token"))
+        .header("Authorization", "Bearer leaked-token")
+        .json(&json!({ "token": "fresh-token" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+    // An empty token is refused rather than silently disabling auth.
+    let empty = client
+        .post(format!("{base}/api/security/token"))
+        .header("Authorization", "Bearer fresh-token")
+        .json(&json!({ "token": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), 400, "an empty token must not disable auth");
+    assert_eq!(
+        authed("fresh-token").send().await.unwrap().status(),
+        200,
+        "a refused empty rotation must leave the working token in place"
+    );
 
     // Immediately after: the old token is DEAD and the new one is required.
     assert_eq!(
@@ -7760,6 +7875,349 @@ async fn test_updater_refuses_a_release_without_checksums() {
 
     srv.abort();
     let _ = std::fs::remove_dir_all(&dest);
+}
+
+// ============================================================================
+// Round 8 security regressions (red-team findings, verified live before fixing)
+// ============================================================================
+
+/// H1: a client-dispatched remote run used to inherit the CLIENT's permission
+/// policy, so a token holder could send `permissions.mode: yolo` and have every
+/// tool - `bash` included, when the operator enabled the privileged shell -
+/// auto-approved on the execution server with no prompt, while the server
+/// operator's own policy was discarded.
+#[tokio::test]
+async fn test_remote_dispatch_cannot_widen_the_servers_permission_policy() {
+    use deepseek_harness_rs::web::build_server_router;
+
+    let temp_dir = std::env::temp_dir().join(format!("harness-r8-perm-{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+    // The server operator runs Safe mode: every shell/network tool needs a prompt.
+    let mut srv_cfg = HarnessConfig::default();
+    srv_cfg.sandbox_root = temp_dir.clone();
+    srv_cfg.server_identity = "srv-perm".into();
+    srv_cfg.permissions.mode = deepseek_harness_rs::config::PermissionMode::Safe;
+    srv_cfg.remote_root_allowlist = vec![temp_dir.clone()];
+
+    // The client's payload carries YOLO, and asks for a root the server allows.
+    let mut client_cfg = HarnessConfig::default();
+    client_cfg.sandbox_root = temp_dir.clone();
+    client_cfg.extra_access_roots = vec![temp_dir.clone()];
+    client_cfg.projects = Vec::new();
+    client_cfg.permissions.mode = deepseek_harness_rs::config::PermissionMode::Yolo;
+
+    let srv_state = AppState::new(srv_cfg);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv = tokio::spawn(async move {
+        axum::serve(listener, build_server_router(srv_state)).await.unwrap();
+    });
+
+    let body = json!({
+        "run_id": format!("run_r8perm_{}", std::process::id()),
+        "session_id": "ses-r8-perm",
+        "task": "noop",
+        "prior_messages": [],
+        "attachments": [],
+        "config": client_cfg,
+        "read_only": false,
+        "use_mock": true
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/server/runs"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+
+    // The server's own permission policy is untouched by the dispatch, and the
+    // mode it reports is its own Safe mode - not the client's yolo.
+    let info: Value = reqwest::Client::new()
+        .get(format!("http://{addr}/api/server/info"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let srv_permissions = &info["permission_mode"];
+    assert_eq!(
+        srv_permissions.as_str().unwrap_or_default(),
+        "safe",
+        "a yolo payload must not rewrite the server's permission policy"
+    );
+
+    srv.abort();
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// H2: `run_id` is client-chosen and the insert used to overwrite
+/// unconditionally, destroying the victim's handle (result, messages and its
+/// cancellation token). A collision is now a 409.
+#[tokio::test]
+async fn test_a_duplicate_remote_run_id_is_rejected() {
+    use deepseek_harness_rs::web::build_server_router;
+
+    let temp_dir = std::env::temp_dir().join(format!("harness-r8-dup-{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+    let mut cfg = HarnessConfig::default();
+    cfg.sandbox_root = temp_dir.clone();
+    cfg.server_identity = "srv-dup".into();
+    cfg.mock_mode = true;
+    cfg.remote_root_allowlist = vec![temp_dir.clone()];
+    let state = AppState::new(cfg);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv = tokio::spawn(async move {
+        axum::serve(listener, build_server_router(state)).await.unwrap();
+    });
+
+    let run_id = format!("run_dup_{}", std::process::id());
+    let mut client_cfg = HarnessConfig::default();
+    client_cfg.sandbox_root = temp_dir.clone();
+    client_cfg.extra_access_roots = vec![temp_dir.clone()];
+    client_cfg.projects = Vec::new();
+    let body = json!({
+        "run_id": run_id,
+        "session_id": "ses-dup",
+        "task": "first run",
+        "prior_messages": [],
+        "attachments": [],
+        "config": client_cfg,
+        "read_only": false,
+        "use_mock": true
+    });
+    let client = reqwest::Client::new();
+    let first = client
+        .post(format!("http://{addr}/api/server/runs"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200, "{:?}", first.text().await);
+
+    // The second, colliding dispatch must be refused rather than overwriting the
+    // live handle.
+    let second = client
+        .post(format!("http://{addr}/api/server/runs"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        409,
+        "a duplicate run_id must not silently destroy the live run"
+    );
+    assert!(second.text().await.unwrap().contains("already in use"));
+
+    srv.abort();
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// M2/M1: a whole-config snapshot must not be able to rewrite the permission
+/// policy, blank the auth token, or plant an update pin - each is a security or
+/// availability boundary, not a preference.
+#[tokio::test]
+async fn test_a_stale_config_snapshot_cannot_widen_permissions_or_pin_updates() {
+    let temp_dir = std::env::temp_dir().join(format!("harness-r8-cfg-{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+    let mut cfg = HarnessConfig::default();
+    cfg.sandbox_root = temp_dir.clone();
+    cfg.auth_token = String::new();
+    cfg.permissions.mode = deepseek_harness_rs::config::PermissionMode::Safe;
+    let state = AppState::new(cfg);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    let live: Value = client
+        .get(format!("{base}/api/config"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let mut hostile = live.clone();
+    hostile["permissions"]["mode"] = json!("yolo");
+    hostile["update_pin_version"] = json!("1.1.3");
+    hostile["allow_privileged_shell"] = json!(true);
+    hostile["remote_root_allowlist"] = json!(["C:\\"]);
+    hostile["auth_token"] = json!("attacker-token");
+    let resp = client
+        .post(format!("{base}/api/config"))
+        .json(&hostile)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+
+    let after: Value = client
+        .get(format!("{base}/api/config"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        after["permissions"]["mode"], "safe",
+        "a snapshot must not turn the whole harness into auto-approve"
+    );
+    assert_eq!(
+        after["update_pin_version"], "",
+        "a snapshot must not be able to force a downgrade or suppress updates"
+    );
+    assert_eq!(
+        after["allow_privileged_shell"], false,
+        "only the dedicated endpoint may enable the unjailed shell"
+    );
+    assert_eq!(
+        after["remote_root_allowlist"].as_array().unwrap().len(),
+        0,
+        "a snapshot must not widen what a remote client may reach"
+    );
+    assert_eq!(
+        after["auth_token"], "",
+        "a snapshot must not install or blank the bearer token"
+    );
+
+    // And the rotation endpoint is the one supported way to change it.
+    let rot = client
+        .post(format!("{base}/api/security/token"))
+        .json(&json!({ "token": "operator-chosen" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rot.status(), 200, "{:?}", rot.text().await);
+    assert_eq!(
+        client
+            .get(format!("{base}/api/security/status"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401,
+        "the rotated token must be required immediately"
+    );
+
+    srv.abort();
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// M6: a cross-origin state-changing request is refused outright. The loopback
+/// `Host` guard does not catch this (a rebound request sends a correct `Host`),
+/// and the protection used to be an accident of the `Json` extractor forcing a
+/// preflight that no `CorsLayer` answers.
+#[tokio::test]
+async fn test_a_cross_origin_state_changing_request_is_rejected() {
+    let temp_dir = std::env::temp_dir().join(format!("harness-r8-origin-{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+    let mut cfg = HarnessConfig::default();
+    cfg.sandbox_root = temp_dir.clone();
+    cfg.host = "127.0.0.1".to_string();
+    cfg.auth_token = String::new();
+    let state = AppState::new(cfg);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // A page on evil.com tries to enable the unjailed shell. The Host it sends is
+    // the correct loopback one, so only the Origin check can stop this.
+    let resp = client
+        .post(format!("{base}/api/security/privileged-shell"))
+        .header("Origin", "https://evil.example")
+        .header("Host", format!("{addr}"))
+        .json(&json!({ "enabled": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "a cross-origin POST must be refused");
+
+    // The same request with a same-origin Origin is allowed.
+    let ok = client
+        .post(format!("{base}/api/security/privileged-shell"))
+        .header("Origin", format!("http://{addr}"))
+        .header("Host", format!("{addr}"))
+        .json(&json!({ "enabled": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200, "a same-origin POST must still work");
+
+    srv.abort();
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// M3: an SSE stream whose run handle has disappeared must END. Before the fix
+/// the `Closed` branch found no terminal status, fell through, and the stream
+/// looped forever at ~4 Hz holding the `server_runs` read lock.
+#[tokio::test]
+async fn test_a_stream_for_a_removed_run_terminates() {
+    use deepseek_harness_rs::web::handlers::async_stream_unfold_run;
+    use futures_util::StreamExt;
+
+    let temp_dir = std::env::temp_dir().join(format!("harness-r8-sse-{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+    let mut cfg = HarnessConfig::default();
+    cfg.sandbox_root = temp_dir.clone();
+    let state = AppState::new(cfg);
+    let run_id = "run_missing_entirely".to_string();
+    let (tx, rx) = tokio::sync::broadcast::channel(4);
+    drop(tx); // no sender: every recv() is Closed
+
+    let mut stream = std::pin::pin!(async_stream_unfold_run(state, run_id, rx, Vec::new(), None));
+    let finished = tokio::time::timeout(Duration::from_secs(3), async {
+        while futures_util::StreamExt::next(&mut stream).await.is_some() {}
+    })
+    .await;
+    assert!(
+        finished.is_ok(),
+        "a stream whose run no longer exists must end, not spin forever"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// M1: an invalid update pin must fail closed rather than being interpolated
+/// into a GitHub API path (`/`, `?`, `#`, `..`, `%2f` are all meaningful there).
+#[tokio::test]
+async fn test_an_invalid_update_pin_is_refused() {
+    use deepseek_harness_rs::updater::is_valid_version_pin;
+    for good in ["1.1.5", "v1.1.5", "1.1.5-beta.1", "2.0.0+build.7", "1.2"] {
+        assert!(is_valid_version_pin(good), "'{good}' is a valid pin");
+    }
+    for bad in [
+        "",
+        "1.1.3?x=1",
+        "1.1.3/../../..",
+        "../..",
+        "1.1.3#frag",
+        "v",
+        "..",
+        "%2f",
+        "1.1.3 extra",
+        "latest",
+        "1..2",
+    ] {
+        assert!(!is_valid_version_pin(bad), "'{bad}' must be refused as a pin");
+    }
 }
 
 

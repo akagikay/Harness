@@ -203,6 +203,62 @@ async fn execute_tool_with_retries(
     }
 }
 
+/// Strip an in-flight conversation down to a form every provider accepts.
+///
+/// The rules, applied to a snapshot taken mid-turn:
+/// * an `assistant` message keeps only the `tool_calls` that already have a `tool`
+///   reply, and is dropped entirely when none of them do (a dangling pair is a
+///   syntax error to a strict provider), and
+/// * a `tool` reply with no preceding assistant `tool_calls` is dropped.
+///
+/// A partially executed batch therefore keeps its answered calls (with their
+/// results) instead of losing the whole message. Everything else - system, user,
+/// and fully-answered pairs - is preserved verbatim, including order.
+pub fn sanitize_checkpoint_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    // Ids that have a reply available.
+    let answered: std::collections::HashSet<&str> = messages
+        .iter()
+        .filter(|m| m.role == "tool")
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+    let requested: std::collections::HashSet<&str> = messages
+        .iter()
+        .filter(|m| m.role == "assistant")
+        .filter_map(|m| m.tool_calls.as_ref())
+        .flatten()
+        .map(|c| c.id.as_str())
+        .collect();
+    messages
+        .iter()
+        .filter_map(|m| match m.role.as_str() {
+            "assistant" => match &m.tool_calls {
+                Some(calls) if !calls.is_empty() => {
+                    let kept: Vec<crate::engine::context::ToolCall> = calls
+                        .iter()
+                        .filter(|c| answered.contains(c.id.as_str()))
+                        .cloned()
+                        .collect();
+                    if kept.is_empty() {
+                        // Nothing was executed: the whole message would dangle.
+                        None
+                    } else {
+                        let mut trimmed = m.clone();
+                        trimmed.tool_calls = Some(kept);
+                        Some(trimmed)
+                    }
+                }
+                _ => Some(m.clone()),
+            },
+            "tool" => m
+                .tool_call_id
+                .as_deref()
+                .is_some_and(|id| requested.contains(id))
+                .then(|| m.clone()),
+            _ => Some(m.clone()),
+        })
+        .collect()
+}
+
 pub struct AgentLoopRunner {
     pub session_id: String,
     pub task: String,
@@ -274,9 +330,20 @@ impl AgentLoopRunner {
     }
 
     /// Hand the current conversation out to the checkpoint sink, if any.
+    ///
+    /// The snapshot is sanitized first. The checkpoint fires after every model
+    /// round-trip, which includes the moment an assistant message carrying
+    /// `tool_calls` has been pushed but the matching `tool` replies have not been
+    /// appended yet. Persisting that intermediate state produced a DANGLING pair:
+    /// strict providers answer the next request with
+    /// `HTTP 400 messages with role 'tool' must be a response to a preceding
+    /// message with 'tool_calls'` - and because the bad pair was also written back
+    /// to the DB, the session stayed wedged forever. The very feature built to
+    /// survive a failed turn was wedging the session in the exact case it was
+    /// built for.
     fn checkpoint_context(&self, context: &ConversationContext) {
         if let Some(ref sink) = self.context_checkpoint {
-            sink(context.messages.clone());
+            sink(sanitize_checkpoint_messages(&context.messages));
         }
     }
 
@@ -719,6 +786,7 @@ impl AgentLoopRunner {
             // Stream turn from model (with 1 transient retry) or handle user stop cancellation
             let mut model_attempt = 0usize;
             let max_model_retries = 1usize;
+
             let turn_result = loop {
                 let stream_res = tokio::select! {
                     _ = self.cancel_notify.notified() => {
@@ -1524,6 +1592,13 @@ impl AgentLoopRunner {
 
             // Drain any mid-run user steering after all tool responses for this turn are recorded
             self.drain_steer_inbox(&mut context, &event_tx).await;
+
+
+            // Second checkpoint of the round: now that every tool result is in,
+            // the pair the previous checkpoint could not have is complete, so a
+            // turn that dies on the NEXT round still leaves a resumable history
+            // (the sanitizer is idempotent, so emitting twice is harmless).
+            self.checkpoint_context(&context);
         }
     }
 }

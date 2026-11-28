@@ -34,6 +34,19 @@ impl Default for PermissionMode {
     }
 }
 
+impl PermissionMode {
+    /// The stable snake_case name used by the API and the config file.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PermissionMode::Safe => "safe",
+            PermissionMode::Auto => "auto",
+            PermissionMode::Autonomous => "autonomous",
+            PermissionMode::Yolo => "yolo",
+            PermissionMode::ReadOnly => "read_only",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionsConfig {
     #[serde(default)]
