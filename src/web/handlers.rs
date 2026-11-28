@@ -1400,7 +1400,7 @@ mod handlers_config_merge_tests {
             id: "foo".into(),
             name: "Foo".into(),
             path: std::path::PathBuf::from("C:\\tmp\\foo"),
-            icon: "📁".into(),
+            icon: "ðŸ“".into(),
             created_at: "now".into(),
             is_active: true,
             defaults: Default::default(),
@@ -2447,7 +2447,7 @@ pub async fn list_remote_models(
     resolve_models(state, params.api_base, params.api_key).await
 }
 
-/// `POST /api/models/remote` — same as GET but accepts `{api_base, api_key}` in
+/// `POST /api/models/remote` â€” same as GET but accepts `{api_base, api_key}` in
 /// the body so credentials never appear in URLs, logs, or browser history.
 pub async fn list_remote_models_post(
     State(state): State<AppState>,
@@ -2830,7 +2830,7 @@ pub async fn save_project(
         }
     };
 
-    let icon = payload.icon.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "≡ƒôü".to_string());
+    let icon = payload.icon.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "â‰¡Æ’Ã´Ã¼".to_string());
     let set_active = payload.set_active.unwrap_or(true);
 
     // Resolve and validate additional folders (created if missing).
@@ -4486,7 +4486,7 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
     favorites.push(FavoritePath {
         name: "Workspace".to_string(),
         path: cwd_norm,
-        icon: "🚀".to_string(),
+        icon: "ðŸš€".to_string(),
     });
 
     let projects_dir = cwd.join("projects");
@@ -4494,7 +4494,7 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
         favorites.push(FavoritePath {
             name: "Projects".to_string(),
             path: normalize_display_path(&projects_dir),
-            icon: "🏠".to_string(),
+            icon: "ðŸ ".to_string(),
         });
     }
 
@@ -4504,7 +4504,7 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
             favorites.push(FavoritePath {
                 name: "Home".to_string(),
                 path: normalize_display_path(&home_p),
-                icon: "📥".to_string(),
+                icon: "ðŸ“¥".to_string(),
             });
         }
 
@@ -4513,7 +4513,7 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
             favorites.push(FavoritePath {
                 name: "Downloads".to_string(),
                 path: normalize_display_path(&downloads),
-                icon: "🖥".to_string(),
+                icon: "ðŸ–¥".to_string(),
             });
         }
 
@@ -4522,7 +4522,7 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
             favorites.push(FavoritePath {
                 name: "Desktop".to_string(),
                 path: normalize_display_path(&desktop),
-                icon: "🖥️".to_string(),
+                icon: "ðŸ–¥ï¸".to_string(),
             });
         }
 
@@ -4531,7 +4531,7 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
             favorites.push(FavoritePath {
                 name: "Documents".to_string(),
                 path: normalize_display_path(&docs),
-                icon: "📄".to_string(),
+                icon: "ðŸ“„".to_string(),
             });
         }
     }
@@ -4667,7 +4667,7 @@ pub async fn browse_filesystem(
         if let Some(fb) = resolved_fallback {
             if !requested_raw.is_empty() {
                 notice = Some(format!(
-                    "'{}' does not exist yet — showing '{}'.",
+                    "'{}' does not exist yet â€” showing '{}'.",
                     requested_raw,
                     normalize_display_path(&fb)
                 ));
@@ -5692,7 +5692,7 @@ pub async fn delete_skill(
 }
 
 
-/// `POST /api/db/optimize` — checkpoint WAL, ANALYZE, PRAGMA optimize, VACUUM.
+/// `POST /api/db/optimize` â€” checkpoint WAL, ANALYZE, PRAGMA optimize, VACUUM.
 pub async fn db_optimize(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -5800,6 +5800,18 @@ pub async fn apply_update(
     })))
 }
 
+/// `GET /api/permissions` - the outstanding permission prompts.
+///
+/// The approval path is the most safety-critical flow in the product and had no
+/// way to be observed: the prompts live in memory, unknown ids 404, and nothing
+/// enumerated the live ones. Without this, an operator (or an automated e2e run)
+/// cannot tell whether an agent is blocked waiting for a human, which is exactly
+/// what a harness must never hide.
+pub async fn list_pending_permissions(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let pending = state.pending_permission_snapshots().await;
+    Json(serde_json::json!({ "pending": pending }))
+}
+
 /// `GET /api/security/status` - non-sensitive summary of the security posture.
 pub async fn security_status(State(state): State<AppState>) -> Json<serde_json::Value> {
     let conf = state.config.read().await;
@@ -5811,6 +5823,14 @@ pub async fn security_status(State(state): State<AppState>) -> Json<serde_json::
         "secrets_encrypted": state.db.is_some(),
         "cors": "same-origin",
         "version": env!("CARGO_PKG_VERSION"),
+        // The three operator-owned security surfaces were invisible here, so an
+        // operator had to read the raw config to learn the posture - and on a
+        // headless execution server there is no UI at all. Report all of them.
+        "permission_mode": conf.permissions.mode.as_str(),
+        "privileged_shell": conf.allow_privileged_shell,
+        "update_pin_version": conf.update_pin_version.clone(),
+        "remote_root_allowlist": conf.remote_root_allowlist.clone(),
+        "max_active_subagents": conf.max_active_subagents,
     }))
 }
 
@@ -5851,14 +5871,17 @@ pub async fn update_permissions(
         match value.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             None => Ok(None),
             Some(raw) => match raw.to_ascii_lowercase().as_str() {
-                "safe" => Ok(Some(crate::config::PermissionMode::Safe)),
+                // `ask` is the word the product's own top-bar pill uses
+                // ("Safe (Ask)"). The API that configures that pill must accept
+                // the vocabulary the UI speaks, not just the serde variant names.
+                "safe" | "ask" => Ok(Some(crate::config::PermissionMode::Safe)),
                 "auto" => Ok(Some(crate::config::PermissionMode::Auto)),
                 "autonomous" => Ok(Some(crate::config::PermissionMode::Autonomous)),
                 "yolo" => Ok(Some(crate::config::PermissionMode::Yolo)),
                 "read_only" | "readonly" => Ok(Some(crate::config::PermissionMode::ReadOnly)),
                 other => Err((
                     StatusCode::BAD_REQUEST,
-                    format!("Unknown permission mode '{other}': expected safe, auto, autonomous, yolo or read_only."),
+                    format!("Unknown permission mode '{other}': expected safe, ask, auto, autonomous, yolo or read_only."),
                 )),
             },
         }
@@ -6321,7 +6344,7 @@ pub struct CompleteOnboardingRequest {
     pub skipped: bool,
 }
 
-/// `POST /api/onboarding/complete` — mark the wizard as done.
+/// `POST /api/onboarding/complete` â€” mark the wizard as done.
 pub async fn complete_onboarding(
     State(state): State<AppState>,
     Json(payload): Json<CompleteOnboardingRequest>,
@@ -6374,7 +6397,7 @@ fn is_protected_fs_root(path: &std::path::Path) -> bool {
     false
 }
 
-/// `POST /api/filesystem/rename` — rename a file or folder in place.
+/// `POST /api/filesystem/rename` â€” rename a file or folder in place.
 pub async fn rename_path(
     State(state): State<AppState>,
     Json(payload): Json<FsRenameRequest>,
@@ -6422,7 +6445,7 @@ pub async fn rename_path(
     })))
 }
 
-/// `POST /api/filesystem/delete` — delete a file, or a folder recursively.
+/// `POST /api/filesystem/delete` â€” delete a file, or a folder recursively.
 pub async fn delete_path(
     State(state): State<AppState>,
     Json(payload): Json<FsPathRequest>,

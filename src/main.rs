@@ -179,6 +179,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // The default project is seeded beside the executable before the flags are
+    // applied; with an explicit `--sandbox` it must live INSIDE that workspace,
+    // otherwise the sandbox stays empty and everything the agent writes lands in
+    // the build-output tree.
+    config.relocate_default_project_into_sandbox();
+
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     let is_server_only = mode.eq_ignore_ascii_case("server");
 

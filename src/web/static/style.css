@@ -3918,6 +3918,29 @@ body.sidebar-is-collapsed .sidebar-expand-btn {
     background: rgba(255, 255, 255, 0.07);
 }
 
+/* The model pill says what is actually configured. "No model set" must not look
+   like a working default - the discoverable difference between "sandboxed" and
+   "trust me". */
+#label-active-model.unconfigured,
+.label-active-model.unconfigured {
+    color: var(--text-dim);
+    font-style: italic;
+}
+
+/* A composer that cannot send anything must not look enabled. */
+.composer-readiness-hint {
+    padding: 4px 12px 6px;
+    font-size: 0.72rem;
+    color: var(--text-dim);
+}
+.starter-chip.disabled {
+    opacity: 0.45;
+    pointer-events: none;
+}
+button:disabled {
+    cursor: not-allowed;
+}
+
 /* The "not sandboxed" notice under the privileged-shell switch. It must read as a
    warning, not as another settings row, because this toggle is a security boundary. */
 .settings-warning-card {

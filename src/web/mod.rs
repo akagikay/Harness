@@ -58,6 +58,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/update/apply", post(handlers::apply_update))
         .route("/api/security/status", get(handlers::security_status))
         .route("/api/security/token", post(handlers::rotate_auth_token))
+        .route("/api/permissions", get(handlers::list_pending_permissions))
         .route("/api/security/permissions", post(handlers::update_permissions))
         .route("/api/security/update-pin", post(handlers::update_pin))
         .route(

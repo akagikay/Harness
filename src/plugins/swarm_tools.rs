@@ -1334,10 +1334,16 @@ impl ToolPlugin for InvokeSubagentPlugin {
         // spawn 8 workers, each spawning 8 more, and nothing looked at the global
         // count. A coordinator that fans out further than this would reach 584
         // concurrent loops on one machine, so refuse rather than OOM.
+        //
+        // The test is `active >= cap`, NOT `active + batch > cap`: a cap of 1 must
+        // still allow the first subagent (that is what the cap of 1 MEANS), and the
+        // additive form refused it with "1 active, limit 1" on a fresh process -
+        // the round-9 QA pass reproduced that 4x, and the operator has to raise the
+        // cap to 2 to get one working subagent.
         if let Some(ref st) = ctx.state {
             let active = st.total_active_subagents().await;
             let cap = st.max_active_subagents().await;
-            if active.saturating_add(specs.len()) > cap {
+            if active >= cap {
                 return Err(format!(
                     "Too many subagents are already running ({active} active, limit {cap}). \
                      Wait for the current wave to finish (`swarm_board` action \"wait\") \

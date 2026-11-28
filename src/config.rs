@@ -718,15 +718,44 @@ fn default_max_active_subagents() -> usize {
     32
 }
 
-fn default_projects() -> Vec<Project> {
-    // The default project is a `Project` folder beside the harness executable, so a
-    // fresh install never points at whatever directory the binary was launched from.
+/// Where the pristine default project lives before any operator override:
+/// a `Project` folder beside the harness executable.
+pub fn default_project_path() -> PathBuf {
     let base = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
-    let project_dir = base.join("Project");
+    base.join("Project")
+}
+
+impl HarnessConfig {
+    /// Move the pristine default project inside `sandbox_root`.
+    ///
+    /// The default project is seeded beside the executable by `default_projects()`,
+    /// which runs before any CLI flag is applied - so on a release build it pointed
+    /// at `target/release/Project` while the `--sandbox` directory stayed empty and
+    /// every file the agent wrote landed in the build-output tree. Called from
+    /// `main.rs` once the flags are known, and again when a persisted config is
+    /// loaded, so both paths agree.
+    pub fn relocate_default_project_into_sandbox(&mut self) {
+        let seeded = default_project_path();
+        if let Some(proj) = self
+            .projects
+            .iter_mut()
+            .find(|p| p.id == "project" && p.path == seeded)
+        {
+            let moved = self.sandbox_root.join("Project");
+            let _ = std::fs::create_dir_all(&moved);
+            proj.path = moved;
+        }
+    }
+}
+
+fn default_projects() -> Vec<Project> {
+    // The default project is a `Project` folder beside the harness executable, so a
+    // fresh install never points at whatever directory the binary was launched from.
+    let project_dir = default_project_path();
     let _ = std::fs::create_dir_all(&project_dir);
     vec![
         Project {
@@ -1033,6 +1062,9 @@ impl HarnessConfig {
     pub fn apply_operator_overrides(&mut self, incoming: &HarnessConfig, defaults: &HarnessConfig) {
         if incoming.sandbox_root != defaults.sandbox_root {
             self.sandbox_root = incoming.sandbox_root.clone();
+            // The operator asked for a workspace: see
+            // `relocate_default_project_into_sandbox` for why this matters.
+            self.relocate_default_project_into_sandbox();
         }
         if incoming.model != defaults.model {
             self.model = incoming.model.clone();
@@ -1607,4 +1639,44 @@ mod subagent_effort_tests {
 
         assert_eq!(db_config.remote_root_allowlist, vec![PathBuf::from("/db/shared")]);
         assert_eq!(db_config.update_pin_version, "1.1.5");
+    }
+
+    /// P0-2 (round-9 e2e): `--sandbox` was not real. The default project was seeded
+    /// beside the executable (i.e. `target/release/Project` on a release build)
+    /// before the flag was applied, so the operator's sandbox stayed empty while
+    /// every file the agent wrote landed in the build-output tree.
+    #[test]
+    fn the_default_project_follows_the_operators_sandbox() {
+        let defaults = HarnessConfig::default();
+        let exe_project = crate::config::default_project_path();
+        let workspace = PathBuf::from("/tmp/harness-reloc-workspace");
+
+        let mut db_config = defaults.clone();
+        db_config.projects = vec![Project {
+            id: "project".to_string(),
+            name: "Project".to_string(),
+            path: exe_project.clone(),
+            icon: "x".to_string(),
+            created_at: "now".to_string(),
+            is_active: true,
+            defaults: Default::default(),
+            extra_paths: Vec::new(),
+        }];
+
+        let mut incoming = defaults.clone();
+        incoming.sandbox_root = workspace.clone();
+        incoming.projects = db_config.projects.clone();
+
+        db_config.apply_operator_overrides(&incoming, &defaults);
+
+        let moved = db_config
+            .projects
+            .iter()
+            .find(|p| p.id == "project")
+            .expect("the default project survives");
+        assert_eq!(
+            moved.path,
+            workspace.join("Project"),
+            "the default project must live inside the workspace the operator named"
+        );
     }

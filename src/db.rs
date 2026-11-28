@@ -70,12 +70,82 @@ fn quarantine_corrupt_db(path: &Path) -> Option<std::path::PathBuf> {
     Some(quarantined)
 }
 
+/// Decide whether a database file is obviously unusable BEFORE opening it.
+///
+/// Returns `Some(reason)` when the file cannot possibly be a database, so the
+/// caller can quarantine it without ever touching it. Two cases the round-9 QA
+/// pass found:
+/// * a **0-byte file** - indistinguishable from "no DB yet", so the harness came
+///   up with an empty workspace and no signal at all, and
+/// * a **missing main file whose `-wal`/`-shm` siblings exist** - a truncated
+///   deployment.
+///
+/// Why this must happen before `open_at`: opening in WAL mode makes SQLite
+/// checkpoint the `-wal` back into the main file and DELETE the sidecars. On the
+/// corruption path that erased the only place uncommitted session rows lived, so
+/// quarantining afterwards preserved just the 4 KB main file. Checking first
+/// leaves the whole set intact. (A file with a valid header and corrupt pages
+/// still cannot be detected up front; that path keeps the bounded behaviour.)
+fn preflight_db_file(path: &Path) -> Option<String> {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        // A missing main file with live sidecars is a truncated deployment.
+        Err(_) => {
+            let orphans = ["-wal", "-shm"].iter().any(|s| {
+                std::path::PathBuf::from(format!("{}{s}", path.display())).exists()
+            });
+            return orphans.then(|| "database file is missing but its -wal/-shm siblings exist".to_string());
+        }
+    };
+    if meta.len() == 0 {
+        return Some("database file is empty (0 bytes)".to_string());
+    }
+    let mut header = [0u8; 16];
+    match std::fs::File::open(path).and_then(|mut f| {
+        use std::io::Read;
+        f.read_exact(&mut header)
+    }) {
+        Ok(()) => {
+            if &header[..15] != b"SQLite format 3" {
+                Some(format!(
+                    "database header is not the SQLite magic ({:?})",
+                    String::from_utf8_lossy(&header)
+                ))
+            } else {
+                None
+            }
+        }
+        Err(e) => Some(format!("database file is unreadable: {e}")),
+    }
+}
+
 impl HarnessDb {
     pub fn open(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("Failed to create database directory: {}", e))?;
+            }
+        }
+        // Preflight BEFORE the first open: a 0-byte or non-SQLite file is quarantined
+        // without ever being opened, which is also what preserves its `-wal`/`-shm`
+        // siblings (opening in WAL mode checkpoints and deletes them).
+        if let Some(reason) = preflight_db_file(path) {
+            match quarantine_corrupt_db(path) {
+                Some(q) => {
+                    eprintln!(
+                        "[harness-db] database {} was unusable ({reason}); moved it to {} and created a fresh one",
+                        path.display(),
+                        q.display()
+                    );
+                }
+                None => {
+                    return Err(format!(
+                        "Database {} is unusable ({reason}) and could not be moved aside. \
+                         Close any other harness instance and rename/delete the file manually.",
+                        path.display()
+                    ));
+                }
             }
         }
         match Self::open_at(path) {
@@ -1270,6 +1340,78 @@ mod encryption_tests {
         let db = HarnessDb::open(&db_path).unwrap();
         let err = db.load_config().expect_err("tampered ciphertext must not decrypt");
         assert!(err.contains("decrypt"), "unexpected: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+}
+    /// P2-3 (round-9 QA): a 0-byte database file was indistinguishable from "no DB
+    /// yet" - the harness came up on an empty workspace with no `.corrupt-*`
+    /// artifact and no operator signal. A truncated deployment must look like one.
+    #[test]
+    fn a_zero_byte_database_is_quarantined() {
+        let (dir, db_path) = temp_db("zerobyte");
+        std::fs::write(&db_path, b"").unwrap();
+
+        let db = HarnessDb::open(&db_path).expect("a 0-byte DB must be recovered by recreating it");
+        assert!(db.load_config().unwrap().is_none(), "the fresh DB has no saved config");
+
+        let quarantined: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains(".corrupt-"))
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1, "the empty file must be quarantined: {quarantined:?}");
+        assert!(db_path.exists(), "a fresh DB must exist at the original path");
+        assert_ne!(std::fs::read(&db_path).unwrap(), Vec::<u8>::new());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A non-SQLite header is caught by the preflight, so its `-wal`/`-shm`
+    /// siblings are preserved for a later recovery instead of being deleted by the
+    /// first open.
+    #[test]
+    fn a_bad_header_database_is_quarantined_with_its_sidecars() {
+        let (dir, db_path) = temp_db("badheader-sidecars");
+        std::fs::write(&db_path, b"NOTASQLITEDBATALL..").unwrap();
+        std::fs::write(format!("{}-wal", db_path.display()), b"wal-bytes").unwrap();
+        std::fs::write(format!("{}-shm", db_path.display()), b"shm-bytes").unwrap();
+
+        let _db = HarnessDb::open(&db_path).expect("a bad header must be recovered by recreating it");
+
+        let quarantined: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains(".corrupt-"))
+            })
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            3,
+            "the main file and both sidecars must be quarantined together: {quarantined:?}"
+        );
+        let stem = quarantined
+            .iter()
+            .find(|p| {
+                let s = p.to_string_lossy().to_string();
+                !s.ends_with("-wal") && !s.ends_with("-shm")
+            })
+            .expect("the quarantined main file")
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            std::path::Path::new(&format!("{stem}-wal")).exists(),
+            "the WAL must be quarantined WITH the main file, not deleted by the first open"
+        );
+        assert!(std::path::Path::new(&format!("{stem}-shm")).exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

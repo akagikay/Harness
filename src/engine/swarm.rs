@@ -121,6 +121,18 @@ struct SwarmBoardInner {
 #[derive(Clone)]
 pub struct SwarmBoard {
     inner: Arc<SwarmBoardInner>,
+    /// Stable identity for this board, so callers deduping a set of boards (e.g.
+    /// `total_active_subagents`) compare by object rather than by name: a board
+    /// reachable from two sessions (a remote run keys its board by run id while
+    /// the client's session holds the same board) must not be counted twice.
+    identity: Arc<()>,
+}
+
+impl SwarmBoard {
+    /// An identity token: two clones of the same board share one `Arc`.
+    pub fn identity_token(&self) -> Arc<()> {
+        self.identity.clone()
+    }
 }
 
 pub type SwarmCoordinator = SwarmBoard;
@@ -160,6 +172,7 @@ impl SwarmBoard {
                 jobs: RwLock::new(Vec::new()),
                 specialists: RwLock::new(Vec::new()),
             }),
+            identity: Arc::new(()),
         }
     }
 

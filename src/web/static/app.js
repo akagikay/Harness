@@ -1511,6 +1511,10 @@ document.addEventListener('DOMContentLoaded', () => {
     // Starter Prompt Chips
     document.querySelectorAll('.starter-chip').forEach(chip => {
         chip.addEventListener('click', () => {
+            if (!isComposerReady()) {
+                showToast('Configure a provider in Settings before sending prompts.', 'info', 6000);
+                return;
+            }
             const prompt = chip.getAttribute('data-prompt');
             taskInput.value = prompt;
             autoResizeTextarea();
@@ -2387,7 +2391,13 @@ function setSendMode(mode, persist = false) {
 function updateSubmitButtonState() {
     if (!btnSubmit) return;
     btnSubmit.classList.remove('hidden');
-    btnSubmit.disabled = false;
+    updateComposerReadiness();
+    // Readiness wins: a composer that cannot send must say why, whatever mode the
+    // running session is in.
+    if (!isComposerReady()) {
+        btnSubmit.title = 'Configure a provider (Settings → AI Providers) before sending prompts.';
+        return;
+    }
     if (isMainSessionRunning) {
         btnSubmit.title = activeSendMode === 'steer'
             ? 'Steer running agent (Enter)'
@@ -4947,6 +4957,12 @@ async function submitPromptText(rawTask, clearInput = false) {
     }
 
     if (isSubmittingPrompt) return;
+    // No model, no key: every turn would die at the model call. Say so here
+    // instead of implying the agent is ready and failing after a round-trip.
+    if (!isComposerReady()) {
+        showToast('Configure a provider in Settings before sending prompts.', 'info', 6000);
+        return;
+    }
     isSubmittingPrompt = true;
 
     try {
@@ -6207,7 +6223,7 @@ function connectEventStream(sessionId) {
             return;
         }
 
-        btnSubmit.disabled = false;
+        updateComposerReadiness();
         setSessionRunning(false);
         finalizeOrphanedStreamStates();
     };
@@ -6420,7 +6436,7 @@ function handleHarnessEvent(event, isReplay = false) {
             // 404'd against an already-finished session.
             clearAllPendingPermissions();
             if (!isReplay) {
-                btnSubmit.disabled = false;
+                updateComposerReadiness();
                 setSessionRunning(false);
             }
             break;
@@ -7517,7 +7533,7 @@ function finishSession(finalAnswer, steps, durationSecs, isReplay = false) {
     streamContainer.appendChild(footerBar);
 
     if (!isReplay) {
-        btnSubmit.disabled = false;
+        updateComposerReadiness();
         if (swarmCoordinator) swarmCoordinator.status = 'completed';
         setSessionRunning(false);
         scheduleSwarmStateSync();
@@ -7985,11 +8001,17 @@ function updateModelPillDisplay() {
     if (!currentConfig) return;
     const orch = currentConfig.orchestrator || {};
     const orchOn = Boolean(orch.enabled);
-    const activeModel = orchOn && orch.model ? orch.model : (currentConfig.model || 'Nemotron-3-Nano');
-    const shortName = activeModel.split('/').pop();
+    // Saying "Nemotron-3-Nano" when nothing is configured is a lie the user only
+    // discovers after a failed round-trip. Show what is actually set, mark the pill
+    // unconfigured, and let the composer refuse the prompt up front.
+    const configured = Boolean(currentConfig.model && String(currentConfig.model).trim());
+    const activeModel = orchOn && orch.model ? orch.model : (currentConfig.model || '');
+    const shortName = activeModel ? activeModel.split('/').pop() : 'No model set';
     if (labelActiveModel) {
         labelActiveModel.textContent = orchOn ? `Orchestrator · ${shortName}` : shortName;
+        labelActiveModel.classList.toggle('unconfigured', !configured);
     }
+    updateComposerReadiness();
     const effort = orchOn ? (orch.thinking_effort || currentConfig.reasoning_effort || 'high') : (currentConfig.reasoning_effort || 'high');
     renderReasoningUiForModel(activeModel, effort);
     const maxCtx = getCachedOrInferredModelContextWindow(activeModel);
@@ -8003,6 +8025,47 @@ function updateModelPillDisplay() {
         btnModelDropdown.title = orchOn
             ? `Orchestrator: ${activeModel} (${effort}) · ${formatTokenCount(maxCtx)} ctx\nProvider: ${provLabel}\nSubagent: ${(orch.subagent_model || 'inherit')} on ${(orch.subagent_server_id || 'local')}`
             : `Model: ${activeModel} (${effort}) · ${formatTokenCount(maxCtx)} ctx\nProvider: ${provLabel}`;
+    }
+}
+
+/// True when a model is configured AND (mock mode, or a credential that is not a
+/// redaction placeholder). Without one of these, every turn dies at the model call,
+/// so the composer must say so instead of implying the agent is ready.
+function isComposerReady() {
+    if (!currentConfig) return false;
+    if (currentConfig.mock_mode === true) return true;
+    const hasModel = Boolean(String(currentConfig.model || '').trim());
+    const hasKey = Boolean(String(currentConfig.api_key || '').trim())
+        && currentConfig.api_key !== '__harness_redacted__';
+    const hasProviderKey = (currentConfig.custom_providers || []).some(p =>
+        p.enabled !== false && String(p.api_key || '').trim() && p.api_key !== '__harness_redacted__');
+    return hasModel && (hasKey || hasProviderKey);
+}
+
+/// Reflect readiness on the composer and the suggestion chips.
+function updateComposerReadiness() {
+    const ready = isComposerReady();
+    if (btnSubmit) {
+        btnSubmit.disabled = !ready;
+        btnSubmit.title = ready
+            ? 'Send (Enter)'
+            : 'Configure a provider (Settings → AI Providers) before sending prompts.';
+    }
+    document.querySelectorAll('[data-prompt]').forEach(chip => {
+        chip.classList.toggle('disabled', !ready);
+        chip.setAttribute('aria-disabled', ready ? 'false' : 'true');
+        chip.title = ready ? chip.title.replace(/^Configure a provider first\. ?/, '') : 'Configure a provider first.';
+    });
+    let hint = document.getElementById('composer-readiness-hint');
+    if (!ready && !hint) {
+        hint = document.createElement('div');
+        hint.id = 'composer-readiness-hint';
+        hint.className = 'composer-readiness-hint';
+        hint.textContent = 'No model configured — add a provider in Settings to start.';
+        const dock = document.querySelector('.prompt-dock-container') || document.body;
+        dock.appendChild(hint);
+    } else if (ready && hint) {
+        hint.remove();
     }
 }
 
@@ -8151,6 +8214,7 @@ async function selectModel(modelId, effortOverride = null, providerIdOverride = 
         await syncModelContextWindowIfAuto(modelId);
     }
     updateModelPillDisplay();
+    updateComposerReadiness();
     renderModelActiveCapsBar();
     renderComposerAttachments();
     checkModelCapabilities(modelId);
@@ -8302,6 +8366,7 @@ function renderFilteredModels(preserveScroll = true) {
                 currentConfig.orchestrator.enabled = !Boolean(currentConfig.orchestrator.enabled);
                 persistCurrentConfigInBackground();
                 updateModelPillDisplay();
+                updateComposerReadiness();
                 renderFilteredModels(true);
                 syncOrchestratorControls();
                 syncActiveConversationConfig();
@@ -8492,6 +8557,7 @@ async function fetchRemoteModels() {
         renderComposerAttachments();
         renderFilteredModels();
         updateModelPillDisplay();
+        updateComposerReadiness();
         if (currentConfig && currentConfig.model) {
             syncModelContextWindowIfAuto(currentConfig.model);
         }
@@ -9636,6 +9702,7 @@ async function loadConfig() {
 
         allServers = Array.isArray(currentConfig.servers) ? currentConfig.servers : [];
         updateModelPillDisplay();
+        updateComposerReadiness();
         renderServerPopover();
         renderConfiguredServers();
         syncOrchestratorControls();
@@ -9912,6 +9979,7 @@ async function saveOrchestratorConfig() {
         const result = await saveCurrentConfig();
         if (result.ok) {
             updateModelPillDisplay();
+            updateComposerReadiness();
             renderFilteredModels(true);
             showSettingsFeedback('✓ Orchestrator & subagent settings saved');
         }
@@ -9972,6 +10040,7 @@ async function applyConversationConfig(sess) {
     }
 
     updateModelPillDisplay();
+    updateComposerReadiness();
     syncOrchestratorControls();
     renderFilteredModels(true);
     renderConfiguredProviders();
@@ -10045,6 +10114,7 @@ async function applyProjectDefaults(project) {
 
     if (changed) {
         updateModelPillDisplay();
+        updateComposerReadiness();
         syncOrchestratorControls();
         renderFilteredModels(true);
         renderConfiguredProviders();

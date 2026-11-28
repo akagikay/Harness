@@ -1277,12 +1277,25 @@ if !saved_conf.onboarded {
     }
 
     pub async fn total_active_subagents(&self) -> usize {
+        // Collect the boards first, then count. A board can be reachable from more
+        // than one session (a remote run keys its board by run id while the
+        // client's session holds the same board), and summing per session would
+        // multiply one live subagent into N. Dedupe by the shared Arc.
         let boards: Vec<SwarmBoard> = {
             let lock = self.sessions.read().await;
             lock.values().map(|s| s.swarm.clone()).collect()
         };
-        let mut total = 0;
+        let mut seen: Vec<Arc<()>> = Vec::new();
+        let mut unique: Vec<SwarmBoard> = Vec::new();
         for board in boards {
+            let key = board.identity_token();
+            if !seen.iter().any(|k| Arc::ptr_eq(k, &key)) {
+                seen.push(key);
+                unique.push(board);
+            }
+        }
+        let mut total = 0;
+        for board in unique {
             total += board.active_subagent_count().await;
         }
         total
@@ -1409,6 +1422,39 @@ if !saved_conf.onboarded {
     ///
     /// Used by "Approve & always allow": the decision only names the tool once
     /// the request is already registered, so the tool is captured alongside it.
+    /// The outstanding permission prompts, as serializable records.
+    ///
+    /// A blocked agent is the one state a harness must never hide, and this is the
+    /// only way to see it without racing the live event stream: the prompts live in
+    /// memory, unknown ids 404 on `/api/permissions/:id/decision`, and nothing
+    /// enumerated the live ones. Operators (and end-to-end tests) need this to tell
+    /// "the agent is waiting for you" from "the agent is stuck".
+    pub async fn pending_permission_snapshots(&self) -> Vec<serde_json::Value> {
+        let meta = self.pending_permission_meta.read().await;
+        let pending = self.pending_permissions.read().await;
+        let now = chrono::Local::now().to_rfc3339();
+        let mut out: Vec<serde_json::Value> = meta
+            .iter()
+            .filter(|(id, _)| pending.contains_key(*id))
+            .map(|(id, (tool, session, path))| {
+                serde_json::json!({
+                    "perm_id": id,
+                    "tool": tool,
+                    "session_id": session,
+                    "path": path,
+                    "waiting_since": now,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            a.get("perm_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .cmp(b.get("perm_id").and_then(|v| v.as_str()).unwrap_or_default())
+        });
+        out
+    }
+
     pub async fn permission_tool_for(&self, perm_id: &str) -> Option<String> {
         let lock = self.pending_permission_meta.read().await;
         lock.get(perm_id).map(|(t, _, _)| t.clone())
