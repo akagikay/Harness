@@ -536,4 +536,4 @@ All six are implemented; regression tests added for each. Details:
   `test_skill_router_does_not_prefix_match_short_keywords`,
   `test_auto_skill_directives_are_not_injected_for_a_weak_match`.
 
-Test status: 226 unit + 78 integration, all green.
+Test status: 228 unit + 78 integration, all green.
