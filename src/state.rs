@@ -1696,6 +1696,33 @@ if !saved_conf.onboarded {
         self.persist_session_record(session_id).await;
     }
 
+    /// Update the in-memory LLM history WITHOUT writing the database.
+    ///
+    /// The mid-turn checkpoint sink calls this on *every* model round-trip.
+    /// A full `save_llm_messages` there is not an option: `persist_session_record`
+    /// holds the global sessions write lock across three deep clones plus a DB
+    /// transaction that serializes the whole message history and every event, so
+    /// on a long conversation every session read on the machine queues behind a
+    /// disk write once per round-trip. The DB copy is refreshed by the caller's
+    /// debounced persist and by every terminal arm of the turn.
+    pub async fn update_llm_messages_in_memory(&self, session_id: &str, messages: Vec<ChatMessage>) {
+        let mut lock = self.sessions.write().await;
+        if let Some(session) = lock.get_mut(session_id) {
+            session.llm_messages = messages;
+            session.updated_at = chrono::Local::now().to_rfc3339();
+        }
+    }
+
+    /// Flush the in-memory session state to the database.
+    ///
+    /// Used by a turn's terminal arms so the last mid-turn snapshot becomes
+    /// durable even when the turn ended in an error (there are no
+    /// `updated_messages` to save in that case - the snapshot already in memory
+    /// is the truth).
+    pub async fn flush_session_record(&self, session_id: &str) {
+        self.persist_session_record(session_id).await;
+    }
+
     /// Append a prompt to the session's FIFO queue, returning `(item, 1_based_position, full_queue)`.
     #[allow(dead_code)]
     pub async fn enqueue_prompt(
@@ -2323,8 +2350,89 @@ mod core_state_tests {
         assert!(snap.updated_at > 0);
     }
 
-    #[tokio::test]
-    async fn queued_prompts_also_block_an_update() {
+    // ---------- Mid-turn checkpoint primitives (v1.1.5) ----------
+
+/// The per-round-trip checkpoint must be able to move the in-memory history
+/// without a DB write: the DB write holds the global sessions write lock across
+/// a full snapshot, so doing it on every round-trip would serialize every
+/// session read behind a disk write.
+#[tokio::test]
+async fn in_memory_checkpoint_updates_history_without_touching_the_db() {
+    let db = HarnessDb::open_in_memory().expect("open in-memory db");
+    let state = AppState::with_db(HarnessConfig::default(), db);
+    let id = "ses-checkpoint-mem".to_string();
+    state
+        .create_session_with_options(id.clone(), "cp".into(), "project".into(), None, None, None, "running")
+        .await;
+
+    state
+        .update_llm_messages_in_memory(
+            &id,
+            vec![ChatMessage::user("partial work from a failed turn".to_string())],
+        )
+        .await;
+
+    // The in-memory history is what the next turn reads.
+    let in_memory = {
+        let lock = state.sessions.read().await;
+        lock.get(&id).unwrap().llm_messages.clone()
+    };
+    assert_eq!(in_memory.len(), 1);
+    assert!(in_memory[0].content.as_deref().unwrap_or_default().contains("partial work"));
+
+    // Nothing was written to the DB: the persisted message list is still empty.
+    let stored = state.db.as_ref().unwrap().load_messages_and_checkpoints(&id).unwrap();
+    let stored_msgs = stored.map(|(msgs, _, _)| msgs).unwrap_or_default();
+    assert!(
+        stored_msgs.is_empty(),
+        "the in-memory path must not persist: {stored_msgs:?}"
+    );
+}
+
+/// A turn's terminal arm must be able to make the last checkpoint durable even
+/// when the turn ended in an error and there are no `updated_messages` to save.
+#[tokio::test]
+async fn flush_makes_the_last_checkpoint_durable() {
+    let db = HarnessDb::open_in_memory().expect("open in-memory db");
+    let state = AppState::with_db(HarnessConfig::default(), db);
+    let id = "ses-checkpoint-flush".to_string();
+    state
+        .create_session_with_options(id.clone(), "cp".into(), "project".into(), None, None, None, "failed")
+        .await;
+
+    state
+        .update_llm_messages_in_memory(
+            &id,
+            vec![ChatMessage::user("work that must survive".to_string())],
+        )
+        .await;
+    state.flush_session_record(&id).await;
+
+    let stored = state
+        .db
+        .as_ref()
+        .unwrap()
+        .load_messages_and_checkpoints(&id)
+        .unwrap()
+        .expect("flushed record must be durable");
+    assert_eq!(stored.0.len(), 1);
+    assert!(stored.0[0].content.as_deref().unwrap_or_default().contains("work that must survive"));
+    assert_eq!(stored.0[0].role, "user");
+}
+
+/// An in-flight snapshot for a DELETED session must not recreate its record.
+#[tokio::test]
+async fn flushing_an_unknown_session_is_a_no_op() {
+    let db = HarnessDb::open_in_memory().expect("open in-memory db");
+    let state = AppState::with_db(HarnessConfig::default(), db.clone());
+    state.flush_session_record("ses-does-not-exist").await;
+    assert!(db.get_conversation("ses-does-not-exist").unwrap().is_none());
+    state.update_llm_messages_in_memory("ses-does-not-exist", Vec::new()).await;
+    assert!(db.get_conversation("ses-does-not-exist").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn queued_prompts_also_block_an_update() {
         let db = HarnessDb::open_in_memory().expect("open in-memory db");
         let mut cfg = HarnessConfig::default();
         cfg.mock_mode = true;

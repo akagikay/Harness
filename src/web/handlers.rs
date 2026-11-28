@@ -460,6 +460,8 @@ pub fn spawn_session_turn(
             // through events and never emits a snapshot here.
             let (checkpoint_tx, mut checkpoint_rx) =
                 mpsc::unbounded_channel::<Vec<ChatMessage>>();
+            let mut last_checkpoint_persist = std::time::Instant::now()
+                - std::time::Duration::from_secs(3600);
             let mut runner_handle = if let Some(remote_srv) = remote_primary {
                 let run_id = format!("run_{}_{}", session_id, chrono::Utc::now().timestamp_millis());
                 {
@@ -583,7 +585,25 @@ pub fn spawn_session_turn(
                         // A rolled-back/undoed session must not be overwritten by
                         // an in-flight snapshot from an older turn.
                         if still_checkpointing {
-                            state.save_llm_messages(&session_id, snapshot).await;
+                            // Keep the in-memory history exact on EVERY snapshot
+                            // (that is what the next turn reads), but only pay for
+                            // the DB write at most once per `CHECKPOINT_PERSIST_INTERVAL`:
+                            // `persist_session_record` holds the global sessions
+                            // write lock across a full snapshot write, so doing it
+                            // on every round-trip serialized every session read on
+                            // the machine behind a disk write. The final state is
+                            // always flushed by the terminal arms below.
+                            let now = std::time::Instant::now();
+                            if now.duration_since(last_checkpoint_persist)
+                                >= CHECKPOINT_PERSIST_INTERVAL
+                            {
+                                state.save_llm_messages(&session_id, snapshot).await;
+                                last_checkpoint_persist = now;
+                            } else {
+                                state
+                                    .update_llm_messages_in_memory(&session_id, snapshot)
+                                    .await;
+                            }
                         }
                         continue;
                     }
@@ -669,8 +689,15 @@ pub fn spawn_session_turn(
                     // emitting: no `Error`, no `SessionCompleted`, so the UI
                     // shows a running agent that will never finish and the DB
                     // keeps a "failed" row that is not rendered anywhere.
+                    // There are no `updated_messages` to save on this arm - the
+                    // mid-turn checkpoint already left the work in memory, so the
+                    // only thing left to do is make it durable.
+                    if still_active {
+                        state.flush_session_record(&session_id).await;
+                    }
                     if !was_stopped {
                         state.update_session_status(&session_id, "failed").await;
+                        state.flush_session_record(&session_id).await;
                         let _ = event_tx_terminal
                             .send(HarnessEvent::Error {
                                 message: run_err,
@@ -681,8 +708,12 @@ pub fn spawn_session_turn(
                     break;
                 }
                 Err(join_err) => {
+                    if still_active {
+                        state.flush_session_record(&session_id).await;
+                    }
                     if !was_stopped {
                         state.update_session_status(&session_id, "panic").await;
+                        state.flush_session_record(&session_id).await;
                         let _ = event_tx_terminal
                             .send(HarnessEvent::Error {
                                 message: format!("Agent turn task failed: {join_err}"),
@@ -704,6 +735,17 @@ pub fn spawn_session_turn(
 /// the provider's raw `400 context_length` - and the oversized prompt stays in
 /// the DB forever.
 pub const MAX_TASK_CHARS: usize = 100_000;
+
+/// How often a mid-turn turn checkpoint is written to the database.
+///
+/// The in-memory history is updated on every snapshot (that is what the next
+/// turn and the UI read); the DB write is the expensive one because
+/// `persist_session_record` holds the global sessions write lock across a full
+/// snapshot of history + messages + checkpoints. Once per second is a ceiling on
+/// what a disk write rate costs and a floor on how much work a hard crash loses;
+/// a turn's terminal arm always flushes, so this interval only ever trades
+/// sub-second durability, not the final state.
+const CHECKPOINT_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub async fn create_session(
     State(state): State<AppState>,
