@@ -781,4 +781,46 @@ icons (📁 🚀 🏠 📥 🖥️ 📄) into Latin-1 mojibake. All six are byte
 
 Current status: **241 unit + 93 integration, all green.**
 
-## Round 9 QA / e2e reports - still landing
+## Round 9 QA + e2e reports - APPLIED (`d2944fd`, `11f77b7`)
+
+Both critics re-verified the round-8 fixes and found them holding (H1/H2/M1/M2/M3 and the
+dangling-`tool_calls` sanitizer, plus both round-9 UX P0s, all live in a browser). What they
+found new, and where it is fixed:
+
+| Finding | Fix |
+|---|---|
+| **P1-1 (QA)** `max_active_subagents = 1` refused the first legitimate spawn with "1 active, limit 1" on a fresh process; the operator had to raise it to 2 to get one working subagent | the ceiling test is `active >= cap` (a cap of N means N runs), and `total_active_subagents` dedupes boards by identity, because a board reachable from two sessions used to multiply one live subagent into N |
+| **P0-2 (e2e)** `--sandbox` was not real: the default project was seeded beside the executable before the flag was applied, so it pointed at `target/release/Project` while the operator's sandbox stayed empty | `relocate_default_project_into_sandbox` on both the first-run and persisted-config paths. Verified live: the project is now `<sandbox>/Project` |
+| **P0-3 (e2e)** the approval flow had zero observability - prompts live in memory, unknown ids 404, nothing enumerated the live ones | new `GET /api/permissions`, and `/api/security/status` reports `permission_mode`, `privileged_shell`, `update_pin_version`, `remote_root_allowlist` and `max_active_subagents` on BOTH routers |
+| **P1 (e2e)** the composer implied readiness: with no provider the send button, all four suggestion chips and a plausible "Nemotron-3-Nano" pill were enabled, and the first failure only surfaced after a round-trip | the pill says what is configured ("No model set"), the composer and chips are disabled with an explanation, and the prompt path refuses instead of dying at the model call. `POST /api/security/permissions` now accepts `ask` - the word the top-bar pill uses |
+| **P2-2/P2-3 (QA)** a 0-byte or wrong-magic DB was indistinguishable from "no DB yet" (silent empty workspace) and quarantine lost the `-wal`/`-shm` sidecars | a preflight catches an obviously-unusable file BEFORE the first open, so the sidecars are preserved with the main file |
+| **P2 (e2e)** the sidebar toggle lied at <=64em (a drawer, so the width never changed) and the permission pill lost its name on a narrow viewport | the button names its action per viewport with `aria-expanded` (Show/Hide sidebar in drawer mode, Collapse/Expand on a wide viewport), collapse reflows to width 0, and the pill keeps `data-mode-label`/`aria-label` |
+
+Current status: **244 unit + 93 integration, all green.**
+
+## Round 9 complete - all four critics reported and applied
+
+| Round 9 critic | Findings | Where applied |
+|---|---|---|
+| UX | 3 P0, 2 P1, ~8 P2 | `51ae6eb` (zombie session), `c4282f9` (stale badge), `bf9f300` (inert permission control + Stop resolves prompts), `11f77b7` (responsive labels) |
+| Red team | 2 CRITICAL, 3 HIGH, 4 MEDIUM, 4 LOW | `2b53667` (filesystem confinement + same-origin), `355c256` (credential exfil + operator flags) |
+| Functional QA | 1 P1, 6 P2 | `d2944fd` (subagent cap, 0-byte DB) |
+| E2E | 2 P0, 2 P1, 2 P2 | `d2944fd` (sandbox, composer, observability, pin alias), `11f77b7` (sidebar/pill) |
+
+**Everything verified live in a real browser or against a running server before the commit.**
+
+### Remaining backlog (ordered)
+1. **UX P0-2** approvals still lost on reload in some paths, and the 120s timeout label is
+   now honest but the card can still linger; retest after the round-9 changes.
+2. **a11y**: no focus trap in any modal (25 Tabs escape into the whole app) and sub-AA
+   contrast on `--text-dim` (2.2:1) and the active settings tab (2.04:1).
+3. **Red-team M4 residual**: a nearest-ancestor browse oracle remains in the picker's
+   non-strict fallback (it resolves to an existing ancestor before the allowlist check).
+4. **QA P2 cluster remainder**: `missing_roots` is still discarded by the client
+   (`src/remote.rs`), the prompt lists `mcp_google_ai_search_search` twice, and a client
+   can still write `db_path`.
+5. **Red-team L1-L4**: quarantine suffix collisions (1000 attempts then startup aborts),
+   the alternating-pin install loop, a missing `Host` bypassing the rebinding guard, and
+   `get_artifact` skipping the secret denylist.
+6. **A release**: v1.1.5 shipped before all of this; the working tree is 15 commits ahead
+   and needs v1.1.6.
