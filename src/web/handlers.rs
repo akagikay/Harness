@@ -577,33 +577,29 @@ pub fn spawn_session_turn(
                 };
                 let evt = match step {
                     TurnOutput::Snapshot(snapshot) => {
-                        let still_checkpointing = {
-                            let lock = state.sessions.read().await;
-                            lock.get(&session_id)
-                                .is_some_and(|s| Arc::ptr_eq(&s.cancel_notify, &cancel_notify))
-                        };
-                        // A rolled-back/undoed session must not be overwritten by
-                        // an in-flight snapshot from an older turn.
-                        if still_checkpointing {
-                            // Keep the in-memory history exact on EVERY snapshot
-                            // (that is what the next turn reads), but only pay for
-                            // the DB write at most once per `CHECKPOINT_PERSIST_INTERVAL`:
-                            // `persist_session_record` holds the global sessions
-                            // write lock across a full snapshot write, so doing it
-                            // on every round-trip serialized every session read on
-                            // the machine behind a disk write. The final state is
-                            // always flushed by the terminal arms below.
-                            let now = std::time::Instant::now();
-                            if now.duration_since(last_checkpoint_persist)
-                                >= CHECKPOINT_PERSIST_INTERVAL
-                            {
-                                state.save_llm_messages(&session_id, snapshot).await;
-                                last_checkpoint_persist = now;
-                            } else {
-                                state
-                                    .update_llm_messages_in_memory(&session_id, snapshot)
-                                    .await;
-                            }
+                        // The guard lives inside the write: a snapshot from a
+                        // rolled-back or deleted turn is dropped rather than
+                        // resurrecting state the user threw away.
+                        // Keep the in-memory history exact on EVERY applied snapshot
+                        // (that is what the next turn reads), but only pay for the
+                        // DB write at most once per `CHECKPOINT_PERSIST_INTERVAL`:
+                        // `persist_session_record` holds the global sessions write
+                        // lock across a full snapshot write, so doing it on every
+                        // round-trip serialized every session read on the machine
+                        // behind a disk write. The final state is always flushed by
+                        // the terminal arms below.
+                        let debounced = std::time::Instant::now().duration_since(last_checkpoint_persist)
+                            >= CHECKPOINT_PERSIST_INTERVAL;
+                        let applied = state
+                            .checkpoint_turn_messages(
+                                &session_id,
+                                &cancel_notify,
+                                snapshot,
+                                debounced,
+                            )
+                            .await;
+                        if applied && debounced {
+                            last_checkpoint_persist = std::time::Instant::now();
                         }
                         continue;
                     }

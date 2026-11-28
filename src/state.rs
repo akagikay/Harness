@@ -1723,6 +1723,53 @@ if !saved_conf.onboarded {
         self.persist_session_record(session_id).await;
     }
 
+    /// True while `turn_cancel` is still the session's live cancellation token.
+    ///
+    /// The mid-turn checkpoint sink must never write into a session whose turn
+    /// was rolled back or deleted: `undo_to_turn` swaps `cancel_notify` for a
+    /// fresh token, and `delete_session` drops the row entirely, so a stale
+    /// snapshot from an older turn is rejected instead of resurrecting the
+    /// messages the user just threw away.
+    pub async fn is_live_turn(&self, session_id: &str, turn_cancel: &Arc<tokio::sync::Notify>) -> bool {
+        let lock = self.sessions.read().await;
+        lock.get(session_id)
+            .is_some_and(|s| Arc::ptr_eq(&s.cancel_notify, turn_cancel))
+    }
+
+    /// Apply a mid-turn checkpoint, but only if `turn_cancel` still owns the
+    /// session. Returns `true` when the snapshot was applied.
+    ///
+    /// The guard and the write share ONE write-lock acquisition on purpose: a
+    /// caller that checked `is_live_turn` first and then awaited the write would
+    /// leave a window where an `undo` lands in between and the stale snapshot
+    /// resurrects the rolled-back conversation. `persist` then refreshes the DB
+    /// copy AFTER the lock is released, so the write re-reads whatever state is
+    /// current at that moment.
+    pub async fn checkpoint_turn_messages(
+        &self,
+        session_id: &str,
+        turn_cancel: &Arc<tokio::sync::Notify>,
+        messages: Vec<ChatMessage>,
+        persist: bool,
+    ) -> bool {
+        let live = {
+            let mut lock = self.sessions.write().await;
+            let Some(session) = lock.get_mut(session_id) else {
+                return false;
+            };
+            if !Arc::ptr_eq(&session.cancel_notify, turn_cancel) {
+                return false;
+            }
+            session.llm_messages = messages;
+            session.updated_at = chrono::Local::now().to_rfc3339();
+            true
+        };
+        if live && persist {
+            self.persist_session_record(session_id).await;
+        }
+        live
+    }
+
     /// Append a prompt to the session's FIFO queue, returning `(item, 1_based_position, full_queue)`.
     #[allow(dead_code)]
     pub async fn enqueue_prompt(
@@ -2429,6 +2476,110 @@ async fn flushing_an_unknown_session_is_a_no_op() {
     assert!(db.get_conversation("ses-does-not-exist").unwrap().is_none());
     state.update_llm_messages_in_memory("ses-does-not-exist", Vec::new()).await;
     assert!(db.get_conversation("ses-does-not-exist").unwrap().is_none());
+}
+
+/// The live-turn guard must reject a snapshot whose turn was rolled back.
+///
+/// `undo_to_turn` hands the session a FRESH cancellation token, so a checkpoint
+/// that was mid-flight when the user hit undo is dropped instead of writing the
+/// removed messages back over the rollback.
+#[tokio::test]
+async fn a_checkpoint_after_undo_is_rejected_by_the_live_turn_guard() {
+    let db = HarnessDb::open_in_memory().expect("open in-memory db");
+    let state = AppState::with_db(HarnessConfig::default(), db);
+    let id = "ses-checkpoint-undo".to_string();
+    state
+        .create_session_with_options(id.clone(), "cp".into(), "project".into(), None, None, None, "running")
+        .await;
+    let turn_id = state
+        .begin_turn_with_command_and_attachments(&id, "first prompt", Vec::new(), None, None)
+        .await
+        .map(|(tid, _, _)| tid)
+        .expect("a turn must start");
+    let turn_cancel = {
+        let lock = state.sessions.read().await;
+        lock.get(&id).unwrap().cancel_notify.clone()
+    };
+
+    // Before any rollback the owning turn may checkpoint.
+    let applied = state
+        .checkpoint_turn_messages(
+            &id,
+            &turn_cancel,
+            vec![ChatMessage::user("legitimate work".to_string())],
+            false,
+        )
+        .await;
+    assert!(applied, "the live turn's checkpoint must be applied");
+
+    // The user rolls back. Undo hands the session a fresh cancellation token,
+    // so the very same snapshot path now refuses to write.
+    assert!(state.undo_to_turn(&id, turn_id).await.is_some(), "undo must restore");
+    let applied_after = state
+        .checkpoint_turn_messages(
+            &id,
+            &turn_cancel,
+            vec![ChatMessage::user("stale work that must be dropped".to_string())],
+            false,
+        )
+        .await;
+    assert!(!applied_after, "a snapshot from a rolled-back turn must be refused");
+
+    let msgs = {
+        let lock = state.sessions.read().await;
+        lock.get(&id).unwrap().llm_messages.clone()
+    };
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| m.content.as_deref() == Some("stale work that must be dropped")),
+        "the refused snapshot must not appear in the conversation"
+    );
+}
+
+#[tokio::test]
+async fn a_checkpoint_into_a_deleted_session_is_refused() {
+    let db = HarnessDb::open_in_memory().expect("open in-memory db");
+    let state = AppState::with_db(HarnessConfig::default(), db);
+    let id = "ses-checkpoint-deleted".to_string();
+    state
+        .create_session_with_options(id.clone(), "cp".into(), "project".into(), None, None, None, "running")
+        .await;
+    let turn_cancel = {
+        let lock = state.sessions.read().await;
+        lock.get(&id).unwrap().cancel_notify.clone()
+    };
+    state.delete_session(&id).await;
+    let applied = state
+        .checkpoint_turn_messages(&id, &turn_cancel, Vec::new(), false)
+        .await;
+    assert!(!applied, "a checkpoint into a deleted session must be refused");
+}
+
+#[tokio::test]
+async fn undo_swaps_the_cancellation_token_so_a_stale_snapshot_is_dropped() {
+    let db = HarnessDb::open_in_memory().expect("open in-memory db");
+    let state = AppState::with_db(HarnessConfig::default(), db);
+    let id = "ses-checkpoint-undo2".to_string();
+    state
+        .create_session_with_options(id.clone(), "cp".into(), "project".into(), None, None, None, "running")
+        .await;
+    // Record a real turn checkpoint so undo_to_turn has something to restore to.
+    let turn_id = state
+        .begin_turn_with_command_and_attachments(&id, "first prompt", Vec::new(), None, None)
+        .await
+        .map(|(tid, _, _)| tid)
+        .expect("a turn must start");
+    let turn_cancel = {
+        let lock = state.sessions.read().await;
+        lock.get(&id).unwrap().cancel_notify.clone()
+    };
+    let undone = state.undo_to_turn(&id, turn_id).await;
+    assert!(undone.is_some(), "undo must restore the checkpoint");
+    assert!(
+        !state.is_live_turn(&id, &turn_cancel).await,
+        "undo must hand the session a fresh token, so a stale snapshot is dropped"
+    );
 }
 
 #[tokio::test]
