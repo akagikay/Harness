@@ -9,6 +9,9 @@ harness.json
 projects/
 *.log
 
+# Adversarial-round scratch reports (never part of the source tree)
+.harness_reports/
+
 # Credential encryption key + update artifacts (never commit these)
 harness.key
 *.key
