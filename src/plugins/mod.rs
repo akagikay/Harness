@@ -164,7 +164,13 @@ impl PluginRegistry {
     }
 
     pub fn register_defaults(&mut self, config: &HarnessConfig) {
-        self.register(Arc::new(bash::BashPlugin));
+        // `bash` is NOT sandboxed: it runs a real shell with the harness
+        // process's full rights, so it can read `harness.key`, the database,
+        // or anything else on the machine. It is opt-in and absent by default;
+        // the file tools enforce the workspace roots instead.
+        if config.allow_privileged_shell {
+            self.register(Arc::new(bash::BashPlugin));
+        }
         self.register(Arc::new(file_ops::ReadFilePlugin));
         self.register(Arc::new(file_ops::WriteFilePlugin));
         self.register(Arc::new(file_ops::EditFilePlugin));

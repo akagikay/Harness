@@ -220,6 +220,12 @@ pub struct AgentLoopRunner {
     pub prior_messages: Vec<ChatMessage>,
     pub task_attachments: Vec<ChatAttachment>,
     pub steer_inbox: Option<Arc<tokio::sync::Mutex<VecDeque<String>>>>,
+    /// Optional sink that receives a snapshot of the conversation after every
+    /// model round-trip. A turn that dies mid-way (stream error, cancellation,
+    /// a bad model reply) still keeps the work it already did: without this the
+    /// partial context died with the task, so a follow-up "continue" started
+    /// from scratch and the agent forgot its own previous tool calls.
+    context_checkpoint: Option<Arc<dyn Fn(Vec<ChatMessage>) + Send + Sync>>,
 }
 
 impl AgentLoopRunner {
@@ -249,6 +255,28 @@ impl AgentLoopRunner {
             prior_messages: Vec::new(),
             task_attachments: Vec::new(),
             steer_inbox: None,
+            context_checkpoint: None,
+        }
+    }
+
+    /// Register a sync sink for periodic conversation snapshots.
+    ///
+    /// Called after every model round-trip (and once more before a turn ends),
+    /// so even a failed turn leaves a resumable history behind. The closure
+    /// must be fast and non-blocking: send it down a channel and drain it in
+    /// the caller's event loop.
+    pub fn with_context_checkpoint<F>(mut self, sink: F) -> Self
+    where
+        F: Fn(Vec<ChatMessage>) + Send + Sync + 'static,
+    {
+        self.context_checkpoint = Some(Arc::new(sink));
+        self
+    }
+
+    /// Hand the current conversation out to the checkpoint sink, if any.
+    fn checkpoint_context(&self, context: &ConversationContext) {
+        if let Some(ref sink) = self.context_checkpoint {
+            sink(context.messages.clone());
         }
     }
 
@@ -390,10 +418,21 @@ impl AgentLoopRunner {
         };
 
         let host_env_line = if cfg!(windows) {
-            "Host Environment: Windows (PowerShell 5.1 — use ';' instead of '&&', use PowerShell cmdlets / dir instead of Unix 'ls -la')"
+            "Host Environment: Windows (PowerShell 5.1 - use ';' instead of '&&', use PowerShell cmdlets / dir instead of Unix 'ls -la')"
         } else {
             "Host Environment: Unix (sh)"
         };
+
+        // Advertise exactly the tools that are actually registered. `bash` is
+        // opt-in (it is uncontained), so naming it in the prompt when it is
+        // absent would send the model after a tool that cannot run.
+        let tool_list = self
+            .registry
+            .get_contracts()
+            .into_iter()
+            .map(|c| format!("`{}`", c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         let knowledge_section = if self.config.knowledge_only {
             "\nExecution Mode: Standalone Knowledge-Work Conversation (No Project Workspace attached).\n\
@@ -457,7 +496,7 @@ impl AgentLoopRunner {
              Workspace Root: {}\n\
              {}{}{}\n\
              Principles & Capabilities:\n\
-             1. 'Everything is a Plugin': Utilize `bash`, `read_file`, `write_file`, `edit_file`, `list_dir`, `grep_search`, `sys_info`, `web_search`, `web_fetch`, `browser_ui`, `swarm_board`, `create_artifact`, `manage_tools`, `invoke_subagent`{}.\n\
+             1. 'Everything is a Plugin': Utilize {}{}.\n\
              2. Modular Tool Contracts & Custom Tools (`manage_tools`):\n\
              - Every tool enforces a typed Tool Contract (required/optional fields, constraints, permission tier, expected output, failure modes).\n\
              - Use `manage_tools` (`list`, `inspect`) to inspect tool contracts, or (`create`, `remove`) to register/remove modular custom tools in `.harness/tools/` (shell command templates or HTTP requests) when specialized repeatable workflows are needed — newly created tools hot-reload on the next turn.\n\
@@ -474,6 +513,7 @@ impl AgentLoopRunner {
             host_env_line,
             subagent_note,
             knowledge_section,
+            tool_list,
             extra_tools_list,
             delegation_guidance,
             google_search_guidance,
@@ -616,6 +656,10 @@ impl AgentLoopRunner {
         let mut last_failed_tool: Option<String> = None;
         let mut repeated_readonly_sig: Option<(String, usize)> = None;
         let mut empty_answer_nudged = false;
+        // Denied/timed-out permission requests across the WHOLE turn. This used
+        // to live inside the per-step loop below, so the fail-fast cap reset on
+        // every model round-trip and a run could ask forever.
+        let mut turn_permission_denials = 0usize;
         let mut session_prompt_tokens = 0usize;
         let mut session_completion_tokens = 0usize;
         let mut session_cached_tokens = 0usize;
@@ -751,6 +795,10 @@ impl AgentLoopRunner {
                 turn_result.reasoning_content.clone(),
                 if turn_result.tool_calls.is_empty() { None } else { Some(turn_result.tool_calls.clone()) },
             ));
+            // Snapshot the turn so far. A stream error 40 lines below used to
+            // throw all of this away: the follow-up "continue" then started with
+            // an empty history and the agent forgot its own tool calls.
+            self.checkpoint_context(&context);
 
             if let Some(ref c) = turn_result.content {
                 final_answer = c.clone();
@@ -898,6 +946,7 @@ impl AgentLoopRunner {
                     total_steps: step,
                     duration_secs,
                 }).await;
+                self.checkpoint_context(&context);
                 return Ok((final_answer, context.messages));
             }
 
@@ -908,8 +957,6 @@ impl AgentLoopRunner {
 
             let total_calls_in_turn = turn_result.tool_calls.len();
             let mut tc_idx = 0usize;
-            // Permission requests in this turn that were denied or timed out.
-            let mut turn_permission_denials = 0usize;
             while tc_idx < total_calls_in_turn {
                 let exec_registry = if let Some(ref st) = self.state {
                     st.get_registry_snapshot().await

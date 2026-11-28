@@ -56,7 +56,9 @@ const MAX_TOOL_HINTS: usize = 2;
 /// Keywords shorter than this are ignored entirely.
 const MIN_KEYWORD_LEN: usize = 3;
 /// A keyword this long also matches by prefix (`research` ~ `researcher`).
-const PREFIX_MATCH_MIN_LEN: usize = 4;
+/// A keyword shorter than this must match a stem exactly; prefix matching only
+/// kicks in at 5+ characters (see [`keyword_matches`]).
+const PREFIX_MATCH_MIN_LEN: usize = 5;
 
 /// Low-signal words that carry no routing information on their own.
 const STOPWORDS: &[&str] = &[
@@ -359,6 +361,12 @@ fn dedupe(items: Vec<String>) -> Vec<String> {
 /// Prefix matching is one-directional and single-word only: `refactor` matches
 /// `refactoring`, but the phrase `refactor plan` never matches just `refactor`,
 /// and `skill-authoring` never matches just `skill` (that is a name *part* hit).
+///
+/// Prefixes are only trusted at 5+ characters. A 4-letter abbreviation such as
+/// `diff` (a `reviewer` trigger) is a *word*, not a stem family: letting it
+/// prefix-match made `diff` fire on "different", which routed a plain
+/// game-building task to the reviewer skill on a 0.37-confidence ghost match.
+/// Short keywords must therefore match exactly.
 fn keyword_matches(keyword: &str, stems: &[String]) -> bool {
     let key = stem(keyword);
     if key.len() < MIN_KEYWORD_LEN || key.contains(char::is_whitespace) {

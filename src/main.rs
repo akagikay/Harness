@@ -30,13 +30,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              \x20 --server-id <ID>             Server identity for remote dispatch\n\
              \x20 --check-update               Check GitHub for a newer release\n\
              \x20 --update                     Download, verify and install the latest release\n\
+             \x20 --update-pin <VERSION>       Install (or roll back to) that exact release\n\
              \x20 --version, -V                Print version and exit\n\
              \x20 --help, -h                   Print this help and exit\n\n\
              ENVIRONMENT:\n\
              \x20 HARNESS_AUTH_TOKEN           Require a bearer token on /api/*\n\
              \x20 HARNESS_MASTER_KEY           AES-256 key (hex or base64) for stored credentials\n\
              \x20 MODEL_API_KEY, MODEL_API_BASE, MODEL_NAME\n\
-             \x20 HARNESS_UPDATE_REPO          owner/repo for auto-update\n",
+             \x20 HARNESS_UPDATE_REPO          owner/repo for auto-update\n\
+             \x20 HARNESS_UPDATE_PIN           Pin auto-update to one exact version\n",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(());
@@ -70,14 +72,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.db_path = Some(PathBuf::from(&args[i + 1]));
                 i += 1;
             }
+            "--update-pin" if i + 1 < args.len() => {
+                config.update_pin_version = args[i + 1].clone();
+                i += 1;
+            }
             "--check-update" => {
                 let repo = config.update_repo.clone();
-                match deepseek_harness_rs::updater::check(&repo, env!("CARGO_PKG_VERSION")).await {
+                let pin = config.update_pin_version.clone();
+                match deepseek_harness_rs::updater::check_pinned(&repo, env!("CARGO_PKG_VERSION"), &pin).await {
                     Ok(info) if info.available => {
                         println!(
-                            "Update available: {} -> {} ({})",
-                            info.current_version, info.latest_version, info.html_url
+                            "Update available: {} -> {} ({}){}",
+                            info.current_version,
+                            info.latest_version,
+                            info.html_url,
+                            if info.pinned { " [pinned]" } else { "" }
                         );
+                    }
+                    Ok(info) if info.pinned => {
+                        println!("Pinned to v{} (running v{}).", info.latest_version, info.current_version)
                     }
                     Ok(info) => println!("Up to date (v{}).", info.current_version),
                     Err(e) => eprintln!("Update check failed: {e}"),
@@ -86,13 +99,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--update" => {
                 let repo = config.update_repo.clone();
+                let pin = config.update_pin_version.clone();
                 let dest = std::env::temp_dir().join("harness-update");
-                match deepseek_harness_rs::updater::update_now(&repo, env!("CARGO_PKG_VERSION"), &dest).await {
+                match deepseek_harness_rs::updater::update_now_pinned(
+                    &repo,
+                    env!("CARGO_PKG_VERSION"),
+                    &pin,
+                    &dest,
+                )
+                .await
+                {
                     Ok(info) if info.available => {
                         println!(
                             "Installed v{} (was v{}). Restarting...",
                             info.latest_version, info.current_version
                         );
+                        return Ok(());
+                    }
+                    Ok(info) if info.pinned => {
+                        println!("Pinned to v{} (already running it).", info.latest_version);
                         return Ok(());
                     }
                     Ok(info) => {

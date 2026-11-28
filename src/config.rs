@@ -752,6 +752,13 @@ pub struct HarnessConfig {
     pub tool_timeout_secs: u64,
     pub sandbox_root: PathBuf,
     pub mock_mode: bool,
+    /// Opt in to the privileged `bash` tool. It is **not** contained by the
+    /// sandbox (a shell can read any absolute path the harness process can), so
+    /// it is unregistered by default. Enable only when the agent is trusted with
+    /// the user's full machine rights. `HARNESS_ALLOW_PRIVILEGED_SHELL=1` also
+    /// turns it on at startup.
+    #[serde(default)]
+    pub allow_privileged_shell: bool,
     pub permissions: PermissionsConfig,
     #[serde(default = "default_providers")]
     pub custom_providers: Vec<CustomProvider>,
@@ -805,6 +812,12 @@ pub struct HarnessConfig {
     /// (progress is shown in the UI; the app restarts itself when done).
     #[serde(default = "default_true")]
     pub auto_update_apply: bool,
+    /// Pin the auto-updater to one exact release (e.g. `1.1.3` or `v1.1.3`).
+    /// When set, the updater installs *that* version even if it is older than the
+    /// running build, and never jumps to `latest`. Empty means "follow latest".
+    /// `HARNESS_UPDATE_PIN` seeds this at startup.
+    #[serde(default)]
+    pub update_pin_version: String,
     /// First-class automations: scheduled agent runs, standalone or project-bound.
     #[serde(default)]
     pub automations: Vec<crate::automation::Automation>,
@@ -812,6 +825,13 @@ pub struct HarnessConfig {
     /// outside the project workspace.
     #[serde(default)]
     pub extra_access_roots: Vec<PathBuf>,
+    /// Server-owned allowlist of directory prefixes a *remote execution server*
+    /// may grant to a client-dispatched run. A client project that lives under
+    /// one of these prefixes (e.g. a shared projects directory) is accepted;
+    /// anything else is refused with 409 instead of being silently dropped.
+    /// Empty means "only this server's own sandbox and extra_access_roots".
+    #[serde(default)]
+    pub remote_root_allowlist: Vec<PathBuf>,
     /// False until the first-run onboarding has been completed.
     #[serde(default)]
     pub onboarded: bool,
@@ -836,6 +856,19 @@ pub struct HarnessConfig {
 
 pub fn default_update_repo() -> String {
     crate::updater::DEFAULT_REPO.to_string()
+}
+
+/// Parse an opt-in environment flag. Only explicit truthy values enable a
+/// privileged capability; an empty or unset variable never does.
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// True when the harness can actually reach a model with the stored config.
@@ -897,6 +930,7 @@ impl Default for HarnessConfig {
             tool_timeout_secs: 30,
             sandbox_root: current_dir.clone(),
             mock_mode: false,
+            allow_privileged_shell: env_truthy("HARNESS_ALLOW_PRIVILEGED_SHELL"),
             permissions: PermissionsConfig::default(),
             custom_providers: default_providers(),
             search: SearchConfig::default(),
@@ -920,8 +954,10 @@ impl Default for HarnessConfig {
                 .unwrap_or_else(|_| default_update_repo()),
             auto_update_check: true,
             auto_update_apply: true,
+            update_pin_version: std::env::var("HARNESS_UPDATE_PIN").unwrap_or_default(),
             automations: Vec::new(),
             extra_access_roots: Vec::new(),
+            remote_root_allowlist: Vec::new(),
             last_auto_update_target: String::new(),
             onboarded: false,
             config_revision: 0,

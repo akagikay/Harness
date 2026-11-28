@@ -116,6 +116,7 @@ async fn test_tool_sys_info() {
 async fn test_agent_loop_end_to_end() {
     let mut config = HarnessConfig::default();
     config.permissions.bash_policy = PermissionLevel::Allow;
+    config.allow_privileged_shell = true;
     let registry = PluginRegistry::new(&config);
     let model = Arc::new(MockClient);
 
@@ -435,7 +436,9 @@ async fn test_session_swarm_and_metrics_endpoints() {
 
 #[test]
 fn test_all_tools_declare_valid_contracts() {
-    let cfg = HarnessConfig::default();
+    // `bash` is opt-in (it is uncontained), so enable it explicitly here.
+    let mut cfg = HarnessConfig::default();
+    cfg.allow_privileged_shell = true;
     let registry = PluginRegistry::new(&cfg);
     let contracts = registry.get_contracts();
 
@@ -622,7 +625,8 @@ async fn test_tool_contract_validation_and_error_messages() {
         .is_ok());
 
     // Central enforcement through PluginRegistry::execute_with_context
-    let cfg = HarnessConfig::default();
+    let mut cfg = HarnessConfig::default();
+    cfg.allow_privileged_shell = true;
     let registry = PluginRegistry::new(&cfg);
     let temp_dir = std::env::temp_dir().join(format!(
         "harness_contract_exec_test_{}",
@@ -828,6 +832,7 @@ async fn test_tools_api_contract_endpoints() {
 
     let mut cfg = HarnessConfig::default();
     cfg.sandbox_root = temp_dir.clone();
+    cfg.allow_privileged_shell = true;
     let state = AppState::new(cfg);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4787,11 +4792,21 @@ async fn test_client_server_split_orchestrator_spawns_subagents_on_remote_server
         axum::serve(pb_listener, prov_b_router).await.unwrap();
     });
 
+    // The client's project folders exist on this same host, so each execution
+    // server must explicitly allowlist them (the remote-root contract). On a
+    // real cluster these would be the shared project directories.
+    let shared_client_roots: Vec<std::path::PathBuf> = HarnessConfig::default()
+        .projects
+        .iter()
+        .flat_map(|p| p.all_paths())
+        .collect();
+
     // Spin up Server 2 & Server 3 (execution workers)
     let mut cfg_s2 = HarnessConfig::default();
     cfg_s2.sandbox_root = dir_s2.clone();
     cfg_s2.server_identity = "server-2".into();
     cfg_s2.permissions.mode = PermissionMode::Autonomous;
+    cfg_s2.remote_root_allowlist = shared_client_roots.clone();
     let s2_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let s2_addr = s2_listener.local_addr().unwrap();
     let s2_handle = tokio::spawn(async move {
@@ -4804,6 +4819,7 @@ async fn test_client_server_split_orchestrator_spawns_subagents_on_remote_server
     cfg_s3.sandbox_root = dir_s3.clone();
     cfg_s3.server_identity = "server-3".into();
     cfg_s3.permissions.mode = PermissionMode::Autonomous;
+    cfg_s3.remote_root_allowlist = shared_client_roots.clone();
     let s3_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let s3_addr = s3_listener.local_addr().unwrap();
     let s3_handle = tokio::spawn(async move {
@@ -4817,6 +4833,7 @@ async fn test_client_server_split_orchestrator_spawns_subagents_on_remote_server
     cfg_s1.sandbox_root = dir_s1.clone();
     cfg_s1.server_identity = "server-1".into();
     cfg_s1.permissions.mode = PermissionMode::Autonomous;
+    cfg_s1.remote_root_allowlist = shared_client_roots.clone();
     let s1_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let s1_addr = s1_listener.local_addr().unwrap();
     let s1_handle = tokio::spawn(async move {
@@ -6540,6 +6557,7 @@ async fn test_update_download_streams_progress_and_verifies_checksum() {
             url: format!("{base}/release/{sums_name}"),
             size: 0,
         }),
+        pinned: false,
     };
 
     let dest = std::env::temp_dir().join(format!("harness-upd-dl-{}", std::process::id()));
@@ -7087,6 +7105,7 @@ async fn test_many_approved_permissions_do_not_abort_the_turn() {
     // Safe mode with bash forced to Ask: every bash call needs approval.
     let mut cfg = HarnessConfig::default();
     cfg.sandbox_root = temp_dir.clone();
+    cfg.allow_privileged_shell = true;
     cfg.permissions.mode = deepseek_harness_rs::config::PermissionMode::Safe;
     cfg.permissions.bash_policy = PermissionLevel::Ask;
     cfg.permissions
@@ -7133,6 +7152,169 @@ async fn test_many_approved_permissions_do_not_abort_the_turn() {
     assert_eq!(answer, "ALL_APPROVED_DONE");
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+// ============================================================================
+// Regression: a failed turn must leave its work behind for the next turn.
+//
+// A model stream error (or a panic, or a user stop) used to discard the whole
+// `ConversationContext`: `spawn_session_turn` only persisted messages on the
+// `Ok(Ok(...))` arm, so every tool call and answer from the failed turn was
+// wiped. The follow-up "continue" then started from an empty history and the
+// agent had to rediscover the workspace it had already read - exactly the
+// "missing memory" symptom seen in the field. The runner now snapshots the
+// conversation after every round-trip, and the turn loop persists it.
+// ============================================================================
+
+/// Issues one tool call, then fails the stream - the shape of the NGC/provider
+/// `error decoding response body` failure that killed a real turn mid-flight.
+struct FailAfterFirstToolCallModel {
+    steps: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelAdapter for FailAfterFirstToolCallModel {
+    async fn stream_completion(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &Value,
+        _event_tx: &mpsc::Sender<HarnessEvent>,
+    ) -> Result<ModelTurnResult, String> {
+        let idx = self.steps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match idx {
+            0 => Ok(ModelTurnResult {
+                content: Some("Reading the workspace...".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![make_tool_call(
+                    "call_lost",
+                    "sys_info",
+                    r#"{}"#,
+                )],
+                finish_reason: Some("tool_calls".into()),
+                estimated_tokens: 20,
+                ..Default::default()
+            }),
+            _ => Err("Stream read error: error decoding response body".to_string()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_a_failed_turn_keeps_the_work_it_already_did() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "harness-failed-turn-memory-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut cfg = HarnessConfig::default();
+    cfg.sandbox_root = temp_dir.clone();
+    cfg.max_iterations = 0;
+    let registry = PluginRegistry::new(&cfg);
+
+    let (tx, mut rx) = mpsc::channel::<HarnessEvent>(100);
+    let drainer = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    // The snapshots the runner hands over, exactly as `spawn_session_turn` collects them.
+    let (snap_tx, mut snap_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<ChatMessage>>();
+    let runner = AgentLoopRunner::new(
+        "failed_turn_memory".into(),
+        "Read the workspace".into(),
+        cfg,
+        registry,
+        Arc::new(FailAfterFirstToolCallModel {
+            steps: std::sync::atomic::AtomicUsize::new(0),
+        }),
+        None,
+    )
+    .with_context_checkpoint(move |snapshot| {
+        let _ = snap_tx.send(snapshot);
+    });
+
+    let result = runner.run(tx).await;
+    assert!(result.is_err(), "the second round-trip must fail the turn");
+
+    // At least one snapshot must carry the assistant turn AND its tool call:
+    // that is the state a "continue" needs to resume the same conversation.
+    let mut saw_assistant = false;
+    let mut saw_tool_call = false;
+    while let Ok(snapshot) = snap_rx.try_recv() {
+        for msg in &snapshot {
+            if msg.role == "assistant" && msg.tool_calls.as_ref().is_some_and(|c| !c.is_empty()) {
+                saw_assistant = true;
+                saw_tool_call = true;
+            }
+        }
+    }
+    assert!(
+        saw_assistant && saw_tool_call,
+        "a failed turn must snapshot the assistant message and its tool calls \
+         (snapshot observer saw assistant={saw_assistant}, tool_call={saw_tool_call})"
+    );
+
+    let _ = drainer.await;
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// Regression: the skill router must not prefix-match short keywords.
+//
+// `diff` is a `reviewer` trigger. Prefix matching let `diff` match the stem of
+// "different", so a plain "make a tower defense game with different tower
+// types" prompt routed to the reviewer skill on a 0.37-confidence ghost hit.
+// ============================================================================
+
+#[tokio::test]
+async fn test_skill_router_does_not_prefix_match_short_keywords() {
+    use deepseek_harness_rs::skill_router::{route_skills, RouterSettings};
+    use deepseek_harness_rs::builtin_skills::BUILTIN_SKILLS;
+    use deepseek_harness_rs::skill_router::RoutableSkill;
+
+    let skills: Vec<RoutableSkill> = BUILTIN_SKILLS
+        .iter()
+        .map(RoutableSkill::from_builtin)
+        .collect();
+    let matches = route_skills(
+        "Make a complex tower defense game with economy, upgradeable towers, \
+         different types of towers, enemies, waves, and progression",
+        &skills,
+        RouterSettings::default(),
+    );
+    let names: Vec<&str> = matches.iter().map(|m| m.name.as_str()).collect();
+    assert!(
+        !names.contains(&"reviewer"),
+        "a different-tower-types prompt must not route to the reviewer skill: {names:?}"
+    );
+}
+
+// ============================================================================
+// Regression: the auto-route must be silent on a weak match.
+//
+// A skill that matched only on a 0.37 ghost prefix used to be injected as a
+// `SYSTEM COMMAND DIRECTIVE`, which redirected the whole run. Now the router
+// threshold gate also guards the injection site.
+// ============================================================================
+
+#[tokio::test]
+async fn test_auto_skill_directives_are_not_injected_for_a_weak_match() {
+    use deepseek_harness_rs::builtin_skills::BUILTIN_SKILLS;
+    use deepseek_harness_rs::skill_router::{route_skills, RouterSettings, RoutableSkill};
+
+    let skills: Vec<RoutableSkill> = BUILTIN_SKILLS
+        .iter()
+        .map(RoutableSkill::from_builtin)
+        .collect();
+    let prompt = "Make a complex tower defense game with different types of towers and waves";
+    let matches = route_skills(prompt, &skills, RouterSettings::default());
+    for m in &matches {
+        assert!(
+            m.confidence >= deepseek_harness_rs::skill_router::DEFAULT_MIN_CONFIDENCE,
+            "'{}' matched with confidence {:.2}, below the gate",
+            m.name,
+            m.confidence
+        );
+    }
 }
 // ============================================================================
 // Round 5 red-team regressions (security fixes)
@@ -7543,6 +7725,7 @@ async fn test_updater_refuses_a_release_without_checksums() {
             size: payload.len() as u64,
         }),
         checksums: sums,
+        pinned: false,
     };
 
     let dest = std::env::temp_dir().join(format!("harness-upd-nosums-{}", std::process::id()));

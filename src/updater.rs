@@ -45,6 +45,10 @@ pub struct UpdateInfo {
     pub asset: Option<ReleaseAsset>,
     /// `SHA256SUMS` asset, when published.
     pub checksums: Option<ReleaseAsset>,
+    /// True when the target came from an explicit version pin rather than
+    /// `releases/latest`. A pin may point at an *older* release (rollback).
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// Progress of an in-flight update, mirrored for the UI (and logs).
@@ -260,9 +264,29 @@ pub async fn get_with_retry(
     }
 }
 
+/// Normalize a version/tag for comparison and URL use: strips whitespace and a
+/// leading `v`/`V`. Returns `""` for an empty pin.
+pub fn normalize_version(v: &str) -> String {
+    v.trim()
+        .trim_start_matches('v')
+        .trim_start_matches('V')
+        .to_string()
+}
+
 /// Query the latest GitHub release and compare it with the running version.
 pub async fn check(repo: &str, current_version: &str) -> Result<UpdateInfo, String> {
     check_for_exe(repo, current_version, &current_exe_name()).await
+}
+
+/// Like [`check`] but honors an explicit version pin. An empty pin behaves
+/// exactly like [`check`]; a non-empty pin targets that exact release, even if
+/// it is older than the running build (a supported rollback/downgrade).
+pub async fn check_pinned(
+    repo: &str,
+    current_version: &str,
+    pin: &str,
+) -> Result<UpdateInfo, String> {
+    check_for_exe_pinned(repo, current_version, &current_exe_name(), pin).await
 }
 
 /// Like [`check`] but targets an explicit asset file name. Falls back to
@@ -272,26 +296,65 @@ pub async fn check_for_exe(
     current_version: &str,
     exe_name: &str,
 ) -> Result<UpdateInfo, String> {
+    check_for_exe_pinned(repo, current_version, exe_name, "").await
+}
+
+/// The full check implementation, optionally pinned to one release tag.
+pub async fn check_for_exe_pinned(
+    repo: &str,
+    current_version: &str,
+    exe_name: &str,
+    pin: &str,
+) -> Result<UpdateInfo, String> {
     let repo = if repo.trim().is_empty() { DEFAULT_REPO } else { repo.trim() };
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let resp = get_with_retry(&url, Some("application/vnd.github+json"))
-        .await
-        .map_err(|e| format!("Update check failed: {e}"))?;
-
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(format!("No published releases found for {repo}"));
+    let pin = normalize_version(pin);
+    let pinned = !pin.is_empty();
+    // Tags in the wild are split between `1.2.3` and `v1.2.3`; try the
+    // canonical `v` form first, then the bare one.
+    let mut tag_candidates: Vec<String> = if pinned {
+        vec![format!("v{pin}"), pin.clone()]
+    } else {
+        vec!["latest".to_string()]
+    };
+    let mut body: Option<serde_json::Value> = None;
+    let mut last_status = None;
+    for tag in tag_candidates.drain(..) {
+        let endpoint = if pinned {
+            format!("https://api.github.com/repos/{repo}/releases/tags/{tag}")
+        } else {
+            format!("https://api.github.com/repos/{repo}/releases/{tag}")
+        };
+        let resp = get_with_retry(&endpoint, Some("application/vnd.github+json"))
+            .await
+            .map_err(|e| format!("Update check failed: {e}"))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            last_status = Some(status);
+            continue;
+        }
+        if !status.is_success() {
+            return Err(format!(
+                "Update check failed: GitHub API returned {} after {MAX_ATTEMPTS} attempts",
+                status_phrase(status)
+            ));
+        }
+        body = Some(
+            resp.json()
+                .await
+                .map_err(|e| format!("Invalid GitHub response: {e}"))?,
+        );
+        break;
     }
-    if !resp.status().is_success() {
-        return Err(format!(
-            "Update check failed: GitHub API returned {} after {MAX_ATTEMPTS} attempts",
-            status_phrase(resp.status())
-        ));
-    }
-
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Invalid GitHub response: {e}"))?;
+    let body = match body {
+        Some(b) => b,
+        None if pinned => {
+            return Err(format!(
+                "Pinned release v{pin} was not found in {repo} (HTTP {}).",
+                last_status.map(|s| s.as_u16()).unwrap_or(404)
+            ));
+        }
+        None => return Err(format!("No published releases found for {repo}")),
+    };
 
     let tag = body
         .get("tag_name")
@@ -343,8 +406,17 @@ pub async fn check_for_exe(
 
     Ok(UpdateInfo {
         current_version: current_version.to_string(),
-        available: !latest.is_empty() && is_newer(&latest, current_version),
+        available: if latest.is_empty() {
+            false
+        } else if pinned {
+            // A pin is authoritative: install that release even when it is
+            // older than the running build.
+            normalize_version(&latest) != normalize_version(current_version)
+        } else {
+            is_newer(&latest, current_version)
+        },
         latest_version: latest,
+        pinned,
         html_url: body
             .get("html_url")
             .and_then(|v| v.as_str())
@@ -666,7 +738,18 @@ fn is_addr_in_use(err: &std::io::Error) -> bool {
 
 /// Convenience: check, download to `dest_dir`, and install.
 pub async fn update_now(repo: &str, current_version: &str, dest_dir: &Path) -> Result<UpdateInfo, String> {
-    let info = check(repo, current_version).await?;
+    update_now_pinned(repo, current_version, "", dest_dir).await
+}
+
+/// Like [`update_now`] but honors an explicit version pin, which may roll the
+/// installation back to an older release.
+pub async fn update_now_pinned(
+    repo: &str,
+    current_version: &str,
+    pin: &str,
+    dest_dir: &Path,
+) -> Result<UpdateInfo, String> {
+    let info = check_pinned(repo, current_version, pin).await?;
     if !info.available {
         return Ok(info);
     }

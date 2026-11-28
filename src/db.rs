@@ -31,6 +31,45 @@ pub struct HarnessDb {
     key: Arc<crate::crypto::MasterKey>,
 }
 
+/// SQLite error text that means the database *file* is unusable, as opposed to
+/// a transient lock or a permissions problem. Only these errors trigger the
+/// quarantine-and-recreate path.
+pub fn is_corruption_message(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("file is not a database")
+        || m.contains("database disk image is malformed")
+        || m.contains("malformed database schema")
+        || m.contains("database corruption")
+        || m.contains("database is corrupt")
+}
+
+/// Move a corrupt database (and its WAL/SHM sidecars) to a timestamped name in
+/// the same directory. Returns the quarantined main-file path, or `None` when
+/// the rename failed (e.g. another process still has it open). Nothing is ever
+/// deleted.
+fn quarantine_corrupt_db(path: &Path) -> Option<std::path::PathBuf> {
+    let name = path.file_name()?.to_string_lossy().to_string();
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let mut quarantined = path.with_file_name(format!("{name}.corrupt-{stamp}"));
+    let mut n = 1u32;
+    while quarantined.exists() {
+        quarantined = path.with_file_name(format!("{name}.corrupt-{stamp}-{n}"));
+        n += 1;
+        if n > 1000 {
+            return None;
+        }
+    }
+    std::fs::rename(path, &quarantined).ok()?;
+    for sidecar in ["-wal", "-shm"] {
+        let from = std::path::PathBuf::from(format!("{}{sidecar}", path.display()));
+        if from.exists() {
+            let to = std::path::PathBuf::from(format!("{}{sidecar}", quarantined.display()));
+            let _ = std::fs::rename(from, to);
+        }
+    }
+    Some(quarantined)
+}
+
 impl HarnessDb {
     pub fn open(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
@@ -39,6 +78,42 @@ impl HarnessDb {
                     .map_err(|e| format!("Failed to create database directory: {}", e))?;
             }
         }
+        match Self::open_at(path) {
+            Ok(db) => Ok(db),
+            Err(e) if is_corruption_message(&e) => {
+                // A corrupt file used to abort startup with no way forward. Move
+                // it aside (never delete it: it may hold the only copy of the
+                // user's conversations) and start a fresh database. The key file
+                // is untouched, so a later recovery of the quarantined DB still
+                // decrypts its stored credentials.
+                match quarantine_corrupt_db(path) {
+                    Some(q) => {
+                        eprintln!(
+                            "[harness-db] database {} was unreadable ({e}); moved it to {} and created a fresh one",
+                            path.display(),
+                            q.display()
+                        );
+                    }
+                    None => {
+                        return Err(format!(
+                            "Database {} is corrupt ({e}) and could not be moved aside. \
+                             Close any other harness instance and rename/delete the file manually.",
+                            path.display()
+                        ));
+                    }
+                }
+                Self::open_at(path).map_err(|e2| {
+                    format!(
+                        "Database {} was corrupt ({e}); a fresh database could not be created: {e2}",
+                        path.display()
+                    )
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn open_at(path: &Path) -> Result<Self, String> {
         let conn = Connection::open(path)
             .map_err(|e| format!("Failed to open SQLite database {}: {}", path.display(), e))?;
         let key = crate::crypto::MasterKey::load_or_create(&crate::crypto::db_dir(path))
@@ -1096,6 +1171,51 @@ mod encryption_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A corrupt main DB used to abort startup with no way forward. It is now
+    /// quarantined (renamed, never deleted) and a fresh DB is created, so the
+    /// app starts and the bad file can still be recovered.
+    #[test]
+    fn a_corrupt_database_is_quarantined_and_recreated() {
+        let (dir, db_path) = temp_db("corrupt");
+        // 4 KiB of non-SQLite bytes: header check fails on the first statement.
+        std::fs::write(&db_path, b"CDEFGHIJKLMNOPQRSTUVWXYZ".repeat(170)).unwrap();
+        let marker = std::fs::read(&db_path).unwrap();
+
+        let db = HarnessDb::open(&db_path).expect("a corrupt DB must be recovered by recreating it");
+        // The quarantined copy still holds the original bytes.
+        let quarantined: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains(".corrupt-"))
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1, "exactly one quarantined copy: {quarantined:?}");
+        assert_eq!(
+            std::fs::read(&quarantined[0]).unwrap(),
+            marker,
+            "the quarantined file must keep the original bytes (never delete user data)"
+        );
+        // The original path is now a healthy, empty database.
+        assert_ne!(std::fs::read(&db_path).unwrap(), marker);
+        assert!(db.load_config().unwrap().is_none(), "a fresh DB has no saved config");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corruption_detection_ignores_ordinary_errors() {
+        assert!(is_corruption_message("Failed to open SQLite database x: file is not a database"));
+        assert!(is_corruption_message("database disk image is malformed"));
+        // A lock or permission problem must NOT trigger the rename path.
+        assert!(!is_corruption_message("database is locked"));
+        assert!(!is_corruption_message("attempt to write a readonly database"));
+        assert!(!is_corruption_message("Failed to load config from DB: invalid type"));
     }
 
     #[test]

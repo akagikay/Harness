@@ -38,17 +38,18 @@ pub fn spawn(state: Arc<AppState>, current_version: &'static str) {
     tokio::spawn(async move {
         tokio::time::sleep(INITIAL_DELAY).await;
         loop {
-            let (repo, do_check, do_install) = {
+            let (repo, pin, do_check, do_install) = {
                 let conf = state.config.read().await;
                 (
                     conf.update_repo.clone(),
+                    conf.update_pin_version.clone(),
                     conf.auto_update_check,
                     conf.auto_update_apply,
                 )
             };
             // A transient network/GitHub failure retries in minutes, not 6 hours.
             let transient = if do_check {
-                run_once(&state, &repo, current_version, do_install).await
+                run_once(&state, &repo, &pin, current_version, do_install).await
             } else {
                 false
             };
@@ -62,6 +63,7 @@ pub fn spawn(state: Arc<AppState>, current_version: &'static str) {
 async fn run_once(
     state: &AppState,
     repo: &str,
+    pin: &str,
     current_version: &'static str,
     auto_install: bool,
 ) -> bool {
@@ -72,7 +74,7 @@ async fn run_once(
         })
         .await;
 
-    let info = match updater::check(repo, current_version).await {
+    let info = match updater::check_pinned(repo, current_version, pin).await {
         Ok(info) => info,
         Err(e) => {
             let msg = e.clone();
@@ -100,7 +102,11 @@ async fn run_once(
             .set_update_status(|s| {
                 s.phase = UpdatePhase::UpToDate;
                 s.target_version = info.current_version.clone();
-                s.message = "Up to date".into();
+                s.message = if info.pinned {
+                    format!("Pinned to v{}", info.latest_version)
+                } else {
+                    "Up to date".into()
+                };
                 s.error = None;
                 s.percent = None;
                 s.downloaded_bytes = 0;
@@ -115,7 +121,11 @@ async fn run_once(
         .set_update_status(|s| {
             s.progress_phase(
                 UpdatePhase::Available,
-                format!("v{} available", info.latest_version),
+                if info.pinned {
+                    format!("v{} available (pinned)", info.latest_version)
+                } else {
+                    format!("v{} available", info.latest_version)
+                },
             );
             s.target_version = info.latest_version.clone();
             s.html_url = info.html_url.clone();

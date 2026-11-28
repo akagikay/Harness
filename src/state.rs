@@ -341,9 +341,16 @@ pub struct ServerRunHandle {
     pub steer_inbox: Arc<Mutex<VecDeque<String>>>,
     pub event_tx: broadcast::Sender<HarnessEvent>,
     pub history: Vec<HarnessEvent>,
+    /// Approximate serialized size of `history`, so a long run cannot pin an
+    /// unbounded amount of memory.
+    pub history_bytes: usize,
     pub updated_messages: Option<Vec<ChatMessage>>,
     pub final_answer: Option<String>,
     pub error: Option<String>,
+    /// When the run reached a terminal status. `None` while it is still running.
+    /// Used by `prune_finished_server_runs` to release memory after a grace
+    /// period (a late SSE reconnect can still fetch the result).
+    pub finished_at: Option<std::time::Instant>,
 }
 
 #[derive(Clone)]
@@ -723,13 +730,109 @@ if !saved_conf.onboarded {
         if !self.automation_runs.lock().await.running.is_empty() {
             return false;
         }
-        if !self.server_runs.read().await.is_empty() {
+        // A *finished* run is kept briefly so a reconnecting client can fetch
+        // its result; it must not make the harness look busy forever.
+        if self
+            .server_runs
+            .read()
+            .await
+            .values()
+            .any(|r| r.status == "running")
+        {
             return false;
         }
         if !self.active_remote_runs.read().await.is_empty() {
             return false;
         }
         true
+    }
+
+    /// Remove finished server runs older than `max_age` and drop the swarm
+    /// boards they owned.
+    ///
+    /// `server_runs` used to grow forever: every remote/automation run kept its
+    /// full event history (up to 2000 events) for the life of the process, and
+    /// each run also left an orphaned `SwarmBoard`. That is ~100-150 MB/day on
+    /// an active cluster. A finished run now survives `max_age` for a late SSE
+    /// reconnect, then is released together with its board.
+    pub async fn prune_finished_server_runs(&self, max_age: std::time::Duration) -> usize {
+        let now = std::time::Instant::now();
+        let stale: Vec<(String, String)> = {
+            let mut runs = self.server_runs.write().await;
+            let ids: Vec<(String, String)> = runs
+                .iter()
+                .filter(|(_, h)| {
+                    h.finished_at
+                        .is_some_and(|t| now.duration_since(t) >= max_age)
+                })
+                .map(|(id, h)| (id.clone(), h.session_id.clone()))
+                .collect();
+            for (id, _) in &ids {
+                runs.remove(id);
+            }
+            ids
+        };
+        if stale.is_empty() {
+            return 0;
+        }
+        let mut boards = Vec::new();
+        {
+            let live_sessions: std::collections::HashSet<String> = self
+                .server_runs
+                .read()
+                .await
+                .values()
+                .map(|h| h.session_id.clone())
+                .collect();
+            let mut map = self.swarm_boards.write().await;
+            for (_, session_id) in &stale {
+                if !live_sessions.contains(session_id) {
+                    if let Some(board) = map.remove(session_id) {
+                        boards.push(board);
+                    }
+                }
+            }
+        }
+        for board in boards {
+            board.cancel_all_subagents().await;
+        }
+        stale.len()
+    }
+
+    /// Drop one server run (and its board when no other run uses the session).
+    pub async fn remove_server_run(&self, run_id: &str) -> bool {
+        let session_id = {
+            let mut runs = self.server_runs.write().await;
+            runs.remove(run_id).map(|h| h.session_id)
+        };
+        let Some(session_id) = session_id else {
+            return false;
+        };
+        let still_used = self
+            .server_runs
+            .read()
+            .await
+            .values()
+            .any(|h| h.session_id == session_id);
+        if !still_used {
+            self.remove_swarm_board(&session_id).await;
+        }
+        true
+    }
+
+    /// Remove a session's swarm board (and stop its subagents). Automation runs
+    /// use their run id as the board key and previously leaked one board per run.
+    pub async fn remove_swarm_board(&self, session_id: &str) -> bool {
+        let board = {
+            let mut map = self.swarm_boards.write().await;
+            map.remove(session_id)
+        };
+        if let Some(board) = board {
+            board.cancel_all_subagents().await;
+            true
+        } else {
+            false
+        }
     }
 
     pub async fn persist_session_record(&self, session_id: &str) {

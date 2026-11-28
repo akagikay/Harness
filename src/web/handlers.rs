@@ -452,6 +452,14 @@ pub fn spawn_session_turn(
             // spawned task below, so the drain loop and the terminal `Error`
             // emitters cannot own them.
             let event_tx_terminal = event_tx.clone();
+            // Snapshots of the conversation taken after every model round-trip.
+            // They make a mid-turn failure (stream error, cancellation, panic)
+            // survivable: the next turn keeps the tool calls and answers that
+            // already happened instead of restarting from an empty history.
+            // A remote execution server owns its own turn; it reports progress
+            // through events and never emits a snapshot here.
+            let (checkpoint_tx, mut checkpoint_rx) =
+                mpsc::unbounded_channel::<Vec<ChatMessage>>();
             let mut runner_handle = if let Some(remote_srv) = remote_primary {
                 let run_id = format!("run_{}_{}", session_id, chrono::Utc::now().timestamp_millis());
                 {
@@ -511,7 +519,10 @@ pub fn spawn_session_turn(
                 .with_cancel_notify(cancel_notify.clone())
                 .with_prior_messages(current_prior)
                 .with_task_attachments(current_attachments)
-                .with_steer_inbox(current_steer);
+                .with_steer_inbox(current_steer)
+                .with_context_checkpoint(move |snapshot| {
+                    let _ = checkpoint_tx.send(snapshot);
+                });
 
                 // Clone, do not move: the turn's terminal `Ok(Err)` / `Err` arms below still
                 // emit `Error` through this sender after the runner is spawned.
@@ -531,13 +542,27 @@ pub fn spawn_session_turn(
                 >,
             > = None;
             loop {
-                let evt = tokio::select! {
+                // The turn produces two kinds of output: agent events and
+                // mid-turn conversation snapshots. They are separated by type
+                // because a snapshot must not take the event path below (it is
+                // not a user-visible event).
+                enum TurnOutput {
+                    Event(HarnessEvent),
+                    Snapshot(Vec<ChatMessage>),
+                }
+                let step = tokio::select! {
                     biased;
                     maybe = event_rx.recv() => match maybe {
-                        Some(evt) => evt,
+                        Some(evt) => TurnOutput::Event(evt),
                         // The channel closed AND the runner already finished.
                         None => break,
                     },
+                    // Persist the mid-turn snapshot. This is the path that keeps
+                    // a failed turn's work: the `Ok(Err)` arm below breaks out
+                    // without saving `updated_msgs` (there are none), so without
+                    // this every message the runner produced before the failure
+                    // was lost.
+                    Some(snapshot) = checkpoint_rx.recv() => TurnOutput::Snapshot(snapshot),
                     // Taking the result here is what makes this safe: a JoinHandle
                     // may be polled to completion exactly once, so the terminal arm
                     // below must use `run_res` instead of awaiting the handle again
@@ -547,6 +572,22 @@ pub fn spawn_session_turn(
                         run_res = Some(joined);
                         break;
                     }
+                };
+                let evt = match step {
+                    TurnOutput::Snapshot(snapshot) => {
+                        let still_checkpointing = {
+                            let lock = state.sessions.read().await;
+                            lock.get(&session_id)
+                                .is_some_and(|s| Arc::ptr_eq(&s.cancel_notify, &cancel_notify))
+                        };
+                        // A rolled-back/undoed session must not be overwritten by
+                        // an in-flight snapshot from an older turn.
+                        if still_checkpointing {
+                            state.save_llm_messages(&session_id, snapshot).await;
+                        }
+                        continue;
+                    }
+                    TurnOutput::Event(evt) => evt,
                 };
                 let still_active = {
                     let lock = state.sessions.read().await;
@@ -996,6 +1037,13 @@ pub fn merge_config_update(existing: &HarnessConfig, incoming: HarnessConfig) ->
     // through the environment.
     merged.extra_access_roots = existing.extra_access_roots.clone();
     merged.update_repo = existing.update_repo.clone();
+    // The privileged shell is a security boundary, not a preference: it is
+    // enabled only through its dedicated endpoint (an explicit, confirmed
+    // action), never by a whole-config snapshot.
+    merged.allow_privileged_shell = existing.allow_privileged_shell;
+    // The remote-root allowlist defines what a client may reach on THIS server;
+    // a client-supplied config must not widen it.
+    merged.remote_root_allowlist = existing.remote_root_allowlist.clone();
     merged
 }
 
@@ -3589,12 +3637,101 @@ pub async fn server_info(State(state): State<AppState>) -> Json<serde_json::Valu
     }))
 }
 
+/// Roots a remote execution server is willing to grant a client-dispatched run.
+///
+/// The server owns its filesystem scope. A client root is granted only when it
+/// exists on this host AND is inside the server's sandbox, its own
+/// `extra_access_roots`, or its `remote_root_allowlist`. A root that exists but
+/// falls outside those is refused (never silently dropped), so a multi-folder
+/// project either works end-to-end or fails with an actionable message.
+pub fn resolve_remote_run_roots(
+    server_conf: &HarnessConfig,
+    requested: &[PathBuf],
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    let mut bases: Vec<PathBuf> = Vec::new();
+    for base in std::iter::once(&server_conf.sandbox_root)
+        .chain(server_conf.extra_access_roots.iter())
+        .chain(server_conf.remote_root_allowlist.iter())
+    {
+        if let Ok(canon) = std::fs::canonicalize(base) {
+            if !bases.iter().any(|b| b == &canon) {
+                bases.push(canon);
+            }
+        }
+    }
+    let mut granted: Vec<PathBuf> = Vec::new();
+    let mut missing: Vec<PathBuf> = Vec::new();
+    let mut denied: Vec<PathBuf> = Vec::new();
+    for root in requested {
+        match std::fs::canonicalize(root) {
+            Ok(canon) => {
+                if bases.iter().any(|base| canon.starts_with(base)) {
+                    if !granted.iter().any(|g| g == &canon) {
+                        granted.push(canon);
+                    }
+                } else if !denied.iter().any(|d| d == root) {
+                    denied.push(root.clone());
+                }
+            }
+            Err(_) => {
+                // A folder that does not exist on the server host cannot be
+                // used there; report it so the client can tell "different
+                // machine" apart from "not permitted".
+                if !missing.iter().any(|m| m == root) {
+                    missing.push(root.clone());
+                }
+            }
+        }
+    }
+    if !denied.is_empty() {
+        let identity = if server_conf.server_identity.trim().is_empty() {
+            "local"
+        } else {
+            server_conf.server_identity.trim()
+        };
+        return Err(format!(
+            "Execution server '{}' is not allowed to access {} on its host. \
+             Add the shared folder to the server's `remote_root_allowlist` (or \
+             `extra_access_roots`) and retry.",
+            identity,
+            denied
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Ok((granted, missing))
+}
+
 pub async fn start_server_run(
     State(state): State<AppState>,
     Json(payload): Json<crate::remote::RemoteRunRequest>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let run_id = payload.run_id.clone();
     let session_id = payload.session_id.clone();
+    // Release runs that finished more than 10 minutes ago (late SSE reconnects
+    // still work); without this the map and its histories grew forever.
+    state
+        .prune_finished_server_runs(Duration::from_secs(600))
+        .await;
+
+    // The client sends its project folders (and human-approved roots) in
+    // `config`. Decide which of them this server may actually grant BEFORE
+    // registering the run, so a refusal is a clear 409 rather than a run that
+    // silently loses folders.
+    let server_conf = state.config.read().await.clone();
+    let mut requested_roots: Vec<PathBuf> = payload.config.extra_access_roots.clone();
+    for project in &payload.config.projects {
+        for root in project.all_paths() {
+            if !requested_roots.iter().any(|r| r == &root) {
+                requested_roots.push(root);
+            }
+        }
+    }
+    let (granted_roots, missing_roots) = resolve_remote_run_roots(&server_conf, &requested_roots)
+        .map_err(|e| (StatusCode::CONFLICT, e))?;
+
     let (tx, _) = broadcast::channel(256);
     let cancel_notify = Arc::new(tokio::sync::Notify::new());
     let steer_inbox = Arc::new(TokioMutex::new(VecDeque::new()));
@@ -3611,9 +3748,11 @@ pub async fn start_server_run(
                 steer_inbox: steer_inbox.clone(),
                 event_tx: tx.clone(),
                 history: Vec::new(),
+                history_bytes: 0,
                 updated_messages: None,
                 final_answer: None,
                 error: None,
+                finished_at: None,
             },
         );
     }
@@ -3622,20 +3761,22 @@ pub async fn start_server_run(
     let _ = state.get_or_create_swarm(&session_id).await;
 
     let state_bg = state.clone();
+    let granted_for_task = granted_roots.clone();
     tokio::spawn(async move {
-        let server_conf = state_bg.config.read().await.clone();
         let mut run_conf = payload.config.clone();
         // Each execution server operates within its own configured sandbox workspace.
         run_conf.sandbox_root = server_conf.sandbox_root.clone();
         // SECURITY: the ONLY authoritative filesystem scope on this server is its
         // own. `payload.config` is client-supplied, so its `extra_access_roots`
-        // and `projects` would otherwise be folded straight into the runner's
-        // sandbox roots (`loop_runner.rs`) - which is exactly the list the file
-        // tools enforce. A client sending `extra_access_roots: ["C:\\"]` got
-        // full read/write on the server host (red-team verified: `list_dir` on
-        // the server's own out-of-sandbox folder returned success). Take both
-        // from the server's own config instead.
+        // and `projects` are never folded in verbatim. Client roots that passed
+        // `resolve_remote_run_roots` (existing AND inside the server's
+        // sandbox/allowlist) are added; everything else was already refused.
         run_conf.extra_access_roots = server_conf.extra_access_roots.clone();
+        for root in &granted_for_task {
+            if !run_conf.extra_access_roots.iter().any(|r| r == root) {
+                run_conf.extra_access_roots.push(root.clone());
+            }
+        }
         run_conf.projects = server_conf.projects.clone();
         if payload.read_only {
             run_conf.permissions.mode = crate::config::PermissionMode::ReadOnly;
@@ -3684,8 +3825,19 @@ pub async fn start_server_run(
             {
                 let mut runs = state_bg.server_runs.write().await;
                 if let Some(h) = runs.get_mut(&run_id) {
-                    if h.history.len() < 2000 {
-                        h.history.push(evt.clone());
+                    // Keep a bounded replay buffer for reconnecting SSE clients.
+                    // A long run can emit thousands of deltas; retaining them all
+                    // used to pin tens of MB per run for the life of the process.
+                    const MAX_HISTORY_EVENTS: usize = 500;
+                    const MAX_HISTORY_BYTES: usize = 4 * 1024 * 1024;
+                    if h.history.len() < MAX_HISTORY_EVENTS {
+                        let len = serde_json::to_string(&evt)
+                            .map(|s| s.len())
+                            .unwrap_or(0);
+                        if h.history_bytes + len <= MAX_HISTORY_BYTES {
+                            h.history_bytes += len;
+                            h.history.push(evt.clone());
+                        }
                     }
                     let _ = h.event_tx.send(evt);
                 }
@@ -3710,13 +3862,27 @@ pub async fn start_server_run(
                     h.error = Some(format!("Server run task panicked: {}", je));
                 }
             }
+            h.finished_at = Some(std::time::Instant::now());
         }
+        drop(runs);
+
+        // Release the run (and its swarm board) after the grace period instead
+        // of leaking it for the life of the server. The client has long since
+        // received `run_finished`; this only affects a late reconnect.
+        let cleanup = state_bg.clone();
+        let cleanup_run = run_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(610)).await;
+            cleanup.remove_server_run(&cleanup_run).await;
+        });
     });
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "run_id": payload.run_id,
-        "status": "running"
-    }))
+        "status": "running",
+        "granted_roots": granted_roots,
+        "missing_roots": missing_roots
+    })))
 }
 
 pub async fn stream_server_run_events(
@@ -3829,6 +3995,7 @@ pub async fn stop_server_run(
         h.cancel_notify.notify_one();
         if h.status == "running" {
             h.status = "stopped".to_string();
+            h.finished_at = Some(std::time::Instant::now());
         }
         h.session_id.clone()
     };
@@ -5017,8 +5184,11 @@ pub async fn db_optimize(
 pub async fn check_update(
     State(state): State<AppState>,
 ) -> Result<Json<crate::updater::UpdateInfo>, (StatusCode, String)> {
-    let repo = state.config.read().await.update_repo.clone();
-    let info = crate::updater::check(&repo, env!("CARGO_PKG_VERSION"))
+    let (repo, pin) = {
+        let conf = state.config.read().await;
+        (conf.update_repo.clone(), conf.update_pin_version.clone())
+    };
+    let info = crate::updater::check_pinned(&repo, env!("CARGO_PKG_VERSION"), &pin)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     state
@@ -5027,7 +5197,11 @@ pub async fn check_update(
             if info.available {
                 s.progress_phase(
                     crate::updater::UpdatePhase::Available,
-                    format!("v{} available", info.latest_version),
+                    if info.pinned {
+                        format!("v{} available (pinned)", info.latest_version)
+                    } else {
+                        format!("v{} available", info.latest_version)
+                    },
                 );
                 s.target_version = info.latest_version.clone();
                 s.html_url = info.html_url.clone();
@@ -5035,7 +5209,11 @@ pub async fn check_update(
             } else {
                 s.phase = crate::updater::UpdatePhase::UpToDate;
                 s.target_version = info.current_version.clone();
-                s.message = "Up to date".into();
+                s.message = if info.pinned {
+                    format!("Pinned to v{}", info.latest_version)
+                } else {
+                    "Up to date".into()
+                };
                 s.error = None;
                 s.percent = None;
                 s.downloaded_bytes = 0;
@@ -5058,14 +5236,18 @@ pub async fn update_status_handler(State(state): State<AppState>) -> Json<crate:
 pub async fn apply_update(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let repo = state.config.read().await.update_repo.clone();
-    let info = crate::updater::check(&repo, env!("CARGO_PKG_VERSION"))
+    let (repo, pin) = {
+        let conf = state.config.read().await;
+        (conf.update_repo.clone(), conf.update_pin_version.clone())
+    };
+    let info = crate::updater::check_pinned(&repo, env!("CARGO_PKG_VERSION"), &pin)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     if !info.available {
         return Ok(Json(serde_json::json!({
             "status": "up-to-date",
-            "version": info.current_version
+            "version": info.current_version,
+            "pinned": info.pinned,
         })));
     }
 
@@ -5084,7 +5266,7 @@ pub async fn apply_update(
     })))
 }
 
-/// `GET /api/security/status` — non-sensitive summary of the security posture.
+/// `GET /api/security/status` - non-sensitive summary of the security posture.
 pub async fn security_status(State(state): State<AppState>) -> Json<serde_json::Value> {
     let conf = state.config.read().await;
     Json(serde_json::json!({
@@ -5096,6 +5278,39 @@ pub async fn security_status(State(state): State<AppState>) -> Json<serde_json::
         "cors": "same-origin",
         "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+#[derive(Deserialize)]
+pub struct PrivilegedShellRequest {
+    pub enabled: bool,
+}
+
+/// `POST /api/security/privileged-shell` - explicitly opt in/out of the
+/// uncontained `bash` tool.
+///
+/// This is deliberately a dedicated endpoint rather than a config field:
+/// `POST /api/config` carries a whole snapshot, and a stale tab (or a replayed
+/// payload) must never silently hand the agent an unjailed shell. Toggling it
+/// re-registers the tool registry immediately, so no restart is needed.
+pub async fn set_privileged_shell(
+    State(state): State<AppState>,
+    Json(payload): Json<PrivilegedShellRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    {
+        let mut conf = state.config.write().await;
+        conf.allow_privileged_shell = payload.enabled;
+    }
+    state.bump_config_revision().await;
+    state.reload_plugins().await;
+    state.persist_config().await;
+    Ok(Json(serde_json::json!({
+        "allow_privileged_shell": payload.enabled,
+        "warning": if payload.enabled {
+            "The bash tool runs with full machine privileges and is NOT sandboxed."
+        } else {
+            ""
+        }
+    })))
 }
 // ============================================================================
 // Automations (first-class scheduled agent runs)

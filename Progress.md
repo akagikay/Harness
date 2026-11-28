@@ -8,8 +8,8 @@ Last updated: 2026-11-28 (round 5 findings applied + round 4 consolidated)
 
 ## Current state
 
-- **Version**: `1.1.4` (commit `e1d4020`, release built, not yet published)
-- **Tests**: 211 unit + 66 integration, all green
+- **Version**: `1.1.5` (v1.1.5 in progress: the six open items + 2 field-reported bugs)
+- **Tests**: 226 unit + 78 integration, all green
 - **Cluster topology** (for live testing): 1 client + 3 execution servers, each
   server in its own sandbox with a `ONLY-<name>.txt` marker file. 4 projects at
   4 scopes (3 single-folder + 1 multi-folder spanning all three).
@@ -478,3 +478,62 @@ Fix: the `select!` arm takes the result into `run_res`, and the terminal arm use
 - A corrupt main DB exits with no recovery path.
 - The updater only ever upgrades: no downgrade or version pin.
 - Permission counter is per model round-trip rather than per turn.
+
+## v1.1.5 IN PROGRESS (2026-11-28) - the six open items above
+
+All six are implemented; regression tests added for each. Details:
+
+1. **`bash` is now opt-in (default OFF).** New `HarnessConfig::allow_privileged_shell`
+   (seeded by `HARNESS_ALLOW_PRIVILEGED_SHELL=1`). `PluginRegistry::register_defaults`
+   only registers `BashPlugin` when it is set, and the system prompt now lists the
+   tools that are ACTUALLY registered instead of a hardcoded string (a prompt that
+   named `bash` when it was absent sent the model after a tool that could never run).
+   Toggling is a dedicated `POST /api/security/privileged-shell` (never the bulk
+   config endpoint: a stale tab must not silently hand over an unjailed shell),
+   which re-registers the registry immediately. `merge_config_update` pins it.
+   Affected tests updated to opt in explicitly.
+2. **Remote dispatch has an explicit root contract.** New `resolve_remote_run_roots`
+   (`src/web/handlers.rs`): the server grants a client root only when the path
+   exists on ITS host AND is inside its sandbox / `extra_access_roots` /
+   new `remote_root_allowlist`. A path that exists but is outside those is
+   refused with **409** plus an actionable message - never silently dropped
+   (the old behaviour), and never trusted from the client payload.
+   `start_server_run` returns `granted_roots`/`missing_roots`.
+3. **`server_runs` is pruned; boards are released.** `ServerRunHandle` now records
+   `finished_at`; `prune_finished_server_runs(max_age)` removes stale runs AND their
+   swarm boards (cancelling their subagents). `is_idle` no longer treats a
+   finished run as busy. History is capped (500 events / 4 MiB) instead of 2000
+   unbounded events; a delayed cleanup task releases the run and board after the
+   grace period. Automation runs now call `remove_swarm_board(run_id)`.
+4. **A corrupt DB is quarantined, not fatal.** `HarnessDb::open` detects SQLite
+   corruption text, renames the file (plus `-wal`/`-shm`) to
+   `harness.db.corrupt-<timestamp>` in place - nothing is deleted, and the master
+   key file is untouched so a later recovery still decrypts - then creates a fresh
+   DB and logs loudly. `is_corruption_message` / `quarantine_corrupt_db` are unit-tested.
+5. **The updater can downgrade and pin.** `update_pin_version`
+   (`HARNESS_UPDATE_PIN`, `--update-pin`); `check_pinned`/`update_now_pinned` use
+   the `/releases/tags/{v,}` endpoint and treat a pinned release as authoritative
+   (installed even when older). `UpdateInfo.pinned` drives "Pinned to vX" status.
+   Auto-update reads the pin from live config every pass.
+6. **The permission counter is per turn again.** `turn_permission_denials` moved out
+   of the per-model-round-trip scope in `loop_runner.rs`, so the fail-fast cap
+   spans the whole turn while approvals still never accumulate.
+
+### Two EXTRA field-reported bugs fixed in the same round
+
+- **"Missing memory" after a model stream error.** `spawn_session_turn` only
+  persisted conversation messages on the `Ok(Ok(...))` arm, so a turn that died on
+  `error decoding response body` discarded every tool call and answer it had made;
+  the follow-up "continue" started from an empty history. `AgentLoopRunner` now
+  snapshots the context after every round-trip (`with_context_checkpoint`) and the
+  turn loop persists each snapshot (guarded by the cancel/undo pointer check, so a
+  rolled-back session is never resurrected). Regression test:
+  `test_a_failed_turn_keeps_the_work_it_already_did`.
+- **A skill was auto-routed on a ghost prefix match.** `reviewer`'s trigger `diff`
+  prefix-matched the stem of "different", so a tower-defense game prompt routed to
+  the reviewer skill (confidence 0.37) and redirected the run. Keywords shorter
+  than 5 characters must now match a stem exactly. Regression tests:
+  `test_skill_router_does_not_prefix_match_short_keywords`,
+  `test_auto_skill_directives_are_not_injected_for_a_weak_match`.
+
+Test status: 226 unit + 78 integration, all green.

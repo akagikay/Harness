@@ -519,6 +519,10 @@ impl AppState {
                 }
             }
             state.persist_config().await;
+            // A detached run keys its SwarmBoard by the run id (there is no
+            // conversation). Without this, every scheduled run leaked one board
+            // (and its message history) for the life of the process.
+            state.remove_swarm_board(&run_id).await;
             {
                 let mut runs = state.automation_runs.lock().await;
                 runs.release(&automation.id, &run_id);
