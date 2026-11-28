@@ -1513,6 +1513,70 @@ mod ui_structure_tests {
 /// event handler may exist anywhere in the UI - the shipped HTML *or* the
 /// template strings app.js injects through `innerHTML`. They are all wired
 /// through the delegated `data-*` listener block at the bottom of app.js.
+    /// The two operator knobs v1.1.5 added must be reachable from the UI.
+    ///
+    /// Both shipped with no surface at all: the only way to enable the uncontained
+    /// `bash` tool was `curl`, and a version pin (a rollback) could only be set by
+    /// editing the config file. A capability nobody can find is not a control.
+    #[test]
+    fn security_settings_expose_the_privileged_shell_and_the_update_pin() {
+        assert!(
+            INDEX_HTML.contains(r#"data-settings-tab="security""#),
+            "the settings rail needs a Security page for the privileged-shell switch"
+        );
+        assert!(
+            INDEX_HTML.contains(r#"id="settings-page-security""#),
+            "the Security page container is missing"
+        );
+        assert!(
+            INDEX_HTML.contains(r#"id="cfg-privileged-shell""#),
+            "the privileged-shell toggle is missing"
+        );
+        assert!(
+            INDEX_HTML.contains(r#"id="privileged-shell-warning""#),
+            "the not-sandboxed warning must be shown with the toggle, not hidden"
+        );
+        assert!(
+            INDEX_HTML.contains(r#"id="cfg-update-pin""#),
+            "the update-version pin field is missing"
+        );
+        // The switch must be wired to its dedicated endpoint, NOT to the bulk
+        // config snapshot (a stale tab must not silently hand over an unjailed shell).
+        assert!(
+            APP_JS.contains("/api/security/privileged-shell"),
+            "the toggle must round-trip through POST /api/security/privileged-shell"
+        );
+        assert!(APP_JS.contains("cfgPrivilegedShell"), "the toggle has no JS wiring");
+        assert!(APP_JS.contains("cfgUpdatePin"), "the pin field has no JS wiring");
+        // A refused toggle must not leave the switch lying about the state.
+        assert!(
+            APP_JS.contains("syncPrivilegedShellUi(!next)"),
+            "a failed toggle has to restore the previous state instead of claiming success"
+        );
+    }
+
+    /// A settings page the rail cannot reach is invisible, so every
+    /// `data-settings-tab` must have a matching page container.
+    #[test]
+    fn every_settings_tab_has_a_page() {
+        let html = strip_comments(INDEX_HTML);
+        let mut tabs = 0usize;
+        for line in html.lines() {
+            if let Some(idx) = line.find(r#"data-settings-tab=""#) {
+                let rest = &line[idx + r#"data-settings-tab=""#.len()..];
+                if let Some(end) = rest.find('"') {
+                    let tab = &rest[..end];
+                    tabs += 1;
+                    assert!(
+                        html.contains(&format!(r#"id="settings-page-{tab}""#)),
+                        "settings tab '{tab}' has no #settings-page-{tab} container"
+                    );
+                }
+            }
+        }
+        assert!(tabs >= 8, "expected the settings tabs to be discovered, got {tabs}");
+    }
+
     #[test]
     fn ui_carries_no_inline_event_handlers() {
         for handler in [

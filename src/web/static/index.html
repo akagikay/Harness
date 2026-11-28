@@ -709,6 +709,10 @@
                         <span class="settings-nav-icon">✨</span>
                         <span>Skills &amp; Automations</span>
                     </button>
+                    <button type="button" class="settings-nav-item" data-settings-tab="security" role="tab">
+                        <span class="settings-nav-icon">&#9679;</span>
+                        <span>Security</span>
+                    </button>
                 </aside>
 
                 <div class="settings-pages-pane">
@@ -850,6 +854,33 @@
                                 <button type="button" class="btn-secondary btn-small" id="btn-check-update-now">Check for updates</button>
                             </div>
                         </div>
+                        <div class="form-grid" style="margin-top:10px;">
+                            <div class="form-group">
+                                <label for="cfg-update-pin">Pin updates to a version</label>
+                                <input type="text" id="cfg-update-pin" class="form-input" placeholder="empty = follow the latest release" autocomplete="off" spellcheck="false">
+                                <p class="form-hint">Installs exactly this release, even when it is older than the running build (a rollback). Leave empty to follow <code>latest</code>.</p>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- PAGE 1b: SECURITY (privileged shell, scope) -->
+                    <section class="settings-page hidden" id="settings-page-security">
+                        <div class="settings-page-header">
+                            <h4>Security & Privileges</h4>
+                        </div>
+                        <div class="settings-toggles-row">
+                            <label class="settings-toggle-card ui-switch-row" title="Register the uncontained bash tool. A shell can read any file the Harness process can, including its own encryption key and database.">
+                                <span class="ui-switch">
+                                    <input type="checkbox" id="cfg-privileged-shell">
+                                    <span class="ui-switch-track"><span class="ui-switch-thumb"></span></span>
+                                </span>
+                                <span>Enable the privileged <code>bash</code> tool</span>
+                            </label>
+                        </div>
+                        <div class="settings-warning-card" id="privileged-shell-warning" role="note">
+                            <strong>Not sandboxed.</strong> The <code>bash</code> tool runs a real shell with this machine's full privileges: it can read <code>harness.key</code>, the database, and every file the Harness process can open. File tools stay inside the workspace; <code>bash</code> does not. Enable it only when you trust the agent with the whole machine.
+                        </div>
+                        <p class="form-hint">The tool list the agent sees updates immediately - no restart needed.</p>
                     </section>
 
                     <!-- PAGE 2: AI PROVIDERS -->

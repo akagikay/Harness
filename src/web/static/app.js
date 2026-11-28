@@ -458,6 +458,31 @@ const cfgSummarizeCompactedTurns = document.getElementById('cfg-summarize-compac
 const cfgVoiceActivityDetection = document.getElementById('cfg-voice-activity-detection');
 const cfgAutoUpdateCheck = document.getElementById('cfg-auto-update-check');
 const cfgAutoUpdateApply = document.getElementById('cfg-auto-update-apply');
+const cfgUpdatePin = document.getElementById('cfg-update-pin');
+const cfgPrivilegedShell = document.getElementById('cfg-privileged-shell');
+
+/// The privileged `bash` tool is a security boundary, not a preference, so it is
+/// NOT written through the bulk config snapshot (a stale tab must not silently
+/// hand the agent an unjailed shell). It round-trips through its own endpoint.
+function syncPrivilegedShellUi(enabled) {
+    const state = Boolean(enabled);
+    if (cfgPrivilegedShell) cfgPrivilegedShell.checked = state;
+    const warn = document.getElementById('privileged-shell-warning');
+    if (warn) {
+        warn.classList.toggle('hidden', !state);
+        warn.setAttribute('aria-hidden', state ? 'false' : 'true');
+    }
+}
+
+async function setPrivilegedShell(next) {
+    const res = await fetch('/api/security/privileged-shell', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next })
+    });
+    if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
+    return res.json();
+}
 const cfgAutoSkillRouter = document.getElementById('cfg-auto-skill-router');
 const cfgSkillRouterConfidence = document.getElementById('cfg-skill-router-confidence');
 const cfgSkillRouterMax = document.getElementById('cfg-skill-router-max');
@@ -1808,6 +1833,43 @@ document.addEventListener('DOMContentLoaded', () => {
                         : 'Harness will only notify about new releases.',
                     'info'
                 );
+            }
+        });
+    }
+    if (cfgUpdatePin) {
+        cfgUpdatePin.addEventListener('change', () => {
+            if (!currentConfig) return;
+            const raw = (cfgUpdatePin.value || '').trim().replace(/^v/i, '');
+            currentConfig.update_pin_version = /^[0-9][0-9A-Za-z.\-+]*$/.test(raw) ? raw : '';
+            cfgUpdatePin.value = currentConfig.update_pin_version;
+            persistDisplayVerbosityConfig();
+            showToast(
+                currentConfig.update_pin_version
+                    ? `Updates pinned to v${currentConfig.update_pin_version} (older versions install too).`
+                    : 'Update pin cleared - following the latest release.',
+                currentConfig.update_pin_version ? 'info' : 'success'
+            );
+        });
+    }
+    if (cfgPrivilegedShell) {
+        cfgPrivilegedShell.addEventListener('change', async () => {
+            const next = cfgPrivilegedShell.checked;
+            cfgPrivilegedShell.disabled = true;
+            try {
+                const out = await setPrivilegedShell(next);
+                syncPrivilegedShellUi(out.allow_privileged_shell === true);
+                showToast(
+                    next
+                        ? 'The privileged bash tool is ENABLED. It runs with full machine privileges and is not sandboxed.'
+                        : 'The privileged bash tool is disabled. File tools stay inside the workspace.',
+                    next ? 'warning' : 'success'
+                );
+            } catch (e) {
+                // A refused toggle must not leave the switch lying about the state.
+                syncPrivilegedShellUi(!next);
+                showToast('Could not change the bash tool: ' + e.message, 'error');
+            } finally {
+                cfgPrivilegedShell.disabled = false;
             }
         });
     }
@@ -9451,6 +9513,8 @@ async function loadConfig() {
         if (cfgVoiceActivityDetection) cfgVoiceActivityDetection.checked = Boolean(currentConfig.voice_activity_detection);
         if (cfgAutoUpdateCheck) cfgAutoUpdateCheck.checked = currentConfig.auto_update_check !== false;
         if (cfgAutoUpdateApply) cfgAutoUpdateApply.checked = currentConfig.auto_update_apply !== false;
+        if (cfgUpdatePin) cfgUpdatePin.value = currentConfig.update_pin_version || '';
+        syncPrivilegedShellUi(currentConfig.allow_privileged_shell === true);
         // Automatic skill routing (defaults on).
         if (cfgAutoSkillRouter) cfgAutoSkillRouter.checked = currentConfig.auto_skill_router !== false;
         if (cfgSkillRouterConfidence) {

@@ -3910,6 +3910,35 @@ body.sidebar-is-collapsed .sidebar-expand-btn {
 .form-group { display: flex; flex-direction: column; gap: 5px; }
 .form-group label { font-size: 0.77rem; font-weight: 500; color: var(--text-secondary); }
 .form-hint { font-size: 0.72rem; color: var(--text-dim); }
+.form-hint code {
+    font-family: var(--mono-font, ui-monospace, "Cascadia Code", monospace);
+    font-size: 0.95em;
+    padding: 0 3px;
+    border-radius: 3px;
+    background: rgba(255, 255, 255, 0.07);
+}
+
+/* The "not sandboxed" notice under the privileged-shell switch. It must read as a
+   warning, not as another settings row, because this toggle is a security boundary. */
+.settings-warning-card {
+    margin-top: 10px;
+    padding: 10px 12px;
+    border: 1px solid rgba(255, 176, 32, 0.45);
+    border-left: 3px solid #ffb020;
+    border-radius: 8px;
+    background: rgba(255, 176, 32, 0.09);
+    color: #ffd79a;
+    font-size: 0.75rem;
+    line-height: 1.5;
+}
+.settings-warning-card strong { color: #ffb020; }
+.settings-warning-card code {
+    font-family: var(--mono-font, ui-monospace, "Cascadia Code", monospace);
+    font-size: 0.95em;
+    padding: 0 3px;
+    border-radius: 3px;
+    background: rgba(0, 0, 0, 0.25);
+}
 .label-with-action { display: flex; justify-content: space-between; align-items: center; }
 .btn-text-action { background: none; border: none; color: var(--accent-blue); font-size: 0.75rem; font-weight: 600; cursor: pointer; }
 .btn-text-action:hover { text-decoration: underline; }
