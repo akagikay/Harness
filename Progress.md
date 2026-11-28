@@ -581,3 +581,67 @@ contract, DB quarantine, updater pin, plus the classics), architecture
 (trust-boundary map, the checkpoint cost, dead-code delete list, feature
 verdicts). Reports land in `.harness_reports/round8-*.md` (gitignored) and are
 consolidated here by the orchestrator, which is the only editor.
+
+### Round 8 results - APPLIED in `6fc28a7` (+ `2dfcf23`, `bab9f7c`, `d41e4f6`)
+
+Red team: 2 HIGH, 5 MEDIUM, 4 LOW. Functional QA: 3 P0, 2 P1, 6 P2. UX critic:
+3 P0, 2 P1. All three reported; the HIGH/MEDIUM/P0/P1 set is fixed.
+
+| Finding | Fix |
+|---|---|
+| **H1** a remote run inherited the *client's* permission policy, so a token holder could dispatch `yolo` and have every tool - `bash` included - auto-approved on the server host with no prompt | `permissions`, the resource caps, `knowledge_only` and `mcp_servers` are server-owned; `permission_mode_is_looser` refuses anything looser than the server's. The model/provider surface stays client-owned by design (the client holds the subscription) |
+| **H2** `run_id` is client-chosen and `runs.insert` overwrote unconditionally: a colliding id destroyed the victim's result, messages and cancellation token | a collision is a 409; `server_info` now reports the effective `permission_mode` and `privileged_shell` so a dispatched run's posture is auditable |
+| **M2/M1** one `POST /api/config` could flip the whole harness to yolo, blank/plant the bearer token, or plant an update pin (authoritative: old pin = silent downgrade, equal pin = update suppression) | `permissions`, `update_pin_version` and `auth_token` are server-owned; rotation moves to `POST /api/security/token` (an empty token is refused, not a way to disable auth); `is_valid_version_pin` fails closed instead of interpolating a pin into the GitHub API path |
+| **M6** a cross-origin state-changing request was only blocked by an accident (the `Json` extractor's content-type check forcing an unanswered preflight) | `cross_origin_state_change` in the middleware refuses an `Origin`/`Sec-Fetch-Site` that is not this server |
+| **M3** an SSE stream whose run handle disappeared never ended: the `Closed` arm found no terminal status, fell through, and the task spun at ~4 Hz holding the `server_runs` read lock for the life of the process | the timeout arm and the close arm are separated; a stream ends on a terminal status OR a genuinely gone handle. **This fix was wrong twice before it was right** - see below |
+| **QA P0** the mid-turn checkpoint fired between the assistant `tool_calls` push and its `tool` replies, so a turn that died one round later persisted a dangling pair: strict providers answer the next request with `HTTP 400 messages with role 'tool' must be a response to a preceding message with 'tool_calls'`, and the bad pair was written back to the DB, wedging the session permanently | `sanitize_checkpoint_messages` keeps only tool_calls that have replies and drops orphan replies; a second checkpoint after the tool loop captures the completed pair |
+| **QA P1** only `extra_access_roots` should be requested from the client config | requesting the whole `projects` registry validated unrelated folders (the default project beside the exe, every project the client knows) and refused the run for folders it never touches |
+
+**The two self-inflicted bugs worth remembering.** Both were mine, introduced while
+fixing M3, and both were caught by tests that already existed:
+
+1. My first M3 attempt merged the 250ms *timeout* arm into the close arm, so any
+   stream that had been idle for a quarter-second ended. That was caught by
+   `test_client_server_split_orchestrator_spawns_subagents_on_remote_servers`
+   (live-since-v1.1.5) going from "completed" to "closed event stream before
+   completion".
+2. My second attempt moved the terminal-status lookup into the close arm only. But
+   a finished run keeps its handle - and therefore its broadcast sender - for the
+   610s reconnect grace period, so the sender never reports Closed on the normal
+   path and the stream never ended at all. Same test, "running" forever.
+
+The lesson recorded here: a stream's lifetime rule has three distinct cases (event
+flowing, run finished-but-handle-alive, handle gone), and the second is the one the
+original code handled correctly by accident of the loop structure.
+
+Also fixed this round, found by my own browser pass: the Settings hub's
+responsive overrides sat ~700 lines ABOVE the base `.settings-*` rules, so on any
+viewport under 64em the base `flex-direction: column` won and the hub rendered as a
+396px rail stacked above a 57px page pane - the whole modal a letterbox
+(`2dfcf23`). And a PowerShell `Set-Content -Encoding UTF8` re-encode mangled six
+em-dashes and the 📁 default icon literal into mojibake; all repaired byte-exactly
+from the release blob.
+
+Current status: **237 unit + 85 integration, all green.**
+
+### Still open from round 8 (next round's scope)
+
+- UX P0-1: a zombie "running" session after a fast-failing turn (no/invalid
+  provider key) - the first prompt fails server-side, `stream_session_events`
+  never replays history, and the optimistic `setSessionRunning(true)` is never
+  cleared, so the UI spins forever with no error rendered.
+- UX P0-2: permission approvals vanish on reload, and a 120s timeout renders as
+  "✕ Denied" (nothing was denied) with the run completing silently without the
+  tool.
+- UX P0-3: a stale approval badge after Stop - the terminal-Error path never calls
+  `clearAllPendingPermissions()`.
+- UX P1: a11y (no focus trap in any modal; sub-AA contrast on `--text-dim`, the
+  active settings tab, and session titles), and fresh installs default to
+  unattended auto-install contrary to the README.
+- QA P2 cluster: corrupt-DB quarantine loses the `-wal`/`-shm` sidecars before it
+  can rename them; `missing_roots` is computed and then thrown away by the client;
+  `/api/security/status` hides all three new security surfaces; the prompt lists
+  `mcp_google_ai_search_search` twice; a 0-byte DB silently starts fresh.
+- Red-team M4: `/api/filesystem/*` mutates and lists arbitrary absolute paths with
+  no sandbox check.
+- Red-team M5/L1/L2/L3/L4 as cleanup.
