@@ -645,3 +645,43 @@ Current status: **237 unit + 85 integration, all green.**
 - Red-team M4: `/api/filesystem/*` mutates and lists arbitrary absolute paths with
   no sandbox check.
 - Red-team M5/L1/L2/L3/L4 as cleanup.
+
+### Round 8 architecture report - APPLIED in `9b1b930`
+
+The architecture critic confirmed the two CRITICALs (already fixed) and added three
+HIGH items, all now fixed:
+
+| Finding | Fix |
+|---|---|
+| **HIGH** `remote_root_allowlist` was unreachable by any operator: no flag, no env var, no UI, and `POST /api/config` pins it - while the 409 error told the operator to change exactly that | `HARNESS_REMOTE_ROOT_ALLOWLIST` (OS-separated) + a repeatable `--remote-allow <PATH>`, both in `--help`. Verified live: the allowlisted folder now returns 200 with `granted_roots` instead of 409 |
+| **HIGH** the checkpoint channel was `mpsc::unbounded_channel` - the one place a long conversation allocates without limit, since every round-trip clones the whole history into it | bounded at 32 with `try_send`: a full queue drops a snapshot instead of stalling a turn or growing without bound |
+| **HIGH** no global subagent cap: `max_depth` x the per-batch cap of 8 is a 584-runner fan-out on one machine, and nothing consulted the running count | new `max_active_subagents` (default 32), enforced in the spawn path with a "wait for the current wave" message |
+
+**237 unit + 87 integration, all green.**
+
+### Remaining round-8 backlog (ordered by what a user hits first)
+
+1. **UX P0-1** the zombie "running" session: with no/invalid provider key (the
+   default fresh-install state) the first prompt fails server-side, the stream
+   never replays history, and `setSessionRunning(true)` is never cleared - the UI
+   spins forever with no error. Reproduced 3x live.
+2. **UX P0-2** approvals vanish on reload (the reload lands on the welcome screen
+   with no badge/card) and a 120s timeout renders as "✕ Denied" when nothing was
+   denied, with the run completing silently without the tool.
+3. **UX P0-3** a stale approval badge after Stop: the terminal-Error path never
+   calls `clearAllPendingPermissions()`, so the badge claims "N awaiting approval"
+   for a dead prompt whose Approve click 404s.
+4. **Red-team M4** `/api/filesystem/*` mutates and lists arbitrary absolute paths
+   with no sandbox check (a picker-by-design, but `create_directory`/`rename_path`/
+   `delete_path` are mutations).
+5. **UX P1** a11y (no focus trap in any modal; sub-AA contrast on `--text-dim`,
+   the active settings tab, and session titles) and fresh installs default to
+   unattended auto-install contrary to the README.
+6. **QA P2 cluster** corrupt-DB quarantine loses the `-wal`/`-shm` sidecars before
+   it can rename them; `missing_roots` is computed and then thrown away by the
+   client; `/api/security/status` hides all three new security surfaces; the
+   prompt lists `mcp_google_ai_search_search` twice; a 0-byte DB silently starts
+   fresh.
+7. **Red-team L1-L4** quarantine suffix collision (1000 attempts, then startup
+   aborts), the alternating-pin install loop, a missing `Host` bypassing the
+   rebinding guard, and `get_artifact` skipping the secret denylist.
