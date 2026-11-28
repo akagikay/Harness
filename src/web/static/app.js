@@ -6148,7 +6148,16 @@ function connectEventStream(sessionId) {
     es.onmessage = (e) => {
         try {
             const evt = JSON.parse(e.data);
-            handleHarnessEvent(evt);
+            // The server replays the stored history when a stream is opened, so a
+            // client that attaches to an already-finished (or approval-blocked)
+            // session still sees the Error event and the permission card instead of
+            // spinning on its own optimistic flag forever. `__replay` keeps those
+            // events from double-rendering what the client already drew.
+            if (evt && evt.__replay && evt.event) {
+                handleHarnessEvent(evt.event, true);
+            } else {
+                handleHarnessEvent(evt);
+            }
         } catch (_) {}
     };
 

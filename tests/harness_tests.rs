@@ -8300,3 +8300,65 @@ async fn test_the_global_subagent_cap_is_enforced() {
 }
 
 
+
+/// P0-1: a session whose turn already FAILED never closed its event stream, so
+/// the client's optimistic "running" flag was never cleared and the UI spun
+/// forever with no error rendered. The terminal status must close the stream, and
+/// the stored history must be replayed so the Error event actually arrives.
+#[tokio::test]
+async fn test_a_finished_session_closes_its_stream_and_replays_history() {
+    use deepseek_harness_rs::engine::events::HarnessEvent;
+
+    let temp_dir = std::env::temp_dir().join(format!("harness-r9-sse-{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+    let mut cfg = HarnessConfig::default();
+    cfg.sandbox_root = temp_dir.clone();
+    cfg.auth_token = String::new();
+    let state = AppState::new(cfg);
+    let id = "ses-r9-failed".to_string();
+    state
+        .create_session_with_options(id.clone(), "will fail".into(), "project".into(), None, None, None, "failed")
+        .await;
+    // The recorded error is the thing the client needs to see.
+    state
+        .append_session_event(
+            &id,
+            HarnessEvent::Error {
+                message: "Model request failed: error decoding response body".to_string(),
+                fatal: true,
+            },
+        )
+        .await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/api/sessions/{id}/events"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    // The stream must TERMINATE on its own for a terminal session, and it must
+    // carry the recorded error before it does.
+    let body = tokio::time::timeout(Duration::from_secs(5), async {
+        resp.text().await.map_err(|e| e.to_string())
+    })
+    .await
+    .expect("a terminal session's stream must end, not hang open forever")
+    .expect("reading the stream body");
+    assert!(
+        body.contains("Model request failed"),
+        "the replayed history must deliver the Error event: {body}"
+    );
+    assert!(
+        body.contains("__replay"),
+        "replayed events are marked so the client dedups them: {body}"
+    );
+
+    srv.abort();
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}

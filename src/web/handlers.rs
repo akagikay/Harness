@@ -876,16 +876,67 @@ pub async fn stream_session_events(
     let lock = state.sessions.read().await;
     let session = lock.get(&id).ok_or(StatusCode::NOT_FOUND)?;
     let rx = session.event_tx.subscribe();
+    // Replay the stored history first. Two reasons, both P0s filed this round:
+    // a client that attaches to a session whose turn ALREADY failed never saw the
+    // Error event, so it kept spinning on its own optimistic "running" flag with
+    // no error rendered anywhere; and a reload in the middle of an approval lost
+    // the permission card because it only existed in the live stream. The history
+    // is the source of truth, so seeding from it makes both cases work.
+    // `replay` markers keep the client from double-rendering its own optimistic
+    // bubble: the client tags its sent message locally and skips replayed ones.
+    let replay: VecDeque<HarnessEvent> = session.history.iter().cloned().collect();
 
-    let stream = stream::unfold(rx, |mut rx| async move {
+    let state_c = state.clone();
+    let id_c = id.clone();
+
+    struct SessionStreamState {
+        rx: broadcast::Receiver<HarnessEvent>,
+        pending: VecDeque<HarnessEvent>,
+        state: AppState,
+        session_id: String,
+    }
+
+    let init = SessionStreamState {
+        rx,
+        pending: replay,
+        state: state_c,
+        session_id: id_c,
+    };
+
+    let stream = stream::unfold(init, |mut st| async move {
+        if let Some(evt) = st.pending.pop_front() {
+            // Mark replayed events so the client renders them as history (dedup
+            // against what it already drew) instead of as fresh live events.
+            let json_data = serde_json::json!({ "__replay": true, "event": evt }).to_string();
+            return Some((Ok(Event::default().data(json_data)), st));
+        }
         loop {
-            match rx.recv().await {
-                Ok(event) => {
+            match tokio::time::timeout(Duration::from_millis(250), st.rx.recv()).await {
+                Ok(Ok(event)) => {
                     let json_data = serde_json::to_string(&event).unwrap_or_default();
-                    return Some((Ok(Event::default().data(json_data)), rx));
+                    return Some((Ok(Event::default().data(json_data)), st));
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                // No event within the poll window. If the session has reached a
+                // terminal status there is nothing left to send - the terminal
+                // event is broadcast before the status flip - so end the stream.
+                // Without this the EventSource stayed open forever on an
+                // open-ended broadcast sender, which is exactly why a failed turn
+                // left the UI spinning: no close event ever reached the client to
+                // clear its optimistic state.
+                Err(_) => {
+                    let terminal = {
+                        let lock = st.state.sessions.read().await;
+                        lock.get(&st.session_id)
+                            .map(|s| !matches!(s.status.as_str(), "running"))
+                            .unwrap_or(true)
+                    };
+                    if terminal {
+                        return None;
+                    }
+                    continue;
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return None,
             }
         }
     });
