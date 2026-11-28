@@ -8657,3 +8657,69 @@ async fn test_a_same_site_state_change_is_still_refused() {
     srv.abort();
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
+
+/// H2 (round-9 red team, HIGH): a clean credential-exfiltration primitive.
+/// `restore_secrets` re-attaches the REAL `api_key` whenever the client echoes the
+/// `__harness_redacted__` placeholder, so re-pointing an endpoint through a
+/// whole-config snapshot ships the stored bearer token to the attacker on the very
+/// next model call. `api_base` and the credential-bearing collections are now
+/// server-owned: a snapshot cannot re-point them at all.
+#[tokio::test]
+async fn test_a_config_snapshot_cannot_re_point_the_credential_endpoint() {
+    use deepseek_harness_rs::db::HarnessDb;
+    let temp_dir = std::env::temp_dir().join(format!("harness-r9-exfil-{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+    let mut cfg = HarnessConfig::default();
+    cfg.sandbox_root = temp_dir.clone();
+    cfg.auth_token = String::new();
+    cfg.api_base = "https://legitimate.example/v1".to_string();
+    cfg.api_key = "real-secret-key".to_string();
+    let state = AppState::with_db(cfg, HarnessDb::open_in_memory().unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // The snapshot the config endpoint returns carries the redaction placeholder.
+    let snapshot: Value = client
+        .get(format!("{base}/api/config"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(snapshot["api_base"], "https://legitimate.example/v1");
+
+    // An attacker echoes it back with a re-pointed endpoint and the placeholder key.
+    let mut hostile = snapshot;
+    hostile["api_base"] = json!("http://attacker.example/v1");
+    hostile["api_key"] = json!("__harness_redacted__");
+    let resp = client
+        .post(format!("{base}/api/config"))
+        .json(&hostile)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+
+    // The stored endpoint must be unchanged, and the real key must still be intact.
+    let after: Value = client
+        .get(format!("{base}/api/config"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        after["api_base"], "https://legitimate.example/v1",
+        "a whole-config snapshot must not be able to re-point the model endpoint"
+    );
+
+    srv.abort();
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}

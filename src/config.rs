@@ -1012,8 +1012,20 @@ impl HarnessConfig {
     /// DB-persisted config when the operator explicitly set them at startup. A field is
     /// considered operator-provided when it differs from `HarnessConfig::default()`
     /// (defaults read the same env vars in-process, so unset env values compare equal).
-    pub const OPERATOR_OVERRIDE_FIELDS: &'static [&'static str] =
-        &["sandbox_root", "model", "api_key", "api_base", "provider"];
+    pub const OPERATOR_OVERRIDE_FIELDS: &'static [&'static str] = &[
+        "sandbox_root",
+        "model",
+        "api_key",
+        "api_base",
+        "provider",
+        // Server-owned security surfaces seeded from the CLI/env. Without these
+        // two, `--remote-allow` / `--update-pin` were a no-op on every machine
+        // that had ever run once: the DB row replaced the whole config and the
+        // operator's flag evaporated - and an over-broad allowlist entry the
+        // operator had tried to remove could never be taken back out.
+        "remote_root_allowlist",
+        "update_pin_version",
+    ];
 
     /// Merge operator-provided (CLI/env) values from `incoming` over the DB-persisted `base`.
     /// `defaults` is a `HarnessConfig::default()` snapshot used to detect which `incoming`
@@ -1033,6 +1045,21 @@ impl HarnessConfig {
         }
         if incoming.provider != defaults.provider {
             self.provider = incoming.provider.clone();
+        }
+        // Union, not replace: the operator's flag ADDS a root the server may grant
+        // a client-dispatched run. It never silently drops a root the operator
+        // saved through the API, and an explicit override always wins.
+        if incoming.remote_root_allowlist != defaults.remote_root_allowlist {
+            let mut merged = incoming.remote_root_allowlist.clone();
+            for root in &self.remote_root_allowlist {
+                if !merged.iter().any(|r| r == root) {
+                    merged.push(root.clone());
+                }
+            }
+            self.remote_root_allowlist = merged;
+        }
+        if incoming.update_pin_version != defaults.update_pin_version {
+            self.update_pin_version = incoming.update_pin_version.clone();
         }
     }
 
@@ -1540,3 +1567,44 @@ mod subagent_effort_tests {
         assert_eq!(cfg.subagent_thinking_effort, "step_down");
     }
 }
+
+    /// H3 (round-9 red team, HIGH): `--remote-allow` / `--update-pin` were a no-op on
+    /// every machine that had ever run once - the DB row replaced the whole config and
+    /// the operator's flag evaporated, so an over-broad allowlist entry could never be
+    /// taken back out. Both are operator-override fields now.
+    #[test]
+    fn the_cli_remote_allowlist_and_pin_survive_a_persisted_config() {
+        let defaults = HarnessConfig::default();
+        let mut db_config = defaults.clone();
+        db_config.remote_root_allowlist = vec![PathBuf::from("/db/shared")];
+        db_config.update_pin_version = "1.1.5".to_string();
+
+        let mut incoming = defaults.clone();
+        incoming.remote_root_allowlist = vec![PathBuf::from("/cli/shared")];
+        incoming.update_pin_version = "1.1.3".to_string();
+
+        db_config.apply_operator_overrides(&incoming, &defaults);
+
+        // The operator's flag is unioned, not replaced: neither entry is lost.
+        assert!(db_config
+            .remote_root_allowlist
+            .contains(&PathBuf::from("/cli/shared")));
+        assert!(db_config
+            .remote_root_allowlist
+            .contains(&PathBuf::from("/db/shared")));
+        assert_eq!(db_config.update_pin_version, "1.1.3");
+    }
+
+    /// A default incoming value must not clear a persisted pin or allowlist.
+    #[test]
+    fn default_incoming_values_leave_the_allowlist_and_pin_alone() {
+        let defaults = HarnessConfig::default();
+        let mut db_config = defaults.clone();
+        db_config.remote_root_allowlist = vec![PathBuf::from("/db/shared")];
+        db_config.update_pin_version = "1.1.5".to_string();
+
+        db_config.apply_operator_overrides(&defaults, &defaults);
+
+        assert_eq!(db_config.remote_root_allowlist, vec![PathBuf::from("/db/shared")]);
+        assert_eq!(db_config.update_pin_version, "1.1.5");
+    }
