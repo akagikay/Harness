@@ -685,3 +685,51 @@ HIGH items, all now fixed:
 7. **Red-team L1-L4** quarantine suffix collision (1000 attempts, then startup
    aborts), the alternating-pin install loop, a missing `Host` bypassing the
    rebinding guard, and `get_artifact` skipping the secret denylist.
+
+## Round 9 - APPLIED (`51ae6eb`, `c4282f9`, `bf9f300`)
+
+Four critics (UX, red team, QA, e2e) against `9b1b930`. Two P0s found and fixed by
+the UX critic; the red-team and QA reports are still landing.
+
+### P0-1: a failed turn left the UI spinning forever (`51ae6eb`) - FIXED and verified live
+The zombie session reproduced 3x in round 8 and did NOT reproduce in round 9,
+because the fix shipped in between. Root cause: the session's SSE stream never
+ended, because the broadcast sender lives in the session object, which lives for
+the life of the process - so the EventSource never closed, `es.onerror` never
+fired, and the client's optimistic `setSessionRunning(true)` was never cleared.
+No error was rendered anywhere. Fixed on both sides: the stream ends when the
+session reaches a terminal status, and opening a stream replays the stored
+history (which is what actually delivers the `Error` event, and also restores a
+permission card after a reload).
+
+### P0-2: the Permission Mode control was completely inert (`bf9f300`) - FIXED and verified live
+Picking Autonomous updated the pill, saved, returned **HTTP 200**, and changed
+nothing: `merge_config_update` discards `permissions` (correctly - a stale
+snapshot must not be able to turn the whole harness into auto-approve), and no
+endpoint could change it. The UI lied about the security state of the running
+harness. New `POST /api/security/permissions` (mode + the five per-tool
+policies) and `POST /api/security/update-pin`, both echoing back what is actually
+in force so the pill follows the server instead of the click. Verified live in a
+real browser: Safe (Ask) -> Autonomous, the pill class, the server config and the
+toast all agree.
+
+### P0-3: terminal events clear a stale approval badge (`c4282f9`)
+A Stop left the top bar claiming "N awaiting approval" for a dead prompt whose
+Approve click 404'd. `Error` and `SessionCompleted` now clear the pending set.
+
+### Also fixed in the same pass
+- Stop during a pending approval now emits `PermissionDecided` (the card kept
+  `data-pending="1"` forever and its Approve 404'd), and `PermissionDecided`
+  carries a `reason` so a **timeout is no longer reported as "Denied"** - a stop
+  or a timeout is not a refusal, and claiming the user denied something they
+  never saw costs trust in every other prompt.
+
+### Process lesson worth keeping
+A line-splicing edit of `app.js` left a stray closing brace, and the browser
+refused to parse the ENTIRE script: every control inert (no listener attached)
+while the HTML still looked perfect. `cargo test` could not see it - Rust cannot
+parse JS - so it shipped as "the permission pill does nothing" until the browser
+console showed `SyntaxError`. `app_js_security_wiring_is_present_exactly_once`
+now pins the spliced structure and the endpoints it must call.
+
+Current status: **239 unit + 90 integration, all green.**
