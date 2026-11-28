@@ -1260,17 +1260,39 @@ document.addEventListener('DOMContentLoaded', () => {
     const sidebarIsDrawer = () => window.matchMedia('(max-width: 64em)').matches;
     const closeSidebarDrawer = () => {
         sidebar.classList.remove('open');
+        if (typeof syncSidebarToggleLabel === 'function') syncSidebarToggleLabel();
     };
     const toggleSidebar = () => {
         if (sidebarIsDrawer()) {
-            const wasOpen = sidebar.classList.contains('open');
-            if (wasOpen) closeSidebarDrawer();
+            if (sidebar.classList.contains('open')) closeSidebarDrawer();
             else sidebar.classList.add('open');
+            syncSidebarToggleLabel();
             return;
         }
         const collapsed = sidebar.classList.toggle('collapsed');
         document.body.classList.toggle('sidebar-is-collapsed', collapsed);
+        syncSidebarToggleLabel();
     };
+    // The button must name what it DOES. In drawer mode (<=64em) it opens and closes
+    // an overlay; only on a wide viewport does it genuinely collapse, so one static
+    // "Collapse Sidebar" label lied on every phone and at 1000px.
+    const syncSidebarToggleLabel = () => {
+        const drawer = sidebarIsDrawer();
+        const isOpen = drawer
+            ? sidebar.classList.contains('open')
+            : !sidebar.classList.contains('collapsed');
+        const label = drawer
+            ? (isOpen ? 'Hide sidebar' : 'Show sidebar')
+            : (isOpen ? 'Collapse sidebar' : 'Expand sidebar');
+        for (const b of [btnSidebarToggle, btnMobileSidebar]) {
+            if (!b) continue;
+            b.title = label;
+            b.setAttribute('aria-label', label);
+            b.setAttribute('aria-expanded', String(isOpen));
+        }
+    };
+    syncSidebarToggleLabel();
+    window.addEventListener('resize', syncSidebarToggleLabel);
     if (btnSidebarToggle) btnSidebarToggle.addEventListener('click', toggleSidebar);
     if (btnExpandSidebar) btnExpandSidebar.addEventListener('click', toggleSidebar);
     if (btnMobileSidebar) btnMobileSidebar.addEventListener('click', toggleSidebar);
@@ -8885,7 +8907,11 @@ function setReasoningEffort(effort, shouldClosePopovers = true, persist = true, 
 function setPermissionMode(mode, persist = true) {
     const labels = { 'safe': 'Safe (Ask)', 'autonomous': 'Autonomous', 'read_only': 'Read Only' };
     if (labelPermMode) labelPermMode.textContent = labels[mode] || 'Safe (Ask)';
-    if (btnPermModeDropdown) btnPermModeDropdown.className = `permission-mode-pill mode-${mode}`;
+    if (btnPermModeDropdown) {
+        btnPermModeDropdown.className = `permission-mode-pill mode-${mode}`;
+        btnPermModeDropdown.setAttribute('data-mode-label', labels[mode] || mode);
+        btnPermModeDropdown.setAttribute('aria-label', `Permission mode: ${labels[mode] || mode}`);
+    }
 
     document.querySelectorAll('#perm-mode-popover .popover-item').forEach(el => {
         el.classList.toggle('active', el.getAttribute('data-perm-mode') === mode);

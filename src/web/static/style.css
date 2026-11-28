@@ -4450,14 +4450,33 @@ select.form-input {
     .permission-mode-pill .mode-label {
         display: none;
     }
+    /* The pill keeps an accessible name when its label is hidden, so a bare
+       shield is never the only signal of the permission mode. */
+    .permission-mode-pill::after {
+        content: attr(data-mode-label);
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip-path: inset(50%);
+        white-space: nowrap;
+    }
     .task-running-indicator {
         max-width: 96px;
     }
     .sidebar {
         width: min(300px, 92vw);
     }
+    /* Collapse must reflow the layout, not just translate the panel off-screen:
+       a `transform` leaves the measured width intact, so the app kept reserving
+       300px for a sidebar the user had collapsed. */
     .sidebar.collapsed {
-        width: min(300px, 92vw);
+        width: 0;
+        min-width: 0;
+        padding: 0;
+        overflow: hidden;
+        transform: translateX(-100%);
+        pointer-events: none;
     }
     .inspector-pane:not(.collapsed) {
         width: 100vw;
