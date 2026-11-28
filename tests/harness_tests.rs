@@ -8521,3 +8521,139 @@ async fn test_the_update_pin_is_settable_through_its_own_endpoint() {
     srv.abort();
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
+
+/// C1 (round-9 red team, CRITICAL): `/api/filesystem/*` accepted ANY absolute
+/// path - a caller listed `C:\Windows\System32\drivers\etc`, and created, renamed
+/// and deleted files via `..` traversal, tokenless on loopback. Only a drive root
+/// and `%USERPROFILE%` were refused. The four endpoints are now confined to the
+/// workspace roots (sandbox + approved roots + the active session's project).
+#[tokio::test]
+async fn test_the_filesystem_endpoints_are_confined_to_the_workspace() {
+    let workspace = std::env::temp_dir().join(format!("harness-r9-fs-ok-{}", std::process::id()));
+    let outside = std::env::temp_dir().join(format!("harness-r9-fs-out-{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    let _ = tokio::fs::remove_dir_all(&outside).await;
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    tokio::fs::create_dir_all(&outside).await.unwrap();
+    std::fs::write(workspace.join("inside.txt"), "allowed").unwrap();
+    std::fs::write(outside.join("secret.txt"), "not yours").unwrap();
+
+    let mut cfg = HarnessConfig::default();
+    cfg.sandbox_root = workspace.clone();
+    cfg.auth_token = String::new();
+    let state = AppState::new(cfg);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Inside the workspace: allowed.
+    let ok = client
+        .get(format!("{base}/api/filesystem/browse"))
+        .query(&[("path", workspace.display().to_string())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200, "{:?}", ok.text().await);
+
+    // Outside the workspace: refused.
+    let bad = client
+        .get(format!("{base}/api/filesystem/browse"))
+        .query(&[("path", outside.display().to_string())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 403, "listing outside the workspace must be refused");
+
+    // A traversal out of the workspace is refused, not followed.
+    let traversal = format!("{}/../{}",
+        workspace.display(),
+        outside.file_name().unwrap().to_string_lossy());
+    let trav = client
+        .get(format!("{base}/api/filesystem/browse"))
+        .query(&[("path", traversal.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(trav.status(), 403, "a `..` escape must be refused");
+
+    // Deleting outside the workspace is refused.
+    let del = client
+        .post(format!("{base}/api/filesystem/delete"))
+        .json(&json!({ "path": outside.join("secret.txt").display().to_string() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 403, "an out-of-workspace delete must be refused");
+    assert!(outside.join("secret.txt").exists(), "the file must still be there");
+
+    srv.abort();
+    let _ = tokio::fs::remove_dir_all(&workspace);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+/// C2 (round-9 red team, CRITICAL): the new cross-origin guard accepted
+/// `Sec-Fetch-Site: same-site`, and for a localhost app EVERY other localhost port
+/// is same-site - so a page on any other port flipped
+/// `POST /api/security/privileged-shell` (verified live). Only `same-origin` is
+/// acceptable.
+#[tokio::test]
+async fn test_a_same_site_state_change_is_still_refused() {
+    let temp_dir = std::env::temp_dir().join(format!("harness-r9-sfs-{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+    let mut cfg = HarnessConfig::default();
+    cfg.sandbox_root = temp_dir.clone();
+    cfg.host = "127.0.0.1".to_string();
+    cfg.auth_token = String::new();
+    let state = AppState::new(cfg);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Another localhost port is same-site but NOT same-origin: it must be refused.
+    let resp = client
+        .post(format!("{base}/api/security/privileged-shell"))
+        .header("Sec-Fetch-Site", "same-site")
+        .header("Host", format!("{addr}"))
+        .json(&json!({ "enabled": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "same-site is not same-origin: another localhost port must not flip the shell"
+    );
+    let cfg_after: Value = client
+        .get(format!("{base}/api/config"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        cfg_after["allow_privileged_shell"], false,
+        "the refused same-site request must leave the shell disabled"
+    );
+
+    // same-origin still works.
+    let ok = client
+        .post(format!("{base}/api/security/privileged-shell"))
+        .header("Sec-Fetch-Site", "same-origin")
+        .header("Host", format!("{addr}"))
+        .json(&json!({ "enabled": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200, "a same-origin POST must still be accepted");
+
+    srv.abort();
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}

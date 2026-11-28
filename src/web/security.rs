@@ -140,16 +140,20 @@ pub fn is_loopback_host(host: &str) -> bool {
 /// Returns `Some(origin)` when the request must be refused.
 pub fn cross_origin_state_change(req: &Request<Body>) -> Option<String> {
     let headers = req.headers();
-    // `Sec-Fetch-Site` is authoritative when present.
+    // `Sec-Fetch-Site` is authoritative when present, but ONLY `same-origin` is
+    // acceptable. `same-site` is NOT: for a localhost app, every other localhost
+    // port is same-site (ports are not part of a site), so accepting `same-site`
+    // let a page on `http://127.0.0.1:9999` flip `POST /api/security/
+
     if let Some(site) = headers
         .get("sec-fetch-site")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_ascii_lowercase())
     {
-        if site == "none" || site == "cross-site" {
-            return Some(format!("Sec-Fetch-Site: {site}"));
+        if site == "same-origin" {
+            return None;
         }
-        return None;
+        return Some(format!("Sec-Fetch-Site: {site}"));
     }
     let Some(origin) = headers
         .get(header::ORIGIN)

@@ -1378,7 +1378,7 @@ mod handlers_config_merge_tests {
             id: "foo".into(),
             name: "Foo".into(),
             path: std::path::PathBuf::from("C:\\tmp\\foo"),
-            icon: "ðŸ“".into(),
+            icon: "📁".into(),
             created_at: "now".into(),
             is_active: true,
             defaults: Default::default(),
@@ -4464,7 +4464,7 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
     favorites.push(FavoritePath {
         name: "Workspace".to_string(),
         path: cwd_norm,
-        icon: "ðŸ“".to_string(),
+        icon: "🚀".to_string(),
     });
 
     let projects_dir = cwd.join("projects");
@@ -4472,7 +4472,7 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
         favorites.push(FavoritePath {
             name: "Projects".to_string(),
             path: normalize_display_path(&projects_dir),
-            icon: "ðŸš€".to_string(),
+            icon: "🏠".to_string(),
         });
     }
 
@@ -4482,7 +4482,7 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
             favorites.push(FavoritePath {
                 name: "Home".to_string(),
                 path: normalize_display_path(&home_p),
-                icon: "ðŸ ".to_string(),
+                icon: "📥".to_string(),
             });
         }
 
@@ -4491,7 +4491,7 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
             favorites.push(FavoritePath {
                 name: "Downloads".to_string(),
                 path: normalize_display_path(&downloads),
-                icon: "ðŸ“¥".to_string(),
+                icon: "🖥".to_string(),
             });
         }
 
@@ -4500,7 +4500,7 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
             favorites.push(FavoritePath {
                 name: "Desktop".to_string(),
                 path: normalize_display_path(&desktop),
-                icon: "ðŸ–¥ï¸".to_string(),
+                icon: "🖥️".to_string(),
             });
         }
 
@@ -4509,7 +4509,7 @@ fn collect_drives_and_favorites() -> (Vec<String>, Vec<FavoritePath>) {
             favorites.push(FavoritePath {
                 name: "Documents".to_string(),
                 path: normalize_display_path(&docs),
-                icon: "ðŸ“„".to_string(),
+                icon: "📄".to_string(),
             });
         }
     }
@@ -4654,9 +4654,27 @@ pub async fn browse_filesystem(
         }
     }
 
+    // Confine the browse to the workspace roots. This endpoint used to accept any
+    // absolute path, so a caller could list `C:\Windows\System32\drivers\etc`
+    // (verified live on a tokenless loopback install).
+    let roots = fs_allowed_roots(&state).await;
     let canonical = tokio::fs::canonicalize(&candidate)
         .await
         .unwrap_or_else(|_| candidate.clone());
+    if !roots.iter().any(|root| canonical.starts_with(root)) {
+        return Err(json_api_error(
+            StatusCode::FORBIDDEN,
+            format!(
+                "Refusing to list '{}': outside the Harness workspace ({}).",
+                candidate.display(),
+                roots
+                    .iter()
+                    .map(|r| r.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
     let current_path_str = normalize_display_path(&canonical);
 
     let parent_path = std::path::Path::new(&current_path_str)
@@ -4731,6 +4749,7 @@ pub struct MkdirResponse {
 }
 
 pub async fn create_directory(
+    State(state): State<AppState>,
     Json(payload): Json<MkdirRequest>,
 ) -> Result<Json<MkdirResponse>, (StatusCode, Json<serde_json::Value>)> {
     let clean_parent = payload.parent_path.trim();
@@ -4749,6 +4768,9 @@ pub async fn create_directory(
     }
 
     let parent = std::path::PathBuf::from(clean_parent);
+    // Confine to the workspace roots: creating a folder anywhere on the disk is
+    // an arbitrary-write primitive (a planted Startup folder is immediate RCE).
+    let parent = ensure_within_fs_roots(&state, &parent).await?;
     if !parent.exists() || !parent.is_dir() {
         return Err(json_api_error(
             StatusCode::BAD_REQUEST,
@@ -4988,6 +5010,104 @@ fn normalize_relative_path(raw: &str) -> Result<PathBuf, (StatusCode, String)> {
         return Err((StatusCode::BAD_REQUEST, "Empty relative path".to_string()));
     }
     Ok(clean)
+}
+
+/// The roots a filesystem-browsing/mutating endpoint may touch.
+///
+/// The `/api/filesystem/*` endpoints used to accept ANY absolute path: a caller
+/// could list `C:\Windows\System32\drivers\etc`, create, rename and delete files
+/// anywhere the process could reach (only a drive root and `%USERPROFILE%` were
+/// refused), verified live on a tokenless loopback install. A planted
+/// `Startup\*.cmd` is immediate RCE, so the picker is now confined to the roots
+/// the harness already considers the user's workspace: the sandbox, every approved
+/// extra root, and the active session's project folders.
+///
+/// Canonicalization is what makes this hold, not string matching: `..\..`, a
+/// trailing dot, a junction and `\\?\C:\foo` all canonicalize to the same real
+/// path, so the `starts_with` check answers about the actual target.
+async fn fs_allowed_roots(state: &AppState) -> Vec<PathBuf> {
+    let conf = state.config.read().await;
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for base in std::iter::once(&conf.sandbox_root).chain(conf.extra_access_roots.iter()) {
+        if let Ok(canon) = tokio::fs::canonicalize(base).await {
+            if !roots.iter().any(|r| r == &canon) {
+                roots.push(canon);
+            }
+        }
+    }
+    // The active session's project folders are part of "where the user works".
+    let active_session = {
+        let lock = state.sessions.read().await;
+        lock.values()
+            .find(|s| matches!(s.status.as_str(), "running"))
+            .or_else(|| lock.values().next())
+            .map(|s| s.id.clone())
+    };
+    if let Some(sid) = active_session {
+        let sandbox = state.resolve_session_sandbox(&sid).await;
+        if let Ok(canon) = tokio::fs::canonicalize(&sandbox).await {
+            if !roots.iter().any(|r| r == &canon) {
+                roots.push(canon);
+            }
+        }
+    }
+    if roots.is_empty() {
+        // Never return an empty allowlist: that would deny everything, including
+        // the legitimate sandbox. Fall back to the sandbox as given.
+        roots.push(conf.sandbox_root.clone());
+    }
+    roots
+}
+
+/// Refuse `path` when it does not live inside one of `roots`.
+async fn ensure_within_fs_roots(
+    state: &AppState,
+    path: &FsPath,
+) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    let roots = fs_allowed_roots(state).await;
+    // A path that does not exist yet (mkdir) cannot be canonicalized; canonicalize
+    // the nearest existing ancestor instead and re-attach the remainder.
+    let mut probe = path.to_path_buf();
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(canon) = tokio::fs::canonicalize(&probe).await {
+            let mut resolved = canon;
+            for part in suffix.iter().rev() {
+                resolved.push(part);
+            }
+            if roots.iter().any(|root| resolved.starts_with(root)) {
+                return Ok(resolved);
+            }
+            return Err(json_api_error(
+                StatusCode::FORBIDDEN,
+                format!(
+                    "Refusing to access '{}': outside the Harness workspace ({}).",
+                    path.display(),
+                    roots
+                        .iter()
+                        .map(|r| r.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+        }
+        match probe.file_name() {
+            Some(name) => {
+                suffix.push(name.to_os_string());
+                if !probe.pop() {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    Err(json_api_error(
+        StatusCode::FORBIDDEN,
+        format!(
+            "Refusing to access '{}': outside the Harness workspace.",
+            path.display()
+        ),
+    ))
 }
 
 async fn resolve_contained_path(
@@ -6234,6 +6354,7 @@ fn is_protected_fs_root(path: &std::path::Path) -> bool {
 
 /// `POST /api/filesystem/rename` — rename a file or folder in place.
 pub async fn rename_path(
+    State(state): State<AppState>,
     Json(payload): Json<FsRenameRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let raw = payload.path.trim();
@@ -6251,6 +6372,9 @@ pub async fn rename_path(
         return Err(json_api_error(StatusCode::BAD_REQUEST, "Invalid name."));
     }
     let src = std::path::PathBuf::from(raw);
+    // Confine to the workspace roots: renaming an arbitrary path is an
+    // arbitrary-write primitive.
+    let src = ensure_within_fs_roots(&state, &src).await?;
     if !src.exists() {
         return Err(json_api_error(StatusCode::NOT_FOUND, "Path does not exist."));
     }
@@ -6278,6 +6402,7 @@ pub async fn rename_path(
 
 /// `POST /api/filesystem/delete` — delete a file, or a folder recursively.
 pub async fn delete_path(
+    State(state): State<AppState>,
     Json(payload): Json<FsPathRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let raw = payload.path.trim();
@@ -6285,6 +6410,9 @@ pub async fn delete_path(
         return Err(json_api_error(StatusCode::BAD_REQUEST, "Path is empty."));
     }
     let target = std::path::PathBuf::from(raw);
+    // Confine to the workspace roots: a recursive delete of an arbitrary path is
+    // the most destructive primitive in the whole API.
+    let target = ensure_within_fs_roots(&state, &target).await?;
     if !target.exists() {
         return Err(json_api_error(StatusCode::NOT_FOUND, "Path does not exist."));
     }
