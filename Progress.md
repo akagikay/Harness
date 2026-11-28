@@ -455,3 +455,26 @@ Exactly ONE agent edits source per round. Follow-up messages to a running subage
 ### The bug that cost the most time (fixed)
 `JoinHandle polled after completion`: the turn loop polled `&mut runner_handle` inside `select!` and then awaited the handle again in the terminal arm, panicking the tokio worker. The panic happened after `SessionCompleted` was emitted but before `update_session_status("completed")`, so **every session stuck on "running" forever**. Symptom: a session whose history ends in `SessionCompleted` while `/api/sessions` still reports `running`, and a stderr line `tokio-rt-worker ... JoinHandle polled after completion`.
 Fix: the `select!` arm takes the result into `run_res`, and the terminal arm uses that value instead of awaiting the handle again.
+---
+
+## v1.1.4 SHIPPED (2026-11-28)
+
+- Commit `07c2fe5` on `main`, tag `v1.1.4` pushed, release published:
+  https://github.com/akagikay/Harness/releases/tag/v1.1.4
+- Assets: `harness.exe` (751b8a6a...), `harness-client.exe` (8481022d...),
+  `harness-server.exe` (ab88ba41...), `SHA256SUMS`.
+- Downloaded the published assets back and re-hashed them: all three match
+  `SHA256SUMS` and `harness.exe --version` prints `harness 1.1.4`.
+- Headline fix: turns could never finalize (double-polled JoinHandle panic).
+- v1.1.3 remains available; v1.1.4 is now `Latest`.
+
+### Still open for the next round (not release blockers, but real)
+- `bash` is honestly documented as unsandboxed, but it is still unsandboxed:
+  a red-team pass read `harness.key` through it. Needs a real jail or removal.
+- Multi-folder projects on remote servers vs server-owned `extra_access_roots`:
+  server-local folder mapping or an explicit dispatch contract is still needed.
+- `server_runs` is never cleaned (~100-150 MB/day) and each automation run
+  orphans a `swarm_board`.
+- A corrupt main DB exits with no recovery path.
+- The updater only ever upgrades: no downgrade or version pin.
+- Permission counter is per model round-trip rather than per turn.
