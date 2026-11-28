@@ -458,8 +458,15 @@ pub fn spawn_session_turn(
             // already happened instead of restarting from an empty history.
             // A remote execution server owns its own turn; it reports progress
             // through events and never emits a snapshot here.
+            // Bounded on purpose. An unbounded channel here is the one place a long
+            // conversation can allocate without limit: every round-trip clones the
+            // whole history (~300 KB at 200 messages) into this queue, and if the
+            // drain loop is ever slower than the model - a slow DB write, an
+            // contended lock - the queue grows until the process is gone. Dropping
+            // a snapshot is harmless: the next round-trip sends a strictly more
+            // complete one, and the terminal arms always flush.
             let (checkpoint_tx, mut checkpoint_rx) =
-                mpsc::unbounded_channel::<Vec<ChatMessage>>();
+                mpsc::channel::<Vec<ChatMessage>>(CHECKPOINT_CHANNEL_CAPACITY);
             let mut last_checkpoint_persist = std::time::Instant::now()
                 - std::time::Duration::from_secs(3600);
             let mut runner_handle = if let Some(remote_srv) = remote_primary {
@@ -523,7 +530,9 @@ pub fn spawn_session_turn(
                 .with_task_attachments(current_attachments)
                 .with_steer_inbox(current_steer)
                 .with_context_checkpoint(move |snapshot| {
-                    let _ = checkpoint_tx.send(snapshot);
+                    // `try_send` never blocks inside the runner: if the queue is
+                    // full the snapshot is dropped rather than stalling a turn.
+                    let _ = checkpoint_tx.try_send(snapshot);
                 });
 
                 // Clone, do not move: the turn's terminal `Ok(Err)` / `Err` arms below still
@@ -731,6 +740,11 @@ pub fn spawn_session_turn(
 /// the provider's raw `400 context_length` - and the oversized prompt stays in
 /// the DB forever.
 pub const MAX_TASK_CHARS: usize = 100_000;
+
+/// Depth of the mid-turn checkpoint queue. One snapshot per model round-trip;
+/// a full queue means the drain loop is behind, in which case skipping a
+/// snapshot is the correct trade against unbounded growth.
+const CHECKPOINT_CHANNEL_CAPACITY: usize = 32;
 
 /// How often a mid-turn turn checkpoint is written to the database.
 ///

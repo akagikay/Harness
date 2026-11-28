@@ -1271,6 +1271,11 @@ if !saved_conf.onboarded {
     }
 
     /// Count active (`running` / `waiting`) subagents across all sessions.
+    /// The configured global ceiling on concurrently running subagents.
+    pub async fn max_active_subagents(&self) -> usize {
+        self.config.read().await.max_active_subagents.max(1)
+    }
+
     pub async fn total_active_subagents(&self) -> usize {
         let boards: Vec<SwarmBoard> = {
             let lock = self.sessions.read().await;

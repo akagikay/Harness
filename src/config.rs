@@ -703,6 +703,10 @@ impl Project {
     }
 }
 
+fn default_max_active_subagents() -> usize {
+    32
+}
+
 fn default_projects() -> Vec<Project> {
     // The default project is a `Project` folder beside the harness executable, so a
     // fresh install never points at whatever directory the binary was launched from.
@@ -834,6 +838,15 @@ pub struct HarnessConfig {
     /// First-class automations: scheduled agent runs, standalone or project-bound.
     #[serde(default)]
     pub automations: Vec<crate::automation::Automation>,
+    /// Global ceiling on concurrently RUNNING subagents, across every session.
+    ///
+    /// A batch cap (8) bounds one `invoke_subagent` call and `max_depth` bounds
+    /// nesting, but the product of the two is a fan-out: with depth 2 a coordinator
+    /// can spawn 8 workers, each of which can spawn 8 more, and nothing anywhere
+    /// looked at the *global* count - so a single ambitious prompt could reach 584
+    /// concurrent agent loops on one machine. This is the bound on that.
+    #[serde(default = "default_max_active_subagents")]
+    pub max_active_subagents: usize,
     /// Extra filesystem roots the user explicitly approved for tools to access
     /// outside the project workspace.
     #[serde(default)]
@@ -969,6 +982,7 @@ impl Default for HarnessConfig {
             auto_update_apply: true,
             update_pin_version: std::env::var("HARNESS_UPDATE_PIN").unwrap_or_default(),
             automations: Vec::new(),
+            max_active_subagents: default_max_active_subagents(),
             extra_access_roots: Vec::new(),
             remote_root_allowlist: Vec::new(),
             last_auto_update_target: String::new(),

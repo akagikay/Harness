@@ -1329,6 +1329,22 @@ impl ToolPlugin for InvokeSubagentPlugin {
         if specs.len() > 8 {
             return Err("Too many concurrent subagents requested (max 8 per batch).".to_string());
         }
+        // Global ceiling. The per-batch cap and `max_depth` bound one call and the
+        // nesting, but their product is a fan-out: with depth 2 a coordinator can
+        // spawn 8 workers, each spawning 8 more, and nothing looked at the global
+        // count. A coordinator that fans out further than this would reach 584
+        // concurrent loops on one machine, so refuse rather than OOM.
+        if let Some(ref st) = ctx.state {
+            let active = st.total_active_subagents().await;
+            let cap = st.max_active_subagents().await;
+            if active.saturating_add(specs.len()) > cap {
+                return Err(format!(
+                    "Too many subagents are already running ({active} active, limit {cap}). \
+                     Wait for the current wave to finish (`swarm_board` action \"wait\") \
+                     or raise `max_active_subagents` in settings."
+                ));
+            }
+        }
 
         let sandbox_buf = sandbox.to_path_buf();
 

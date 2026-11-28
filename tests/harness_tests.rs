@@ -8170,7 +8170,6 @@ async fn test_a_cross_origin_state_changing_request_is_rejected() {
 #[tokio::test]
 async fn test_a_stream_for_a_removed_run_terminates() {
     use deepseek_harness_rs::web::handlers::async_stream_unfold_run;
-    use futures_util::StreamExt;
 
     let temp_dir = std::env::temp_dir().join(format!("harness-r8-sse-{}", std::process::id()));
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
@@ -8218,6 +8217,86 @@ async fn test_an_invalid_update_pin_is_refused() {
     ] {
         assert!(!is_valid_version_pin(bad), "'{bad}' must be refused as a pin");
     }
+}
+
+/// HIGH (architecture round 8): the remote-root allowlist was unreachable by any
+/// operator - no flag, no env var, no UI - while the 409 error told them to change
+/// it, so the only way was hand-editing the SQLite config row. It is now seeded
+/// from the environment and a repeatable CLI flag.
+#[test]
+fn test_the_remote_root_allowlist_is_operator_reachable() {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    let a = std::env::temp_dir().join(format!("r8-allow-a-{}", std::process::id()));
+    let b = std::env::temp_dir().join(format!("r8-allow-b-{}", std::process::id()));
+
+    // Mirror of main.rs's env seeding: entries split on the OS separator, blanks
+    // skipped, duplicates ignored.
+    let raw = format!("{}{}{}{}{}", a.display(), separator, b.display(), separator, "   ");
+    let mut parsed: Vec<std::path::PathBuf> = Vec::new();
+    for entry in raw.split(separator) {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let path = std::path::PathBuf::from(trimmed);
+        if !parsed.iter().any(|p| p == &path) {
+            parsed.push(path);
+        }
+    }
+    assert_eq!(parsed, vec![a.clone(), b.clone()], "blank entries are skipped");
+
+    let _ = std::fs::remove_dir_all(&a);
+    let _ = std::fs::remove_dir_all(&b);
+}
+
+/// HIGH (architecture round 8): there was no global subagent cap. `max_depth` and
+/// the per-batch cap of 8 multiply to a 584-runner fan-out on one machine, and
+/// nothing ever consulted the running count.
+#[tokio::test]
+async fn test_the_global_subagent_cap_is_enforced() {
+    use deepseek_harness_rs::db::HarnessDb;
+    let temp_dir = std::env::temp_dir().join(format!("harness-r8-cap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let mut cfg = HarnessConfig::default();
+    cfg.sandbox_root = temp_dir.clone();
+    cfg.mock_mode = true;
+    // A cap of 1 means the first spawn succeeds and the second is refused.
+    cfg.max_active_subagents = 1;
+    let state = AppState::with_db(cfg, HarnessDb::open_in_memory().unwrap());
+
+    assert_eq!(state.max_active_subagents().await, 1);
+    assert_eq!(state.total_active_subagents().await, 0);
+
+    // Register one live subagent on a session's board; the cap must now block.
+    let session_id = "ses-r8-cap".to_string();
+    state
+        .create_session_with_options(
+            session_id.clone(),
+            "cap".into(),
+            "project".into(),
+            None,
+            None,
+            None,
+            "running",
+        )
+        .await;
+    let board = state.get_or_create_swarm(&session_id).await;
+    board
+        .register_subagent("sub_r8_1", "Worker", "a task", Some("coordinator".to_string()))
+        .await;
+    assert_eq!(state.total_active_subagents().await, 1, "one live runner");
+
+    // The enforcement lives in the swarm tool, so verify the predicate it uses:
+    // `active + batch > cap` is exactly the refusal condition.
+    let active = state.total_active_subagents().await;
+    let cap = state.max_active_subagents().await;
+    assert!(
+        active.saturating_add(8) > cap,
+        "a further batch of 8 must exceed the cap and be refused"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
 

@@ -28,6 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              \x20 --sandbox <PATH>             Workspace sandbox root\n\
              \x20 --db <PATH>                  SQLite database path\n\
              \x20 --server-id <ID>             Server identity for remote dispatch\n\
+             \x20 --remote-allow <PATH>        Root a client-dispatched run may access (repeatable)\n\
              \x20 --check-update               Check GitHub for a newer release\n\
              \x20 --update                     Download, verify and install the latest release\n\
              \x20 --update-pin <VERSION>       Install (or roll back to) that exact release\n\
@@ -38,7 +39,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              \x20 HARNESS_MASTER_KEY           AES-256 key (hex or base64) for stored credentials\n\
              \x20 MODEL_API_KEY, MODEL_API_BASE, MODEL_NAME\n\
              \x20 HARNESS_UPDATE_REPO          owner/repo for auto-update\n\
-             \x20 HARNESS_UPDATE_PIN           Pin auto-update to one exact version\n",
+             \x20 HARNESS_UPDATE_PIN           Pin auto-update to one exact version\n\
+             \x20 HARNESS_REMOTE_ROOT_ALLOWLIST  Extra roots for client-dispatched runs\n\
+             \x20                                (PATH entries separated by the OS separator)\n",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(());
@@ -66,6 +69,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--server-id" if i + 1 < args.len() => {
                 config.server_identity = args[i + 1].clone();
+                i += 1;
+            }
+            // Repeatable: each occurrence adds one root the server will grant a
+            // client-dispatched run. Without this the field that gates the whole
+            // remote-root contract was only reachable by hand-editing the DB row.
+            "--remote-allow" if i + 1 < args.len() => {
+                let path = PathBuf::from(&args[i + 1]);
+                if !config.remote_root_allowlist.iter().any(|p| p == &path) {
+                    config.remote_root_allowlist.push(path);
+                }
                 i += 1;
             }
             "--db" if i + 1 < args.len() => {
@@ -146,6 +159,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(db_str) = std::env::var("HARNESS_DB_PATH") {
         if !db_str.trim().is_empty() {
             config.db_path = Some(PathBuf::from(db_str));
+        }
+    }
+    // The server-owned allowlist of roots a client-dispatched run may reach.
+    // Without an env var or a flag, the field that gates the whole remote-root
+    // contract was only reachable by hand-editing the SQLite config row - and the
+    // 409 message tells the operator to change exactly that.
+    if let Ok(list) = std::env::var("HARNESS_REMOTE_ROOT_ALLOWLIST") {
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        for entry in list.split(separator) {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let path = PathBuf::from(trimmed);
+            if !config.remote_root_allowlist.iter().any(|p| p == &path) {
+                config.remote_root_allowlist.push(path);
+            }
         }
     }
 
